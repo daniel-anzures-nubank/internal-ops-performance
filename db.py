@@ -72,7 +72,13 @@ def get_spark() -> "SparkSession":
             "interpreter to run off-cluster."
         ) from exc
 
-    return SparkSession.builder.getOrCreate()
+    spark = SparkSession.builder.getOrCreate()
+    # The slot-time / night-shift math assumes a UTC session tz (that's how
+    # `timestamp_seconds` renders the local wall clock). Set it here so the
+    # result is identical on any compute — including serverless, where the
+    # cluster-level `spark_conf` can't be set and this is the only knob.
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    return spark
 
 
 # Backwards-compatible alias: scripts historically called `open_connection()`.
