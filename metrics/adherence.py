@@ -48,9 +48,10 @@ denominator is 0.
 
 from __future__ import annotations
 
-import pandas as pd
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
-from metric_utils import aggregate_long, empty_metric_frame
+from metric_utils import aggregate_long
 from adjustments.manual import drop_slot_windows, reclassify_dime_slots
 
 METRIC_NAME = "adherence"
@@ -65,34 +66,32 @@ ADHERENCE_EXCLUDED_ACTIVITY_TYPES: tuple[str, ...] = (
 
 
 def compute_adherence(
-    adherent_time: pd.DataFrame,
+    adherent_time: DataFrame,
     *,
-    general_exclusions: pd.DataFrame | None = None,
-    dime_inconsistencies: pd.DataFrame | None = None,
-) -> pd.DataFrame:
+    general_exclusions: DataFrame | None = None,
+    dime_inconsistencies: DataFrame | None = None,
+) -> DataFrame:
     """Compute the Adherence metric at day/week/month grain.
 
     Args:
         adherent_time: the ``io_adherent_time_raw`` table (one row per slot).
+        general_exclusions: ``adj_exclusiones_generales`` slot windows to drop
+            (``None`` to skip).
+        dime_inconsistencies: ``adj_inconsistencias_dime`` slot relabels
+            (``None`` to skip).
 
     Returns:
-        Tidy long-format metric rows (see module docstring / schema).
+        Tidy long-format metric rows (see module docstring / schema). Empty
+        input naturally yields an empty frame with the metric schema.
     """
-    if adherent_time.empty:
-        return empty_metric_frame()
-
     work = reclassify_dime_slots(adherent_time, dime_inconsistencies)
     work = drop_slot_windows(work, general_exclusions)
 
-    productive = work.loc[
-        ~work["activity_type_required"]
-        .astype("string")
-        .str.lower()
-        .isin(ADHERENCE_EXCLUDED_ACTIVITY_TYPES)
-    ].copy()
-
-    if productive.empty:
-        return empty_metric_frame()
+    productive = work.filter(
+        ~F.lower(F.col("activity_type_required")).isin(
+            list(ADHERENCE_EXCLUDED_ACTIVITY_TYPES)
+        )
+    )
 
     return aggregate_long(
         productive,

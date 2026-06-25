@@ -1,4 +1,4 @@
-"""shift_attribution — re-attribute night-shift activity to the day the shift started.
+"""shift_attribution — re-attribute night-shift activity to the day the shift started (PySpark).
 
 Night-shift agents work across midnight, so plain calendar-day attribution
 splits one shift across two days: the evening head on day *N* and the
@@ -29,68 +29,56 @@ and the June 30 → July 1 boundary shift keeps its legacy (split) attribution.
 
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
+from datetime import date
+
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
 # Roster shift label that crosses midnight.
 NIGHT_SHIFT_LABEL = "night"
 
 # Activity strictly before this date keeps legacy calendar-day attribution, so
 # historical metrics never change.
-NIGHT_SHIFT_CUTOVER = pd.Timestamp("2026-07-01")
+NIGHT_SHIFT_CUTOVER: date = date(2026, 7, 1)
 
 # Night "business day" boundary: noon. Subtract 12h before taking the date so a
 # shift's evening start and its following early morning land on the start date.
 NIGHT_BOUNDARY_HOURS = 12
 
 
-def _to_naive(series: pd.Series) -> pd.Series:
-    """Coerce a datetime Series to tz-naive ``datetime64[ns]``."""
-    s = pd.to_datetime(series)
-    if s.dt.tz is not None:
-        return s.dt.tz_localize(None)
-    return s
-
-
-def night_agent_months(agent_info: pd.DataFrame) -> pd.DataFrame:
+def night_agent_months(agent_info: DataFrame) -> DataFrame:
     """Return ``(agent, snapshot_month, is_night=True)`` for night-shift rows.
 
-    ``snapshot_month`` is normalized to a tz-naive month-start Timestamp so it
-    joins cleanly against an activity's month. Non-night / NULL-shift rows are
-    dropped, so a left-join miss means "not a night agent that month".
+    ``snapshot_month`` is normalized to a month-start ``DATE`` so it joins
+    cleanly against an activity's month. Non-night / NULL-shift rows are dropped,
+    so a left-join miss means "not a night agent that month".
     """
-    shift = agent_info["shift"].astype("string").str.lower()
-    df = agent_info.loc[
-        shift == NIGHT_SHIFT_LABEL, ["agent", "snapshot_month"]
-    ].copy()
-    if df.empty:
-        return pd.DataFrame(
-            {
-                "agent": pd.Series(dtype="object"),
-                "snapshot_month": pd.Series(dtype="datetime64[ns]"),
-                "is_night": pd.Series(dtype="bool"),
-            }
+    return (
+        agent_info.filter(F.lower(F.col("shift")) == NIGHT_SHIFT_LABEL)
+        .select(
+            F.col("agent"),
+            F.trunc(F.to_date(F.col("snapshot_month")), "month").alias(
+                "snapshot_month"
+            ),
         )
-    df["snapshot_month"] = (
-        _to_naive(df["snapshot_month"]).dt.to_period("M").dt.to_timestamp()
+        .distinct()
+        .withColumn("is_night", F.lit(True))
     )
-    df = df.drop_duplicates()
-    df["is_night"] = True
-    return df
 
 
 def shift_start_date(
-    df: pd.DataFrame,
+    df: DataFrame,
     *,
     agent_col: str,
     local_ts_col: str,
     calendar_date_col: str,
-    night_months: pd.DataFrame,
-    cutover: pd.Timestamp = NIGHT_SHIFT_CUTOVER,
-) -> pd.Series:
+    night_months: DataFrame,
+    cutover: date = NIGHT_SHIFT_CUTOVER,
+) -> DataFrame:
     """Re-attribute each row to the day its (night) shift started.
 
-    Returns a Series of python ``date`` objects aligned to ``df.index``:
+    Replaces ``calendar_date_col`` in place (keeping every other column and the
+    column order) with:
 
       * Night-shift agent AND calendar date >= ``cutover`` AND the noon-boundary
         date is also >= ``cutover``  →  ``DATE(local_ts - 12h)``.
@@ -101,32 +89,29 @@ def shift_start_date(
             (the activity's LOCAL timestamp) and ``calendar_date_col``.
         night_months: output of :func:`night_agent_months`.
     """
-    if df.empty:
-        return pd.Series([], dtype="object", index=df.index)
-
-    local_ts = _to_naive(df[local_ts_col])
-    cal_ts = _to_naive(df[calendar_date_col]).dt.normalize()
-
-    month = local_ts.dt.to_period("M").dt.to_timestamp()
-    lookup = pd.DataFrame(
-        {"agent": df[agent_col].to_numpy(), "snapshot_month": month.to_numpy()}
+    nm = night_months.select(
+        F.col("agent").alias("_nm_agent"),
+        F.col("snapshot_month").alias("_nm_month"),
+        F.col("is_night").alias("_is_night"),
     )
-    # ``is_night`` in ``night_months`` is always True, so a left-join match is
-    # exactly ``notna()`` — this also sidesteps the object-dtype fillna downcast.
-    is_night = (
-        lookup.merge(night_months, on=["agent", "snapshot_month"], how="left")[
-            "is_night"
-        ]
-        .notna()
-        .to_numpy()
+    month = F.trunc(F.to_date(F.col(local_ts_col)), "month")
+    joined = df.withColumn("_month", month).join(
+        nm,
+        (F.col(agent_col) == F.col("_nm_agent"))
+        & (F.col("_month") == F.col("_nm_month")),
+        "left",
     )
 
-    candidate = (local_ts - pd.Timedelta(hours=NIGHT_BOUNDARY_HOURS)).dt.normalize()
-    cutover64 = np.datetime64(pd.Timestamp(cutover))
-    eligible = (
-        is_night
-        & (cal_ts.to_numpy() >= cutover64)
-        & (candidate.to_numpy() >= cutover64)
+    is_night = F.col("_is_night").isNotNull()
+    cal = F.to_date(F.col(calendar_date_col))
+    candidate = F.to_date(
+        F.col(local_ts_col).cast("timestamp")
+        - F.expr(f"INTERVAL {NIGHT_BOUNDARY_HOURS} HOURS")
     )
-    business = np.where(eligible, candidate.to_numpy(), cal_ts.to_numpy())
-    return pd.to_datetime(pd.Series(business, index=df.index)).dt.date
+    cut = F.lit(cutover)
+    eligible = is_night & (cal >= cut) & (candidate >= cut)
+    business = F.when(eligible, candidate).otherwise(cal)
+
+    return joined.withColumn(calendar_date_col, business).drop(
+        "_month", "_nm_agent", "_nm_month", "_is_night"
+    )

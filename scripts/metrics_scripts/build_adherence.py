@@ -4,7 +4,7 @@ First script of the **metrics layer**. Thin orchestrator — the math lives in
 ``metrics/adherence.py`` and is covered by ``tests/metrics/test_adherence.py``.
 Here we only:
 
-  1. Open a Databricks SQL connection (shared `db.open_connection`).
+  1. Get the ambient SparkSession (shared `db.open_connection`).
   2. Read the raw input table ``io_adherent_time_raw`` for the period
      (via `db.read_table`, not an extractor — the metrics layer reads the
      already-built `io_*_raw` tables).
@@ -18,17 +18,17 @@ Tables
 
 Manual adjustments
 ------------------
-None applied here (no adjustments layer yet) — see `metrics/adherence.py` for
-the list of legacy carve-outs deferred to the future Adjustments layer.
+``excluziones_generales`` (slot windows to drop) and ``inconsistencias_dime``
+(slot relabels) are read from their synced ``adj_*`` Delta tables, if present.
 
 Usage
 -----
-::
+Runs on a Databricks cluster (``spark-submit`` / a Databricks job task)::
 
-    uv run python scripts/metrics_scripts/build_adherence.py \\
+    python scripts/metrics_scripts/build_adherence.py \\
         --period-start 2026-05-01 --period-end 2026-05-24 --dry-run
 
-    uv run python scripts/metrics_scripts/build_adherence.py \\
+    python scripts/metrics_scripts/build_adherence.py \\
         --period-start 2026-01-01 --period-end 2026-05-24
 """
 
@@ -48,7 +48,7 @@ sys.path.insert(0, str(REPO_ROOT / "metrics"))
 from db import open_connection, read_table, publish  # noqa: E402
 from metric_utils import GRANULARITIES  # noqa: E402
 from adherence import IO_ADHERENCE_METRIC_SCHEMA, compute_adherence  # noqa: E402
-from adjustments.manual import read_adjustment_csv  # noqa: E402
+from adjustments.manual import read_adjustment_table  # noqa: E402
 
 LOGGER = logging.getLogger("cx_metrics.adherence")
 
@@ -116,65 +116,78 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
-    conn = open_connection()
-    try:
-        with _log_step(f"read {args.source}"):
-            adherent_time = read_table(
-                conn, args.source, args.period_start, args.period_end
+    spark = open_connection()
+
+    with _log_step(f"read {args.source}"):
+        adherent_time = read_table(
+            spark, args.source, args.period_start, args.period_end
+        )
+
+    with _log_step("compute_adherence"):
+        result = compute_adherence(
+            adherent_time,
+            general_exclusions=read_adjustment_table(spark, "exclusiones_generales"),
+            dime_inconsistencies=read_adjustment_table(spark, "inconsistencias_dime"),
+        )
+
+    if args.dry_run:
+        from pyspark.sql import functions as F
+
+        result = result.persist()
+        LOGGER.info("Dry run — not writing. Summary:")
+        print()
+        by_gran = {
+            r["date_granularity"]: (r["rows"], r["agents"])
+            for r in result.groupBy("date_granularity")
+            .agg(
+                F.count(F.lit(1)).alias("rows"),
+                F.countDistinct("agent").alias("agents"),
             )
-            LOGGER.info("  %s raw slot rows", f"{len(adherent_time):,}")
-
-        with _log_step("compute_adherence"):
-            result = compute_adherence(
-                adherent_time,
-                general_exclusions=read_adjustment_csv("exclusiones_generales"),
-                dime_inconsistencies=read_adjustment_csv("inconsistencias_dime"),
-            )
-            LOGGER.info("  %s metric rows", f"{len(result):,}")
-
-        expected_cols = [c for c, _ in IO_ADHERENCE_METRIC_SCHEMA]
-        result = result[expected_cols]
-
-        if args.dry_run:
-            LOGGER.info("Dry run — not writing. Summary:")
-            print()
-            for g in GRANULARITIES:
-                sub = result[result["date_granularity"] == g]
-                print(f"{g:>9}: {len(sub):,} rows, {sub['agent'].nunique():,} agents")
-            print(f"\nAgents: {result['agent'].nunique():,}   "
-                  f"Teams: {', '.join(sorted(result['team'].dropna().unique()))}")
-            if not result.empty:
-                mv = result["metric_value"].dropna()
-                print(f"metric_value (%): min={mv.min():.1f}  "
-                      f"max={mv.max():.1f}  mean={mv.mean():.1f}")
-            print("\nHead (day grain):")
+            .collect()
+        }
+        for g in GRANULARITIES:
+            rows, agents = by_gran.get(g, (0, 0))
+            print(f"{g:>9}: {rows:,} rows, {agents:,} agents")
+        teams = sorted(
+            r["team"]
+            for r in result.select("team").distinct().collect()
+            if r["team"] is not None
+        )
+        stats = result.agg(
+            F.countDistinct("agent").alias("agents"),
+            F.min("metric_value").alias("mn"),
+            F.max("metric_value").alias("mx"),
+            F.avg("metric_value").alias("mean"),
+        ).collect()[0]
+        print(f"\nAgents: {stats['agents']:,}   Teams: {', '.join(teams)}")
+        if stats["mn"] is not None:
             print(
-                result[result["date_granularity"] == "day"]
-                .head(10)
-                .to_string(index=False)
+                f"metric_value (%): min={stats['mn']:.1f}  "
+                f"max={stats['mx']:.1f}  mean={stats['mean']:.1f}"
             )
-            return 0
+        print("\nHead (day grain):")
+        result.filter(F.col("date_granularity") == "day").show(10, truncate=False)
+        result.unpersist()
+        return 0
 
-        with _log_step(f"write {args.target}"):
-            run = publish(
-                conn,
-                result,
-                args.target,
-                IO_ADHERENCE_METRIC_SCHEMA,
-                layer="metrics",
-                period_start=args.period_start,
-                period_end=args.period_end,
-                run_id=args.run_id,
-                snapshot=not args.no_snapshot,
-            )
-            LOGGER.info(
-                "  wrote %s rows to %s (run_id=%s)",
-                f"{run.row_count:,}", args.target, run.run_id,
-            )
-            if run.snapshot_table:
-                LOGGER.info("  snapshot -> %s", run.snapshot_table)
-    finally:
-        conn.close()
+    with _log_step(f"write {args.target}"):
+        run = publish(
+            spark,
+            result,
+            args.target,
+            IO_ADHERENCE_METRIC_SCHEMA,
+            layer="metrics",
+            period_start=args.period_start,
+            period_end=args.period_end,
+            run_id=args.run_id,
+            snapshot=not args.no_snapshot,
+        )
+        LOGGER.info(
+            "  wrote %s rows to %s (run_id=%s)",
+            f"{run.row_count:,}", args.target, run.run_id,
+        )
+        if run.snapshot_table:
+            LOGGER.info("  snapshot -> %s", run.snapshot_table)
 
     return 0
 

@@ -1,9 +1,9 @@
-"""Unit tests for ``metrics_data/shift_attribution.py``.
+"""Unit tests for ``metrics_data/shift_attribution.py`` (PySpark).
 
-Pure-pandas tests for the night-shift re-attribution helper. They cover:
+Tests for the night-shift re-attribution helper. They cover:
 
   * ``night_agent_months`` — selecting only ``shift == 'night'`` roster rows and
-    normalizing ``snapshot_month`` to a tz-naive month-start.
+    normalizing ``snapshot_month`` to a month-start ``DATE``.
   * ``shift_start_date`` — the noon-boundary roll-back, the 2026-07-01 cutover
     gate, the clamp that keeps the June 30 -> July 1 boundary shift on its legacy
     (split) attribution, and the no-op for morning / non-night agents.
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-import pandas as pd
+from pyspark.sql import types as T
 
 from shift_attribution import (
     NIGHT_SHIFT_CUTOVER,
@@ -21,39 +21,58 @@ from shift_attribution import (
     shift_start_date,
 )
 
-
 # ---------------------------------------------------------------------------
 # Builders
 # ---------------------------------------------------------------------------
 
+_AGENT_INFO_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("shift", T.StringType()),
+        T.StructField("snapshot_month", T.DateType()),
+    ]
+)
 
-def make_agent_info(rows: list[dict]) -> pd.DataFrame:
+_ACTIVITY_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("local_ts", T.TimestampType()),
+        T.StructField("date", T.DateType()),
+    ]
+)
+
+
+def make_agent_info(spark, rows):
+    defaults = {"agent": "nyx.owl", "shift": "night", "snapshot_month": dt.date(2026, 7, 1)}
+    data = [{**defaults, **r} for r in rows]
+    return spark.createDataFrame(
+        [(r["agent"], r["shift"], r["snapshot_month"]) for r in data],
+        _AGENT_INFO_SCHEMA,
+    )
+
+
+def make_activity(spark, rows):
     defaults = {
         "agent": "nyx.owl",
-        "shift": "night",
-        "snapshot_month": dt.date(2026, 7, 1),
-    }
-    return pd.DataFrame([{**defaults, **r} for r in rows])
-
-
-def make_activity(rows: list[dict]) -> pd.DataFrame:
-    """Frame with the three columns ``shift_start_date`` needs."""
-    defaults = {
-        "agent": "nyx.owl",
-        "local_ts": pd.Timestamp("2026-07-05 22:00:00"),
+        "local_ts": dt.datetime(2026, 7, 5, 22, 0, 0),
         "date": dt.date(2026, 7, 5),
     }
-    return pd.DataFrame([{**defaults, **r} for r in rows])
+    data = [{**defaults, **r} for r in rows]
+    return spark.createDataFrame(
+        [(r["agent"], r["local_ts"], r["date"]) for r in data],
+        _ACTIVITY_SCHEMA,
+    )
 
 
-def _attribute(activity: pd.DataFrame, agent_info: pd.DataFrame) -> pd.Series:
-    return shift_start_date(
+def _attribute(activity, agent_info):
+    out = shift_start_date(
         activity,
         agent_col="agent",
         local_ts_col="local_ts",
         calendar_date_col="date",
         night_months=night_agent_months(agent_info),
     )
+    return [r["date"] for r in out.collect()]
 
 
 # ---------------------------------------------------------------------------
@@ -62,51 +81,46 @@ def _attribute(activity: pd.DataFrame, agent_info: pd.DataFrame) -> pd.Series:
 
 
 class TestNightAgentMonths:
-    def test_keeps_only_night_rows(self):
+    def test_keeps_only_night_rows(self, spark):
         out = night_agent_months(
             make_agent_info(
+                spark,
                 [
                     {"agent": "a", "shift": "night"},
                     {"agent": "b", "shift": "morning"},
                     {"agent": "c", "shift": None},
-                ]
+                ],
             )
-        )
-        assert set(out["agent"]) == {"a"}
-        assert out["is_night"].all()
+        ).collect()
+        assert {r["agent"] for r in out} == {"a"}
+        assert all(r["is_night"] for r in out)
 
-    def test_case_insensitive_shift_label(self):
-        out = night_agent_months(make_agent_info([{"agent": "a", "shift": "NIGHT"}]))
-        assert len(out) == 1
+    def test_case_insensitive_shift_label(self, spark):
+        out = night_agent_months(make_agent_info(spark, [{"agent": "a", "shift": "NIGHT"}]))
+        assert out.count() == 1
 
-    def test_normalizes_snapshot_month_to_month_start(self):
+    def test_normalizes_snapshot_month_to_month_start(self, spark):
         out = night_agent_months(
-            make_agent_info([{"snapshot_month": dt.date(2026, 7, 31)}])
-        )
-        assert out.iloc[0]["snapshot_month"] == pd.Timestamp("2026-07-01")
+            make_agent_info(spark, [{"snapshot_month": dt.date(2026, 7, 31)}])
+        ).collect()
+        assert out[0]["snapshot_month"] == dt.date(2026, 7, 1)
 
-    def test_handles_tz_aware_snapshot_month(self):
-        out = night_agent_months(
-            make_agent_info([{"snapshot_month": pd.Timestamp("2026-07-01", tz="UTC")}])
-        )
-        assert out.iloc[0]["snapshot_month"] == pd.Timestamp("2026-07-01")
-        assert out.iloc[0]["snapshot_month"].tz is None
-
-    def test_dedups(self):
+    def test_dedups(self, spark):
         out = night_agent_months(
             make_agent_info(
+                spark,
                 [
                     {"agent": "a", "snapshot_month": dt.date(2026, 7, 1)},
                     {"agent": "a", "snapshot_month": dt.date(2026, 7, 15)},
-                ]
+                ],
             )
         )
-        assert len(out) == 1
+        assert out.count() == 1
 
-    def test_no_night_agents_returns_empty_typed_frame(self):
-        out = night_agent_months(make_agent_info([{"shift": "morning"}]))
-        assert out.empty
-        assert list(out.columns) == ["agent", "snapshot_month", "is_night"]
+    def test_no_night_agents_returns_empty_typed_frame(self, spark):
+        out = night_agent_months(make_agent_info(spark, [{"shift": "morning"}]))
+        assert out.count() == 0
+        assert out.columns == ["agent", "snapshot_month", "is_night"]
 
 
 # ---------------------------------------------------------------------------
@@ -115,80 +129,87 @@ class TestNightAgentMonths:
 
 
 class TestShiftStartDate:
-    def test_evening_head_stays_on_start_day(self):
-        # 22:00 on Jul 5 -> noon boundary keeps it on Jul 5.
+    def test_evening_head_stays_on_start_day(self, spark):
         out = _attribute(
-            make_activity([{"local_ts": pd.Timestamp("2026-07-05 22:00:00"),
-                            "date": dt.date(2026, 7, 5)}]),
-            make_agent_info([{}]),
+            make_activity(
+                spark,
+                [{"local_ts": dt.datetime(2026, 7, 5, 22, 0, 0), "date": dt.date(2026, 7, 5)}],
+            ),
+            make_agent_info(spark, [{}]),
         )
-        assert out.iloc[0] == dt.date(2026, 7, 5)
+        assert out[0] == dt.date(2026, 7, 5)
 
-    def test_early_morning_tail_rolls_back_to_start_day(self):
-        # 03:00 on Jul 6 (calendar Jul 6) -> rolled back to Jul 5.
+    def test_early_morning_tail_rolls_back_to_start_day(self, spark):
         out = _attribute(
-            make_activity([{"local_ts": pd.Timestamp("2026-07-06 03:00:00"),
-                            "date": dt.date(2026, 7, 6)}]),
-            make_agent_info([{}]),
+            make_activity(
+                spark,
+                [{"local_ts": dt.datetime(2026, 7, 6, 3, 0, 0), "date": dt.date(2026, 7, 6)}],
+            ),
+            make_agent_info(spark, [{}]),
         )
-        assert out.iloc[0] == dt.date(2026, 7, 5)
+        assert out[0] == dt.date(2026, 7, 5)
 
-    def test_morning_agent_is_never_touched(self):
+    def test_morning_agent_is_never_touched(self, spark):
         out = _attribute(
-            make_activity([{"local_ts": pd.Timestamp("2026-07-06 03:00:00"),
-                            "date": dt.date(2026, 7, 6)}]),
-            make_agent_info([{"shift": "morning"}]),
+            make_activity(
+                spark,
+                [{"local_ts": dt.datetime(2026, 7, 6, 3, 0, 0), "date": dt.date(2026, 7, 6)}],
+            ),
+            make_agent_info(spark, [{"shift": "morning"}]),
         )
-        assert out.iloc[0] == dt.date(2026, 7, 6)
+        assert out[0] == dt.date(2026, 7, 6)
 
-    def test_before_cutover_keeps_legacy_split(self):
-        # Night tail on Jun 30 03:00 -> would roll to Jun 29, but it's pre-cutover.
+    def test_before_cutover_keeps_legacy_split(self, spark):
         out = _attribute(
-            make_activity([{"local_ts": pd.Timestamp("2026-06-30 03:00:00"),
-                            "date": dt.date(2026, 6, 30)}]),
-            make_agent_info([{"snapshot_month": dt.date(2026, 6, 1)}]),
+            make_activity(
+                spark,
+                [{"local_ts": dt.datetime(2026, 6, 30, 3, 0, 0), "date": dt.date(2026, 6, 30)}],
+            ),
+            make_agent_info(spark, [{"snapshot_month": dt.date(2026, 6, 1)}]),
         )
-        assert out.iloc[0] == dt.date(2026, 6, 30)
+        assert out[0] == dt.date(2026, 6, 30)
 
-    def test_july_1_boundary_tail_is_clamped(self):
-        # Tail at 2026-07-01 03:00 would roll back to Jun 30 (< cutover); clamp
-        # keeps it on its legacy calendar date (Jul 1) so June metrics are frozen.
+    def test_july_1_boundary_tail_is_clamped(self, spark):
         out = _attribute(
-            make_activity([{"local_ts": pd.Timestamp("2026-07-01 03:00:00"),
-                            "date": dt.date(2026, 7, 1)}]),
-            make_agent_info([{}]),
+            make_activity(
+                spark,
+                [{"local_ts": dt.datetime(2026, 7, 1, 3, 0, 0), "date": dt.date(2026, 7, 1)}],
+            ),
+            make_agent_info(spark, [{}]),
         )
-        assert out.iloc[0] == dt.date(2026, 7, 1)
+        assert out[0] == dt.date(2026, 7, 1)
 
-    def test_unknown_night_month_is_left_join_miss(self):
-        # Activity in a month with no night-roster row -> treated as non-night.
+    def test_unknown_night_month_is_left_join_miss(self, spark):
         out = _attribute(
-            make_activity([{"local_ts": pd.Timestamp("2026-08-02 03:00:00"),
-                            "date": dt.date(2026, 8, 2)}]),
-            make_agent_info([{"snapshot_month": dt.date(2026, 7, 1)}]),
+            make_activity(
+                spark,
+                [{"local_ts": dt.datetime(2026, 8, 2, 3, 0, 0), "date": dt.date(2026, 8, 2)}],
+            ),
+            make_agent_info(spark, [{"snapshot_month": dt.date(2026, 7, 1)}]),
         )
-        assert out.iloc[0] == dt.date(2026, 8, 2)
+        assert out[0] == dt.date(2026, 8, 2)
 
-    def test_empty_frame_returns_empty_series(self):
-        empty = make_activity([{}]).iloc[0:0]
+    def test_empty_frame_returns_empty_result(self, spark):
+        empty = make_activity(spark, [{}]).limit(0)
         out = shift_start_date(
             empty,
             agent_col="agent",
             local_ts_col="local_ts",
             calendar_date_col="date",
-            night_months=night_agent_months(make_agent_info([{}])),
+            night_months=night_agent_months(make_agent_info(spark, [{}])),
         )
-        assert out.empty
+        assert out.count() == 0
 
-    def test_handles_tz_aware_local_ts(self):
-        out = _attribute(
-            make_activity(
-                [{"local_ts": pd.Timestamp("2026-07-06 03:00:00", tz="UTC"),
-                  "date": dt.date(2026, 7, 6)}]
-            ),
-            make_agent_info([{}]),
+    def test_preserves_other_columns_and_order(self, spark):
+        activity = make_activity(spark, [{}])
+        out = shift_start_date(
+            activity,
+            agent_col="agent",
+            local_ts_col="local_ts",
+            calendar_date_col="date",
+            night_months=night_agent_months(make_agent_info(spark, [{}])),
         )
-        assert out.iloc[0] == dt.date(2026, 7, 5)
+        assert out.columns == activity.columns
 
     def test_cutover_constant_is_july_1_2026(self):
-        assert NIGHT_SHIFT_CUTOVER == pd.Timestamp("2026-07-01")
+        assert NIGHT_SHIFT_CUTOVER == dt.date(2026, 7, 1)

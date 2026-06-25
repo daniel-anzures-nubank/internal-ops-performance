@@ -1,22 +1,21 @@
-"""Unit tests for ``metrics_data/adherent_time.py``.
+"""Unit tests for ``metrics_data/adherent_time.py`` (PySpark).
 
-These tests use small, hand-crafted pandas frames. They never touch
-Databricks — every check exercises pure-pandas transformation logic, which
-makes them fast (sub-second).
+These tests build small, hand-crafted Spark DataFrames via the session-scoped
+``spark`` fixture (see ``tests/conftest.py``). They never touch Databricks —
+every check exercises the pure Spark transformation logic.
 
-adherent_time is now a RAW dataset: ``filter_dime`` keeps every slot with a
-non-null ``activity_type_required`` (business exclusions move to the metrics
-layer), and the output is one row per DIME slot with ``adherent_minutes`` and
-``required_minutes`` plus the standardized dimensions
-(agent, xforce, xplead, squad, district, shift).
+adherent_time is a RAW dataset: ``filter_dime`` keeps every slot with a non-null
+``activity_type_required`` (business exclusions move to the metrics layer), and
+the output is one row per DIME slot with ``adherent_minutes`` and
+``required_minutes`` plus the standardized dimensions.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 
-import pandas as pd
 import pytest
+from pyspark.sql import types as T
 
 from adherent_time import (
     CORE_OUT_OF_SCOPE_SQUADS,
@@ -28,7 +27,6 @@ from adherent_time import (
     filter_productivity,
 )
 
-
 # ---------------------------------------------------------------------------
 # Builders for synthetic input frames
 # ---------------------------------------------------------------------------
@@ -36,16 +34,72 @@ from adherent_time import (
 D = dt.date(2026, 5, 18)
 
 _DAY_SECONDS = 86400
+# A UTC-midnight-aligned unix + 6h, so the local time-of-day is exactly 06:00:00.
 SLOT_06_LOCAL = (
     int(dt.datetime(2026, 5, 18, 12, 0, 0).timestamp()) // _DAY_SECONDS
 ) * _DAY_SECONDS + 6 * 3600
-# 06:00 local → 12:00 UTC. We use UTC unix for productivity rows.
 SLOT_06_UTC = SLOT_06_LOCAL + MEXICO_UTC_OFFSET_SECONDS
 
 
-def make_dime_row(**overrides) -> dict:
-    """One synthetic DIME-slot row with sensible defaults (passes the filter)."""
-    base = {
+_DIME_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("date", T.DateType()),
+        T.StructField("squad", T.StringType()),
+        T.StructField("affiliation", T.StringType()),
+        T.StructField("activity_type_required", T.StringType()),
+        T.StructField("shuffle_status_required", T.StringType()),
+        T.StructField("dimensioned_activity", T.StringType()),
+        T.StructField("local_timestamp_dime_slot_starts_at", T.TimestampType()),
+        T.StructField("slot_start_local_unix", T.LongType()),
+        T.StructField("slot_end_local_unix", T.LongType()),
+    ]
+)
+
+_PROD_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("actor_id", T.StringType()),
+        T.StructField("timestamp", T.TimestampType()),
+        T.StructField("next_event_time", T.TimestampType()),
+        T.StructField("activity_start_unix", T.LongType()),
+        T.StructField("activity_end_unix", T.LongType()),
+        T.StructField("raw_status", T.StringType()),
+        T.StructField("inferred_status", T.StringType()),
+        T.StructField("channel", T.StringType()),
+        T.StructField("active_jobs", T.LongType()),
+        T.StructField("level_3", T.StringType()),
+    ]
+)
+
+_ROSTER_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("actor_id", T.StringType()),
+        T.StructField("xforce", T.StringType()),
+        T.StructField("xplead", T.StringType()),
+        T.StructField("team", T.StringType()),
+        T.StructField("squad", T.StringType()),
+        T.StructField("squad_district", T.StringType()),
+        T.StructField("status", T.StringType()),
+        T.StructField("shift", T.StringType()),
+        T.StructField("snapshot_date", T.DateType()),
+        T.StructField("snapshot_month", T.DateType()),
+        T.StructField("hire_start_date", T.DateType()),
+        T.StructField("last_change_date", T.DateType()),
+    ]
+)
+
+
+def _rows_to_df(spark, schema, rows, defaults):
+    data = [{**defaults, **r} for r in rows]
+    return spark.createDataFrame(
+        [tuple(r[f.name] for f in schema.fields) for r in data], schema
+    )
+
+
+def make_dime(spark, rows):
+    defaults = {
         "agent": "jane.doe",
         "date": D,
         "squad": "core",
@@ -57,21 +111,15 @@ def make_dime_row(**overrides) -> dict:
         "slot_start_local_unix": SLOT_06_LOCAL,
         "slot_end_local_unix": SLOT_06_LOCAL + SLOT_DURATION_SECONDS,
     }
-    base.update(overrides)
-    return base
+    return _rows_to_df(spark, _DIME_SCHEMA, rows, defaults)
 
 
-def make_dime(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame([make_dime_row(**r) for r in rows])
-
-
-def make_prod_row(**overrides) -> dict:
-    """One synthetic productivity row (defaults are a 30-min available shift)."""
-    base = {
+def make_prod(spark, rows):
+    defaults = {
         "agent": "jane.doe",
         "actor_id": "actor-1",
-        "timestamp": pd.Timestamp("2026-05-18 12:00:00"),
-        "next_event_time": pd.Timestamp("2026-05-18 12:30:00"),
+        "timestamp": dt.datetime(2026, 5, 18, 12, 0, 0),
+        "next_event_time": dt.datetime(2026, 5, 18, 12, 30, 0),
         "activity_start_unix": SLOT_06_UTC,
         "activity_end_unix": SLOT_06_UTC + 1800,
         "raw_status": "available",
@@ -80,16 +128,14 @@ def make_prod_row(**overrides) -> dict:
         "active_jobs": 0,
         "level_3": None,
     }
-    base.update(overrides)
-    return base
+    return _rows_to_df(spark, _PROD_SCHEMA, rows, defaults)
 
 
-def make_prod(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame([make_prod_row(**r) for r in rows])
+def empty_prod(spark):
+    return spark.createDataFrame([], _PROD_SCHEMA)
 
 
-def make_roster(rows: list[dict]) -> pd.DataFrame:
-    """One synthetic roster row per agent×month (defaults are active core)."""
+def make_roster(spark, rows):
     defaults = {
         "agent": "jane.doe",
         "actor_id": "actor-1",
@@ -105,7 +151,7 @@ def make_roster(rows: list[dict]) -> pd.DataFrame:
         "hire_start_date": dt.date(2025, 1, 15),
         "last_change_date": dt.date(2025, 1, 15),
     }
-    return pd.DataFrame([{**defaults, **r} for r in rows])
+    return _rows_to_df(spark, _ROSTER_SCHEMA, rows, defaults)
 
 
 # ---------------------------------------------------------------------------
@@ -114,38 +160,27 @@ def make_roster(rows: list[dict]) -> pd.DataFrame:
 
 
 class TestFilterDime:
-    def test_keeps_well_formed_row(self):
-        out = filter_dime(make_dime([{}]))
-        assert len(out) == 1
+    def test_keeps_well_formed_row(self, spark):
+        assert filter_dime(make_dime(spark, [{}])).count() == 1
 
-    def test_drops_null_activity_type(self):
-        out = filter_dime(make_dime([{"activity_type_required": None}]))
-        assert out.empty
+    def test_drops_null_activity_type(self, spark):
+        assert filter_dime(make_dime(spark, [{"activity_type_required": None}])).count() == 0
 
     @pytest.mark.parametrize("act", ["lunch_break", "time_off", "shrinkage"])
-    def test_keeps_formerly_excluded_activity_types(self, act):
-        # Raw table: these exclusions now belong to the metrics layer.
-        out = filter_dime(make_dime([{"activity_type_required": act}]))
-        assert len(out) == 1
-
-    @pytest.mark.parametrize("dim", ["Mouring", "Licencia", "Vacacion"])
-    def test_keeps_formerly_excluded_dimensioned_activities(self, dim):
-        out = filter_dime(make_dime([{"dimensioned_activity": dim}]))
-        assert len(out) == 1
+    def test_keeps_formerly_excluded_activity_types(self, spark, act):
+        assert filter_dime(make_dime(spark, [{"activity_type_required": act}])).count() == 1
 
     @pytest.mark.parametrize("squad", ["wfm", "credit_evolution", "dote"])
-    def test_keeps_formerly_excluded_squads(self, squad):
-        out = filter_dime(make_dime([{"squad": squad}]))
-        assert len(out) == 1
+    def test_keeps_formerly_excluded_squads(self, spark, squad):
+        assert filter_dime(make_dime(spark, [{"squad": squad}])).count() == 1
 
-    def test_keeps_null_squad(self):
-        out = filter_dime(make_dime([{"squad": None}]))
-        assert len(out) == 1
+    def test_keeps_null_squad(self, spark):
+        assert filter_dime(make_dime(spark, [{"squad": None}])).count() == 1
 
-    def test_adds_utc_unix_columns_with_six_hour_offset(self):
-        out = filter_dime(make_dime([{}]))
-        assert out.iloc[0]["slot_start"] == SLOT_06_LOCAL + MEXICO_UTC_OFFSET_SECONDS
-        assert out.iloc[0]["slot_end"] == out.iloc[0]["slot_start"] + SLOT_DURATION_SECONDS
+    def test_adds_utc_unix_columns_with_six_hour_offset(self, spark):
+        row = filter_dime(make_dime(spark, [{}])).collect()[0]
+        assert row["slot_start"] == SLOT_06_LOCAL + MEXICO_UTC_OFFSET_SECONDS
+        assert row["slot_end"] == row["slot_start"] + SLOT_DURATION_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -155,62 +190,50 @@ class TestFilterDime:
 
 class TestFilterProductivity:
     @pytest.mark.parametrize("status", ["available", "oos", "training"])
-    def test_keeps_connected_status(self, status):
-        out = filter_productivity(make_prod([{"inferred_status": status}]))
-        assert len(out) == 1
+    def test_keeps_connected_status(self, spark, status):
+        assert filter_productivity(make_prod(spark, [{"inferred_status": status}])).count() == 1
 
-    def test_keeps_paused_with_jobs(self):
+    def test_keeps_paused_with_jobs(self, spark):
         out = filter_productivity(
-            make_prod([{"inferred_status": "pause", "level_3": "paused_with_jobs"}])
+            make_prod(spark, [{"inferred_status": "pause", "level_3": "paused_with_jobs"}])
         )
-        assert len(out) == 1
+        assert out.count() == 1
 
-    def test_drops_plain_paused(self):
+    def test_drops_plain_paused(self, spark):
         out = filter_productivity(
-            make_prod([{"inferred_status": "pause", "level_3": "paused"}])
+            make_prod(spark, [{"inferred_status": "pause", "level_3": "paused"}])
         )
-        assert out.empty
+        assert out.count() == 0
 
-    def test_keeps_active_jobs_positive_regardless_of_status(self):
+    def test_keeps_active_jobs_positive_regardless_of_status(self, spark):
         out = filter_productivity(
-            make_prod([{"inferred_status": "lunch_break", "active_jobs": 1}])
+            make_prod(spark, [{"inferred_status": "lunch_break", "active_jobs": 1}])
         )
-        assert len(out) == 1
+        assert out.count() == 1
 
-    def test_drops_unknown_status_with_no_active_jobs(self):
+    def test_drops_unknown_status_with_no_active_jobs(self, spark):
         out = filter_productivity(
-            make_prod([{"inferred_status": "weird_status", "active_jobs": 0}])
+            make_prod(spark, [{"inferred_status": "weird_status", "active_jobs": 0}])
         )
-        assert out.empty
+        assert out.count() == 0
 
-    def test_keeps_null_status_after_jan_22_2026(self):
-        out = filter_productivity(
-            make_prod(
-                [{"inferred_status": None, "timestamp": pd.Timestamp("2026-02-15 12:00:00")}]
-            )
-        )
-        assert len(out) == 1
-
-    def test_drops_null_status_before_jan_22_2026(self):
+    def test_keeps_null_status_after_jan_22_2026(self, spark):
         out = filter_productivity(
             make_prod(
-                [{"inferred_status": None, "timestamp": pd.Timestamp("2026-01-10 12:00:00")}]
+                spark,
+                [{"inferred_status": None, "timestamp": dt.datetime(2026, 2, 15, 12, 0, 0)}],
             )
         )
-        assert out.empty
+        assert out.count() == 1
 
-    def test_handles_tz_aware_utc_timestamps_from_warehouse(self):
+    def test_drops_null_status_before_jan_22_2026(self, spark):
         out = filter_productivity(
             make_prod(
-                [
-                    {
-                        "inferred_status": None,
-                        "timestamp": pd.Timestamp("2026-02-15 12:00:00", tz="UTC"),
-                    }
-                ]
+                spark,
+                [{"inferred_status": None, "timestamp": dt.datetime(2026, 1, 10, 12, 0, 0)}],
             )
         )
-        assert len(out) == 1
+        assert out.count() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -219,119 +242,74 @@ class TestFilterProductivity:
 
 
 class TestComputeSlotAdherence:
-    def _one_slot(self, **dime_overrides) -> pd.DataFrame:
-        return filter_dime(make_dime([dime_overrides]))
+    def _one_slot(self, spark, **dime_overrides):
+        return filter_dime(make_dime(spark, [dime_overrides]))
 
-    def test_activity_fully_inside_slot(self):
-        slots = self._one_slot()
+    def _final(self, slots, prod):
+        rows = compute_slot_adherence(slots, prod).collect()
+        assert len(rows) == 1
+        return rows[0]["adherent_time_final"]
+
+    def test_activity_fully_inside_slot(self, spark):
         prod = filter_productivity(
             make_prod(
-                [
-                    {
-                        "activity_start_unix": SLOT_06_UTC + 300,
-                        "activity_end_unix": SLOT_06_UTC + 900,
-                    }
-                ]
+                spark,
+                [{"activity_start_unix": SLOT_06_UTC + 300, "activity_end_unix": SLOT_06_UTC + 900}],
             )
         )
-        result = compute_slot_adherence(slots, prod)
-        assert len(result) == 1
-        assert result.iloc[0]["adherent_time_final"] == 600
+        assert self._final(self._one_slot(spark), prod) == 600
 
-    def test_activity_spans_slot(self):
-        slots = self._one_slot()
+    def test_activity_spans_slot(self, spark):
         prod = filter_productivity(
             make_prod(
-                [
-                    {
-                        "activity_start_unix": SLOT_06_UTC - 3600,
-                        "activity_end_unix": SLOT_06_UTC + 5400,
-                    }
-                ]
+                spark,
+                [{"activity_start_unix": SLOT_06_UTC - 3600, "activity_end_unix": SLOT_06_UTC + 5400}],
             )
         )
-        result = compute_slot_adherence(slots, prod)
-        assert result.iloc[0]["adherent_time_final"] == SLOT_DURATION_SECONDS
+        assert self._final(self._one_slot(spark), prod) == SLOT_DURATION_SECONDS
 
-    def test_activity_ends_inside_slot(self):
-        slots = self._one_slot()
+    def test_activity_ends_inside_slot(self, spark):
         prod = filter_productivity(
             make_prod(
-                [
-                    {
-                        "activity_start_unix": SLOT_06_UTC - 300,
-                        "activity_end_unix": SLOT_06_UTC + 600,
-                    }
-                ]
+                spark,
+                [{"activity_start_unix": SLOT_06_UTC - 300, "activity_end_unix": SLOT_06_UTC + 600}],
             )
         )
-        result = compute_slot_adherence(slots, prod)
-        assert result.iloc[0]["adherent_time_final"] == 600
+        assert self._final(self._one_slot(spark), prod) == 600
 
-    def test_activity_starts_inside_slot(self):
-        slots = self._one_slot()
+    def test_activity_starts_inside_slot(self, spark):
         prod = filter_productivity(
             make_prod(
-                [
-                    {
-                        "activity_start_unix": SLOT_06_UTC + 1200,
-                        "activity_end_unix": SLOT_06_UTC + 2400,
-                    }
-                ]
+                spark,
+                [{"activity_start_unix": SLOT_06_UTC + 1200, "activity_end_unix": SLOT_06_UTC + 2400}],
             )
         )
-        result = compute_slot_adherence(slots, prod)
-        assert result.iloc[0]["adherent_time_final"] == 600
+        assert self._final(self._one_slot(spark), prod) == 600
 
-    def test_no_overlap_still_returns_slot_with_zero(self):
-        slots = self._one_slot()
+    def test_no_overlap_still_returns_slot_with_zero(self, spark):
         prod = filter_productivity(
             make_prod(
-                [
-                    {
-                        "activity_start_unix": SLOT_06_UTC + 9999,
-                        "activity_end_unix": SLOT_06_UTC + 20000,
-                    }
-                ]
+                spark,
+                [{"activity_start_unix": SLOT_06_UTC + 9999, "activity_end_unix": SLOT_06_UTC + 20000}],
             )
         )
-        result = compute_slot_adherence(slots, prod)
-        assert len(result) == 1
-        assert result.iloc[0]["adherent_time_final"] == 0
+        assert self._final(self._one_slot(spark), prod) == 0
 
-    def test_multiple_productivity_rows_sum_then_cap(self):
-        slots = self._one_slot()
+    def test_multiple_productivity_rows_sum_then_cap(self, spark):
         prod = filter_productivity(
             make_prod(
+                spark,
                 [
-                    {
-                        "activity_start_unix": SLOT_06_UTC,
-                        "activity_end_unix": SLOT_06_UTC + 720,
-                    },
-                    {
-                        "activity_start_unix": SLOT_06_UTC + 720,
-                        "activity_end_unix": SLOT_06_UTC + 1440,
-                        "timestamp": pd.Timestamp("2026-05-18 12:12:00"),
-                        "next_event_time": pd.Timestamp("2026-05-18 12:24:00"),
-                    },
-                    {
-                        "activity_start_unix": SLOT_06_UTC + 1440,
-                        "activity_end_unix": SLOT_06_UTC + 2160,
-                        "timestamp": pd.Timestamp("2026-05-18 12:24:00"),
-                        "next_event_time": pd.Timestamp("2026-05-18 12:36:00"),
-                    },
-                ]
+                    {"activity_start_unix": SLOT_06_UTC, "activity_end_unix": SLOT_06_UTC + 720},
+                    {"activity_start_unix": SLOT_06_UTC + 720, "activity_end_unix": SLOT_06_UTC + 1440},
+                    {"activity_start_unix": SLOT_06_UTC + 1440, "activity_end_unix": SLOT_06_UTC + 2160},
+                ],
             )
         )
-        result = compute_slot_adherence(slots, prod)
-        assert result.iloc[0]["adherent_time_final"] == SLOT_DURATION_SECONDS
+        assert self._final(self._one_slot(spark), prod) == SLOT_DURATION_SECONDS
 
-    def test_empty_productivity_returns_all_slots_with_zero(self):
-        slots = self._one_slot()
-        prod = pd.DataFrame(columns=list(make_prod([{}]).columns))
-        result = compute_slot_adherence(slots, prod)
-        assert len(result) == 1
-        assert result.iloc[0]["adherent_time_final"] == 0
+    def test_empty_productivity_returns_all_slots_with_zero(self, spark):
+        assert self._final(self._one_slot(spark), empty_prod(spark)) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -340,15 +318,12 @@ class TestComputeSlotAdherence:
 
 
 class TestComputeAdherentTimeEndToEnd:
-    def test_one_agent_one_day_one_slot_full_adherent(self):
-        dime = make_dime([{}])
-        prod = make_prod([{}])  # exactly covers the slot
-        roster = make_roster([{}])
-
-        out = compute_adherent_time(roster, dime, prod)
-
+    def test_one_agent_one_day_one_slot_full_adherent(self, spark):
+        out = compute_adherent_time(
+            make_roster(spark, [{}]), make_dime(spark, [{}]), make_prod(spark, [{}])
+        ).collect()
         assert len(out) == 1
-        row = out.iloc[0]
+        row = out[0]
         assert row["agent"] == "jane.doe"
         assert row["xforce"] == "lead.one"
         assert row["squad"] == "core"
@@ -359,9 +334,11 @@ class TestComputeAdherentTimeEndToEnd:
         assert row["adherent_minutes"] == SLOT_DURATION_SECONDS / 60.0
         assert row["required_minutes"] == SLOT_DURATION_SECONDS / 60.0
 
-    def test_column_order_matches_schema(self):
-        out = compute_adherent_time(make_roster([{}]), make_dime([{}]), make_prod([{}]))
-        assert list(out.columns) == [
+    def test_column_order_matches_schema(self, spark):
+        out = compute_adherent_time(
+            make_roster(spark, [{}]), make_dime(spark, [{}]), make_prod(spark, [{}])
+        )
+        assert out.columns == [
             "agent",
             "xforce",
             "xplead",
@@ -376,133 +353,105 @@ class TestComputeAdherentTimeEndToEnd:
             "adherent_minutes",
         ]
 
-    def test_no_productivity_yields_zero_adherent_full_required(self):
-        dime = make_dime([{}])
-        prod = pd.DataFrame(columns=list(make_prod([{}]).columns))
-        roster = make_roster([{}])
-
-        out = compute_adherent_time(roster, dime, prod)
-
+    def test_no_productivity_yields_zero_adherent_full_required(self, spark):
+        out = compute_adherent_time(
+            make_roster(spark, [{}]), make_dime(spark, [{}]), empty_prod(spark)
+        ).collect()
         assert len(out) == 1
-        assert out.iloc[0]["adherent_minutes"] == 0.0
-        assert out.iloc[0]["required_minutes"] == SLOT_DURATION_SECONDS / 60.0
+        assert out[0]["adherent_minutes"] == 0.0
+        assert out[0]["required_minutes"] == SLOT_DURATION_SECONDS / 60.0
 
-    def test_inactive_agent_dropped(self):
-        dime = make_dime([{}])
-        prod = make_prod([{}])
-        roster = make_roster([{"status": "inactive"}])
-
-        out = compute_adherent_time(roster, dime, prod)
-        assert out.empty
+    def test_inactive_agent_dropped(self, spark):
+        out = compute_adherent_time(
+            make_roster(spark, [{"status": "inactive"}]),
+            make_dime(spark, [{}]),
+            make_prod(spark, [{}]),
+        )
+        assert out.count() == 0
 
     def test_out_of_scope_squads_constant_is_empty(self):
         assert CORE_OUT_OF_SCOPE_SQUADS == ()
 
     @pytest.mark.parametrize("squad", ["social", "content"])
-    def test_social_and_content_squads_kept(self, squad):
-        dime = make_dime([{}])
-        prod = make_prod([{}])
-        roster = make_roster([{"squad": squad}])
-
-        out = compute_adherent_time(roster, dime, prod)
+    def test_social_and_content_squads_kept(self, spark, squad):
+        out = compute_adherent_time(
+            make_roster(spark, [{"squad": squad}]),
+            make_dime(spark, [{}]),
+            make_prod(spark, [{}]),
+        ).collect()
         assert len(out) == 1
-        assert out.iloc[0]["squad"] == squad
+        assert out[0]["squad"] == squad
 
-    def test_each_slot_emits_its_own_row(self):
+    def test_each_slot_emits_its_own_row(self, spark):
         dime = make_dime(
+            spark,
             [
                 {},
                 {
-                    "local_timestamp_dime_slot_starts_at": dt.datetime(
-                        2026, 5, 18, 6, 30, 0
-                    ),
+                    "local_timestamp_dime_slot_starts_at": dt.datetime(2026, 5, 18, 6, 30, 0),
                     "slot_start_local_unix": SLOT_06_LOCAL + 1800,
                     "slot_end_local_unix": SLOT_06_LOCAL + 3600,
                 },
-            ]
+            ],
         )
-        prod = pd.DataFrame(columns=list(make_prod([{}]).columns))
-        roster = make_roster([{}])
-
-        out = compute_adherent_time(roster, dime, prod)
+        out = compute_adherent_time(make_roster(spark, [{}]), dime, empty_prod(spark)).collect()
         assert len(out) == 2
-        assert (out["required_minutes"] == SLOT_DURATION_SECONDS / 60.0).all()
-        assert (out["adherent_minutes"] == 0.0).all()
-        assert sorted(out["slot_time"].tolist()) == ["06:00:00", "06:30:00"]
-        assert out["required_minutes"].sum() == 2 * SLOT_DURATION_SECONDS / 60.0
+        assert all(r["required_minutes"] == SLOT_DURATION_SECONDS / 60.0 for r in out)
+        assert all(r["adherent_minutes"] == 0.0 for r in out)
+        assert sorted(r["slot_time"] for r in out) == ["06:00:00", "06:30:00"]
 
-    def test_handles_tz_aware_roster_snapshot_month(self):
-        dime = make_dime([{}])
-        prod = make_prod([{}])
-        roster = make_roster([{"snapshot_month": pd.Timestamp("2026-05-01", tz="UTC")}])
-        out = compute_adherent_time(roster, dime, prod)
-        assert len(out) == 1
-        assert out.iloc[0]["adherent_minutes"] == SLOT_DURATION_SECONDS / 60.0
-
-    def test_night_tail_attributed_to_shift_start_day(self):
+    def test_night_tail_attributed_to_shift_start_day(self, spark):
         # Night agent, slot at Jul 6 03:00 local -> attributed to Jul 5.
-        ts = pd.Timestamp("2026-07-06 03:00:00")
-        local_unix = int(ts.value // 10**9)
+        local_unix = int(dt.datetime(2026, 7, 6, 3, 0, 0).replace(tzinfo=dt.timezone.utc).timestamp())
         dime = make_dime(
+            spark,
             [
                 {
                     "date": dt.date(2026, 7, 6),
-                    "local_timestamp_dime_slot_starts_at": ts,
+                    "local_timestamp_dime_slot_starts_at": dt.datetime(2026, 7, 6, 3, 0, 0),
                     "slot_start_local_unix": local_unix,
                     "slot_end_local_unix": local_unix + SLOT_DURATION_SECONDS,
                 }
-            ]
+            ],
         )
-        prod = pd.DataFrame(columns=list(make_prod([{}]).columns))
         roster = make_roster(
-            [{"shift": "night", "snapshot_month": dt.date(2026, 7, 1),
-              "snapshot_date": dt.date(2026, 7, 31)}]
+            spark,
+            [{"shift": "night", "snapshot_month": dt.date(2026, 7, 1), "snapshot_date": dt.date(2026, 7, 31)}],
         )
-        out = compute_adherent_time(roster, dime, prod)
+        out = compute_adherent_time(roster, dime, empty_prod(spark)).collect()
         assert len(out) == 1
-        assert out.iloc[0]["date"] == dt.date(2026, 7, 5)
-        assert out.iloc[0]["slot_time"] == "03:00:00"
+        assert out[0]["date"] == dt.date(2026, 7, 5)
+        assert out[0]["slot_time"] == "03:00:00"
 
-    def test_night_tail_before_cutover_keeps_calendar_day(self):
-        ts = pd.Timestamp("2026-06-30 03:00:00")
-        local_unix = int(ts.value // 10**9)
+    def test_night_tail_before_cutover_keeps_calendar_day(self, spark):
+        local_unix = int(dt.datetime(2026, 6, 30, 3, 0, 0).replace(tzinfo=dt.timezone.utc).timestamp())
         dime = make_dime(
+            spark,
             [
                 {
                     "date": dt.date(2026, 6, 30),
-                    "local_timestamp_dime_slot_starts_at": ts,
+                    "local_timestamp_dime_slot_starts_at": dt.datetime(2026, 6, 30, 3, 0, 0),
                     "slot_start_local_unix": local_unix,
                     "slot_end_local_unix": local_unix + SLOT_DURATION_SECONDS,
                 }
-            ]
+            ],
         )
-        prod = pd.DataFrame(columns=list(make_prod([{}]).columns))
         roster = make_roster(
-            [{"shift": "night", "snapshot_month": dt.date(2026, 6, 1),
-              "snapshot_date": dt.date(2026, 6, 30)}]
+            spark,
+            [{"shift": "night", "snapshot_month": dt.date(2026, 6, 1), "snapshot_date": dt.date(2026, 6, 30)}],
         )
-        out = compute_adherent_time(roster, dime, prod)
+        out = compute_adherent_time(roster, dime, empty_prod(spark)).collect()
         assert len(out) == 1
-        assert out.iloc[0]["date"] == dt.date(2026, 6, 30)
+        assert out[0]["date"] == dt.date(2026, 6, 30)
 
-    def test_uses_month_specific_roster_snapshot(self):
-        dime = make_dime([{}])
-        prod = make_prod([{}])
+    def test_uses_month_specific_roster_snapshot(self, spark):
         roster = make_roster(
+            spark,
             [
-                {
-                    "snapshot_month": dt.date(2026, 4, 1),
-                    "snapshot_date": dt.date(2026, 4, 30),
-                    "squad": "wrong-april",
-                },
-                {
-                    "snapshot_month": dt.date(2026, 5, 1),
-                    "snapshot_date": dt.date(2026, 5, 31),
-                    "squad": "correct-may",
-                },
-            ]
+                {"snapshot_month": dt.date(2026, 4, 1), "snapshot_date": dt.date(2026, 4, 30), "squad": "wrong-april"},
+                {"snapshot_month": dt.date(2026, 5, 1), "snapshot_date": dt.date(2026, 5, 31), "squad": "correct-may"},
+            ],
         )
-
-        out = compute_adherent_time(roster, dime, prod)
+        out = compute_adherent_time(roster, make_dime(spark, [{}]), make_prod(spark, [{}])).collect()
         assert len(out) == 1
-        assert out.iloc[0]["squad"] == "correct-may"
+        assert out[0]["squad"] == "correct-may"

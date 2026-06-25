@@ -1,10 +1,13 @@
 [project]
 name = "internal-ops-performance"
 version = "0.1.0"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
+# Runtime is Databricks: the cluster provides PySpark, Delta, and an ambient
+# SparkSession. These are the libraries the pipeline needs on top of that.
+#   * pandas / python-dotenv — only the Google Sheets -> Delta sync path and the
+#     `.env` loader for local/off-cluster runs; the metric pipeline itself is
+#     pure PySpark.
 dependencies = [
-    "databricks-sql-connector[pyarrow]>=4.2.6",
-    "databricks-sdk>=0.108",  # used for OAuth U2M (browser) auth so a PAT isn't required
     "pandas>=2.0.0",
     "python-dotenv>=1.2",
 ]
@@ -12,9 +15,14 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    # PySpark for running the Spark test suite off-cluster. On Databricks the
+    # runtime supplies Spark, so it is NOT a project runtime dependency. PySpark
+    # has no wheels for Python >= 3.13, so the suite must run on a Python
+    # 3.11/3.12 interpreter (or directly on a Databricks cluster).
+    "pyspark>=3.5",
 ]
-# Local Google Sheets access (gsheets.py). Optional — only needed to read/write
-# Sheets directly from a laptop (no Databricks). `uv sync --group sheets`.
+# Google Sheets access (gsheets.py) for the adjustments sheet -> Delta sync.
+# Optional — `uv sync --group sheets`.
 sheets = [
     "gspread>=6.0",
     "google-auth>=2.0",
@@ -22,7 +30,7 @@ sheets = [
 
 [tool.pytest.ini_options]
 # Import roots:
-#   * "."            -> top-level `db.py` (Databricks transport, shared by scripts).
+#   * "."            -> top-level `db.py` (Spark transport, shared by scripts).
 #   * "tests"        -> `checks.py` (DQ logic, lives next to its tests).
 #   * "metrics_data" -> raw-table compute modules (e.g. `adherent_time.py`).
 #   * "metrics"      -> metrics-layer compute modules (e.g. `adherence.py`).

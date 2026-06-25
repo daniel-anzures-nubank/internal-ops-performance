@@ -1,34 +1,75 @@
-"""Pandas helpers for the approved manual-adjustment CSVs.
+"""PySpark helpers for the manual-adjustment layer.
 
-These helpers intentionally implement the current adjustment tabs directly.
-They are small and typed so metric modules can stay pure and tests can pass
-synthetic adjustment frames without reading files.
+The adjustment tabs (from the Google Sheet) are synced to small Delta tables —
+one per tab — by ``scripts/adjustments_scripts/sync_adjustments.py``. These
+helpers read those tables and apply each adjustment to the (large) metric/raw
+Spark DataFrames.
+
+Because the adjustment tables are tiny config (a handful of rows), we collect
+them to the driver and build Spark ``Column`` predicates row-by-row — this mirrors
+the original pandas row-iteration semantics exactly (OR across rows) without an
+expensive join.
+
+Column-name convention
+----------------------
+Delta/Parquet dislikes spaces and parentheses in column names, so the sync step
+normalizes the Spanish sheet headers to snake_case (``Fecha Inicio`` ->
+``fecha_inicio``, ``Job (Clasificación)`` -> ``job_clasificacion``). These
+helpers read those normalized names.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+from datetime import date
+from typing import Any
 
-import pandas as pd
+from pyspark.sql import Column, DataFrame, SparkSession
+from pyspark.sql import functions as F
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = REPO_ROOT / "adjustments" / "data"
-MISSING_DIME_PATH = REPO_ROOT / "adjustments" / "slots_faltantes_dime.csv"
+# Default location of the synced adjustment Delta tables: one table per tab,
+# named ``{ADJUSTMENT_SCHEMA}.adj_{name}``.
+ADJUSTMENT_SCHEMA = "usr.danielanzures"
+ADJUSTMENT_TABLE_PREFIX = "adj_"
+
+# Normalized (snake_case) column names the sync step writes.
+COL_AGENT = "agente"
+COL_TEAM = "equipo"
+COL_DATE_START = "fecha_inicio"
+COL_DATE_END = "fecha_fin"
+COL_TIME_START = "hora_inicio"
+COL_TIME_END = "hora_fin"
+COL_LABEL = "etiqueta_correcta"
+COL_QUEUES = "queues_a_excluir"
+COL_JOB = "job_clasificacion"
 
 
-def read_adjustment_csv(name: str) -> pd.DataFrame:
-    path = DATA_DIR / f"{name}.csv"
-    if not path.exists():
-        return pd.DataFrame()
-    return pd.read_csv(path, dtype=str).fillna("")
+def adjustment_table_name(name: str, schema: str = ADJUSTMENT_SCHEMA) -> str:
+    return f"{schema}.{ADJUSTMENT_TABLE_PREFIX}{name}"
 
 
-def _empty(df: pd.DataFrame | None) -> bool:
-    return df is None or df.empty
+def read_adjustment_table(
+    spark: SparkSession, name: str, schema: str = ADJUSTMENT_SCHEMA
+) -> DataFrame | None:
+    """Read one synced adjustment Delta table, or ``None`` if it doesn't exist."""
+    table = adjustment_table_name(name, schema)
+    if not spark.catalog.tableExists(table):
+        return None
+    return spark.table(table)
 
 
-def _to_date(value: object) -> pd.Timestamp:
-    return pd.Timestamp(str(value).strip()).normalize()
+# ---------------------------------------------------------------------------
+# Small parsing helpers (driver-side, on collected config rows)
+# ---------------------------------------------------------------------------
+
+
+def _rows(adjustments: DataFrame | None) -> list[dict[str, Any]]:
+    if adjustments is None:
+        return []
+    return [r.asDict() for r in adjustments.collect()]
+
+
+def _to_date(value: object) -> date:
+    return date.fromisoformat(str(value).strip()[:10])
 
 
 def _time_to_minutes(value: object) -> int:
@@ -36,155 +77,202 @@ def _time_to_minutes(value: object) -> int:
     return int(h) * 60 + int(m)
 
 
-def _row_window_mask(df: pd.DataFrame, row: pd.Series) -> pd.Series:
-    dates = pd.to_datetime(df["date"]).dt.normalize()
-    start = _to_date(row["Fecha Inicio"])
-    end = _to_date(row["Fecha Fin"])
-    date_ok = dates.between(start, end)
+def _slot_minutes_col(df: DataFrame) -> Column:
+    parts = F.split(F.col("slot_time"), ":")
+    return parts.getItem(0).cast("int") * 60 + parts.getItem(1).cast("int")
 
+
+def _row_window_mask(df: DataFrame, row: dict[str, Any]) -> Column:
+    date_col = F.to_date(F.col("date"))
+    date_ok = (date_col >= F.lit(_to_date(row[COL_DATE_START]))) & (
+        date_col <= F.lit(_to_date(row[COL_DATE_END]))
+    )
     if "slot_time" not in df.columns:
         return date_ok
-    slot_minutes = df["slot_time"].astype(str).str.slice(0, 5).map(_time_to_minutes)
-    start_min = _time_to_minutes(row["Hora Inicio"])
-    end_min = _time_to_minutes(row["Hora Fin"])
-    # 23:59 is the full-day sentinel. Treat it as the end of day so the 23:30
-    # slot is included while normal windows remain half-open.
+    slot_minutes = _slot_minutes_col(df)
+    start_min = _time_to_minutes(row[COL_TIME_START])
+    end_min = _time_to_minutes(row[COL_TIME_END])
+    # 23:59 is the full-day sentinel: treat as end-of-day so the 23:30 slot is
+    # included while normal windows remain half-open.
     end_exclusive = 24 * 60 if end_min == 23 * 60 + 59 else end_min
     return date_ok & (slot_minutes >= start_min) & (slot_minutes < end_exclusive)
 
 
-def _scope_mask(df: pd.DataFrame, row: pd.Series) -> pd.Series:
-    mask = pd.Series(True, index=df.index)
-    team = str(row.get("Equipo", "")).strip().lower()
-    if team and team != "todos" and "team" in df.columns:
-        mask &= df["team"].astype(str).str.lower() == team
+def _str(value: object) -> str:
+    return "" if value is None else str(value).strip()
 
-    agent = str(row.get("Agente", "")).strip()
+
+def _scope_mask(df: DataFrame, row: dict[str, Any]) -> Column:
+    mask = F.lit(True)
+    team = _str(row.get(COL_TEAM)).lower()
+    if team and team != "todos" and "team" in df.columns:
+        mask = mask & (F.lower(F.col("team")) == team)
+
+    agent = _str(row.get(COL_AGENT))
     agent_l = agent.lower()
     if not agent_l or agent_l == "todos":
         return mask
     if agent_l.startswith("todos (xplead:") and "xplead" in df.columns:
         xplead = agent.split(":", maxsplit=1)[1].rstrip(")").strip().lower()
-        return mask & (df["xplead"].astype(str).str.lower() == xplead)
+        return mask & (F.lower(F.col("xplead")) == xplead)
     if agent_l.startswith("todos (squad") and "squad" in df.columns:
         squad = agent.split("squad", maxsplit=1)[1].rstrip(")").strip().lower()
-        return mask & df["squad"].astype(str).str.lower().str.contains(
-            squad, regex=False, na=False
-        )
+        return mask & F.lower(F.col("squad")).contains(squad)
     if "agent" in df.columns:
-        return mask & (df["agent"].astype(str).str.lower() == agent_l)
+        return mask & (F.lower(F.col("agent")) == agent_l)
     return mask
 
 
-def _combined_window_mask(df: pd.DataFrame, adjustments: pd.DataFrame) -> pd.Series:
-    if _empty(adjustments) or df.empty:
-        return pd.Series(False, index=df.index)
-    mask = pd.Series(False, index=df.index)
-    for _, row in adjustments.iterrows():
-        mask |= _scope_mask(df, row) & _row_window_mask(df, row)
+def _combined_window_mask(df: DataFrame, rows: list[dict[str, Any]]) -> Column:
+    mask = F.lit(False)
+    for row in rows:
+        mask = mask | (_scope_mask(df, row) & _row_window_mask(df, row))
     return mask
 
 
-def reclassify_dime_slots(slots: pd.DataFrame, inconsistencies: pd.DataFrame | None) -> pd.DataFrame:
-    if _empty(inconsistencies) or slots.empty:
-        return slots.copy()
-    out = slots.copy()
-    for _, row in inconsistencies.iterrows():
-        label = str(row.get("Etiqueta Correcta", "")).strip()
+# ---------------------------------------------------------------------------
+# Slot-window adjustments (Exclusiones Generales / Training / Shadowing,
+# Inconsistencias DIME, No Shrinkage)
+# ---------------------------------------------------------------------------
+
+
+def reclassify_dime_slots(
+    slots: DataFrame, inconsistencies: DataFrame | None
+) -> DataFrame:
+    rows = _rows(inconsistencies)
+    if not rows:
+        return slots
+    out = slots
+    has_shrinkage = "shrinkage_flag" in out.columns
+    extra_flags = [
+        c
+        for c in ("controllable_shrinkage_flag", "uncontrollable_shrinkage_flag")
+        if c in out.columns
+    ]
+    for row in rows:
+        label = _str(row.get(COL_LABEL))
         if not label:
             continue
         mask = _scope_mask(out, row) & _row_window_mask(out, row)
-        out.loc[mask, "activity_type_required"] = label
-        if "shrinkage_flag" in out.columns:
-            out.loc[mask, "shrinkage_flag"] = int(label == "shrinkage")
+        out = out.withColumn(
+            "activity_type_required",
+            F.when(mask, F.lit(label)).otherwise(F.col("activity_type_required")),
+        )
+        if has_shrinkage:
+            out = out.withColumn(
+                "shrinkage_flag",
+                F.when(mask, F.lit(int(label == "shrinkage"))).otherwise(
+                    F.col("shrinkage_flag")
+                ),
+            )
             if label != "shrinkage":
-                for col in ("controllable_shrinkage_flag", "uncontrollable_shrinkage_flag"):
-                    if col in out.columns:
-                        out.loc[mask, col] = 0
+                for col in extra_flags:
+                    out = out.withColumn(
+                        col, F.when(mask, F.lit(0)).otherwise(F.col(col))
+                    )
     return out
 
 
-def drop_slot_windows(df: pd.DataFrame, *adjustments: pd.DataFrame | None) -> pd.DataFrame:
-    if df.empty:
-        return df.copy()
-    mask = pd.Series(False, index=df.index)
+def drop_slot_windows(df: DataFrame, *adjustments: DataFrame | None) -> DataFrame:
+    mask = F.lit(False)
+    any_rows = False
     for adj in adjustments:
-        if not _empty(adj):
-            mask |= _combined_window_mask(df, adj)
-    return df.loc[~mask].copy()
+        rows = _rows(adj)
+        if rows:
+            any_rows = True
+            mask = mask | _combined_window_mask(df, rows)
+    if not any_rows:
+        return df
+    return df.filter(~mask)
 
 
-def apply_no_shrinkage(df: pd.DataFrame, no_shrinkage: pd.DataFrame | None) -> pd.DataFrame:
-    if _empty(no_shrinkage) or df.empty:
-        return df.copy()
-    out = df.copy()
-    mask = _combined_window_mask(out, no_shrinkage)
-    out.loc[mask, "shrinkage_flag"] = 0
+def apply_no_shrinkage(df: DataFrame, no_shrinkage: DataFrame | None) -> DataFrame:
+    rows = _rows(no_shrinkage)
+    if not rows:
+        return df
+    mask = _combined_window_mask(df, rows)
+    out = df.withColumn(
+        "shrinkage_flag", F.when(mask, F.lit(0)).otherwise(F.col("shrinkage_flag"))
+    )
     for col in ("controllable_shrinkage_flag", "uncontrollable_shrinkage_flag"):
         if col in out.columns:
-            out.loc[mask, col] = 0
+            out = out.withColumn(col, F.when(mask, F.lit(0)).otherwise(F.col(col)))
     return out
 
 
-def _job_date_mask(df: pd.DataFrame, row: pd.Series) -> pd.Series:
-    dates = pd.to_datetime(df["date"]).dt.normalize()
-    return dates.between(_to_date(row["Fecha Inicio"]), _to_date(row["Fecha Fin"]))
+# ---------------------------------------------------------------------------
+# Job-window adjustments (Cross Support / Exclusiones Jobs)
+# ---------------------------------------------------------------------------
 
 
-def _job_scope_mask(df: pd.DataFrame, row: pd.Series) -> pd.Series:
-    return _scope_mask(df, row)
+def _job_date_mask(df: DataFrame, row: dict[str, Any]) -> Column:
+    date_col = F.to_date(F.col("date"))
+    return (date_col >= F.lit(_to_date(row[COL_DATE_START]))) & (
+        date_col <= F.lit(_to_date(row[COL_DATE_END]))
+    )
 
 
-def _contains_any(series: pd.Series, values: list[str]) -> pd.Series:
-    haystack = series.astype(str).str.lower()
-    mask = pd.Series(False, index=series.index)
+def _contains_any(text: Column, values: list[str]) -> Column:
+    mask = F.lit(False)
+    lowered = F.lower(text)
     for value in values:
         value = value.strip().lower()
         if value:
-            mask |= haystack.str.contains(value, regex=False, na=False)
+            mask = mask | lowered.contains(value)
     return mask
 
 
-def drop_cross_support_jobs(jobs: pd.DataFrame, cross_support: pd.DataFrame | None) -> pd.DataFrame:
-    if _empty(cross_support) or jobs.empty:
-        return jobs.copy()
-    drop = pd.Series(False, index=jobs.index)
-    text = jobs["job_id"].astype(str) + " " + jobs["job_type"].astype(str)
-    for _, row in cross_support.iterrows():
-        queues = str(row.get("Queues a Excluir", "")).splitlines()
-        drop |= _job_scope_mask(jobs, row) & _job_date_mask(jobs, row) & _contains_any(text, queues)
-    return jobs.loc[~drop].copy()
+def drop_cross_support_jobs(
+    jobs: DataFrame, cross_support: DataFrame | None
+) -> DataFrame:
+    rows = _rows(cross_support)
+    if not rows:
+        return jobs
+    text = F.concat_ws(" ", F.col("job_id"), F.col("job_type"))
+    drop = F.lit(False)
+    for row in rows:
+        queues = _str(row.get(COL_QUEUES)).splitlines()
+        drop = drop | (
+            _scope_mask(jobs, row)
+            & _job_date_mask(jobs, row)
+            & _contains_any(text, queues)
+        )
+    return jobs.filter(~drop)
 
 
-def drop_excluded_jobs(jobs: pd.DataFrame, exclusions: pd.DataFrame | None) -> pd.DataFrame:
-    if _empty(exclusions) or jobs.empty:
-        return jobs.copy()
-    drop = pd.Series(False, index=jobs.index)
-    text = jobs["job_id"].astype(str) + " " + jobs["job_type"].astype(str)
-    for _, row in exclusions.iterrows():
-        job = str(row.get("Job (Clasificación)", "")).strip()
-        drop |= _job_scope_mask(jobs, row) & _job_date_mask(jobs, row) & _contains_any(text, [job])
-    return jobs.loc[~drop].copy()
+def drop_excluded_jobs(jobs: DataFrame, exclusions: DataFrame | None) -> DataFrame:
+    rows = _rows(exclusions)
+    if not rows:
+        return jobs
+    text = F.concat_ws(" ", F.col("job_id"), F.col("job_type"))
+    drop = F.lit(False)
+    for row in rows:
+        job = _str(row.get(COL_JOB))
+        drop = drop | (
+            _scope_mask(jobs, row) & _job_date_mask(jobs, row) & _contains_any(text, [job])
+        )
+    return jobs.filter(~drop)
 
 
-def append_missing_dime_slots(dime: pd.DataFrame, path: Path = MISSING_DIME_PATH) -> pd.DataFrame:
-    if not path.exists():
-        return dime.copy()
-    missing = pd.read_csv(path, dtype=str).fillna("")
-    if missing.empty:
-        return dime.copy()
-    out = missing.rename(
-        columns={
-            "agent_dime_squad": "squad",
-            "dime_date": "date",
-        }
-    ).copy()
-    out["agent"] = out["agent"].astype(str).str.replace("@nu.com.mx", "", regex=False).str.lower()
-    out["date"] = pd.to_datetime(out["date"]).dt.date
-    local_ts = pd.to_datetime(out["local_timestamp_dime_slot_starts_at"])
-    out["slot_start_local_unix"] = (local_ts.astype("int64") // 1_000_000_000).astype("int64")
-    out["slot_end_local_unix"] = out["slot_start_local_unix"] + 30 * 60
+# ---------------------------------------------------------------------------
+# Missing DIME slots (committed CSV, appended to the dime extractor output)
+# ---------------------------------------------------------------------------
+
+
+def append_missing_dime_slots(
+    dime: DataFrame, missing: DataFrame | None
+) -> DataFrame:
+    """Append synced missing-DIME-slot rows to the ``dime`` extractor frame.
+
+    ``missing`` is the synced ``io_slots_faltantes_dime`` Delta table (already
+    shaped to the dime columns), or ``None``. Columns the dime frame has but the
+    missing frame lacks are filled with NULL before the union.
+    """
+    if missing is None:
+        return dime
+    aligned = missing
     for col in dime.columns:
-        if col not in out.columns:
-            out[col] = pd.NA
-    return pd.concat([dime, out[list(dime.columns)]], ignore_index=True)
+        if col not in aligned.columns:
+            aligned = aligned.withColumn(col, F.lit(None))
+    aligned = aligned.select(*dime.columns)
+    return dime.unionByName(aligned)

@@ -1,21 +1,20 @@
-"""Databricks SQL warehouse transport — shared by every script in this repo.
+"""Spark transport — shared by every script in this repo.
 
-This module is the *only* place that imports `databricks.sql`. Both the DQ
-checker and the metric-build scripts use it. Keeping the connection logic in
-one place means:
+This module is the *only* place that talks to Spark / Delta for table IO. Both
+the DQ checker and the metric-build scripts use it. Keeping the IO in one place
+means the pure ``metrics_data/`` and ``metrics/`` modules stay free of any
+session/catalog concerns — they just take a Spark ``DataFrame`` and return one.
 
-* OAuth/PAT handling is a single source of truth.
-* When the project later migrates to Databricks-native execution
-  (`spark.sql(...)`), only this file's body changes — every caller keeps
-  working unchanged.
-* `.env` loading happens once, at import time, so scripts can read
-  `os.environ` directly.
+Execution model
+---------------
+The pipeline runs **on Databricks**, where an ambient ``SparkSession`` and Delta
+are always available. :func:`get_spark` returns that session (``getOrCreate``),
+so the same code runs unchanged on a cluster, in a Databricks job, or against a
+local Spark for tests.
 
-Auth modes (matches the `agent-deep-dives` notebooks):
-    * `DATABRICKS_TOKEN` set     -> PAT auth.
-    * `DATABRICKS_TOKEN` unset   -> OAuth U2M (browser). First run pops a tab;
-                                    the SDK caches the token at
-                                    ~/.config/databricks-sdk-py/.
+There is no SQL-warehouse / PAT / OAuth handling anymore: on a cluster the
+session is already authenticated. ``.env`` is still loaded at import so the
+off-cluster Google-Sheets sync and any optional config can read ``os.environ``.
 """
 
 from __future__ import annotations
@@ -27,16 +26,18 @@ import subprocess
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Iterable
 
-import pandas as pd
 from dotenv import load_dotenv
+
+if TYPE_CHECKING:  # avoid importing pyspark at module import for `--help`/lint
+    from pyspark.sql import DataFrame, SparkSession
 
 REPO_ROOT = Path(__file__).resolve().parent
 EXTRACTORS_DIR = REPO_ROOT / "extractors"
 
-# Load workspace settings from the repo-root .env (gitignored). Loaded at
-# import time so anything that imports this module can rely on os.environ.
+# Load workspace settings from the repo-root .env (gitignored). Loaded at import
+# time so anything that imports this module can rely on os.environ.
 load_dotenv(REPO_ROOT / ".env")
 
 LOGGER = logging.getLogger("cx_metrics.db")
@@ -53,70 +54,60 @@ RUN_ID_ENV_VAR = "PIPELINE_RUN_ID"
 
 
 # ---------------------------------------------------------------------------
-# Connection
+# Session
 # ---------------------------------------------------------------------------
 
 
-def open_connection():
-    """Open a Databricks SQL connection from env vars.
+def get_spark() -> "SparkSession":
+    """Return the active SparkSession (the ambient one on Databricks).
 
-    Lazy-imports the connector so `--help` and unit tests don't pull it in.
+    Lazy-imports pyspark so `--help` and non-Spark code paths don't require it.
     """
     try:
-        from databricks import sql
-    except ImportError as exc:
+        from pyspark.sql import SparkSession
+    except ImportError as exc:  # pragma: no cover - environment dependent
         raise SystemExit(
-            "databricks-sql-connector is not installed. "
-            "Run `uv sync` to install project dependencies."
+            "pyspark is not available. Run this on a Databricks cluster, or "
+            "install the dev group (`uv sync --group dev`) on a Python 3.11/3.12 "
+            "interpreter to run off-cluster."
         ) from exc
 
-    server = os.environ.get("DATABRICKS_SERVER_HOSTNAME")
-    http_path = os.environ.get("DATABRICKS_HTTP_PATH")
-    if not server or not http_path:
-        raise SystemExit(
-            "Missing DATABRICKS_SERVER_HOSTNAME and/or DATABRICKS_HTTP_PATH. "
-            "Set them in a .env file at the repo root (see .env.example)."
-        )
+    return SparkSession.builder.getOrCreate()
 
-    token = os.environ.get("DATABRICKS_TOKEN")
-    if token:
-        LOGGER.info("Connecting to %s via PAT auth", server)
-        return sql.connect(
-            server_hostname=server,
-            http_path=http_path,
-            access_token=token,
-        )
 
-    LOGGER.info("Connecting to %s via OAuth U2M (browser on first run)", server)
-    return sql.connect(
-        server_hostname=server,
-        http_path=http_path,
-        auth_type="databricks-oauth",
-    )
+# Backwards-compatible alias: scripts historically called `open_connection()`.
+# The "connection" is now just the SparkSession; there is nothing to close.
+def open_connection() -> "SparkSession":
+    return get_spark()
 
 
 # ---------------------------------------------------------------------------
-# Read — run an extractor SQL file, return pandas
+# Read — run an extractor SQL file, return a Spark DataFrame
 # ---------------------------------------------------------------------------
 
 
 def run_extractor(
-    conn, name: str, period_start: date, period_end: date
-) -> pd.DataFrame:
-    """Execute one ``extractors/{name}.sql`` and return the result as pandas.
+    spark: "SparkSession", name: str, period_start: date, period_end: date
+) -> "DataFrame":
+    """Execute one ``extractors/{name}.sql`` and return a Spark DataFrame.
 
-    Parameters are bound as `:period_start` / `:period_end` named placeholders.
+    The extractors are parameterized with ``:period_start`` / ``:period_end``.
+    We substitute them with explicit ``DATE 'YYYY-MM-DD'`` literals (safe: both
+    are ``datetime.date``), so the same SQL runs on any Spark/DBR version
+    regardless of named-parameter support.
     """
     sql_path = EXTRACTORS_DIR / f"{name}.sql"
     if not sql_path.is_file():
         raise FileNotFoundError(f"No such extractor: {sql_path}")
-    sql_text = sql_path.read_text()
-    with conn.cursor() as cur:
-        cur.execute(
-            sql_text,
-            parameters={"period_start": period_start, "period_end": period_end},
-        )
-        return cur.fetchall_arrow().to_pandas()
+    sql_text = _bind_period(sql_path.read_text(), period_start, period_end)
+    return spark.sql(sql_text)
+
+
+def _bind_period(sql_text: str, period_start: date, period_end: date) -> str:
+    """Replace ``:period_start`` / ``:period_end`` with DATE literals."""
+    return sql_text.replace(
+        ":period_start", f"DATE '{period_start.isoformat()}'"
+    ).replace(":period_end", f"DATE '{period_end.isoformat()}'")
 
 
 # ---------------------------------------------------------------------------
@@ -125,180 +116,90 @@ def run_extractor(
 
 
 def read_table(
-    conn,
+    spark: "SparkSession",
     table: str,
     period_start: date | None = None,
     period_end: date | None = None,
     date_col: str = "date",
-) -> pd.DataFrame:
-    """Read a Delta table into pandas, optionally scoped to a date window.
+) -> "DataFrame":
+    """Read a Delta table, optionally scoped to a date window.
 
     The raw layer reads ``extractors/*.sql`` via :func:`run_extractor`; the
     metrics layer instead reads the already-built ``io_*_raw`` tables — that's
     what this helper is for.
-
-    Args:
-        conn: open connection from :func:`open_connection`.
-        table: fully-qualified source table, e.g.
-            ``usr.danielanzures.io_adherent_time_raw``.
-        period_start / period_end: inclusive bounds on ``date_col``. If either
-            is ``None`` the whole table is read.
-        date_col: the DATE column to filter on (default ``date``).
-
-    Returns:
-        The table contents as a pandas DataFrame.
     """
+    from pyspark.sql import functions as F
+
+    df = spark.table(table)
     if period_start is not None and period_end is not None:
-        sql_text = (
-            f"SELECT * FROM {table} "
-            f"WHERE `{date_col}` BETWEEN :period_start AND :period_end"
+        df = df.filter(
+            (F.col(date_col) >= F.lit(period_start))
+            & (F.col(date_col) <= F.lit(period_end))
         )
-        params = {"period_start": period_start, "period_end": period_end}
-    else:
-        sql_text = f"SELECT * FROM {table}"
-        params = None
-
-    with conn.cursor() as cur:
-        cur.execute(sql_text, parameters=params)
-        return cur.fetchall_arrow().to_pandas()
+    return df
 
 
 # ---------------------------------------------------------------------------
-# Write — persist a pandas DataFrame back to a Delta table
+# Write — persist a Spark DataFrame to a Delta table
 # ---------------------------------------------------------------------------
+
+
+def _apply_schema(df: "DataFrame", schema: list[tuple[str, str]]) -> "DataFrame":
+    """Select + cast ``df`` to the declared (name, spark_type) schema, in order.
+
+    This enforces column presence, order, and type so the written table is
+    stable across runs even if an upstream DataFrame's column types drift.
+    """
+    from pyspark.sql import functions as F
+
+    expected = [c for c, _ in schema]
+    missing = [c for c in expected if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"DataFrame is missing columns required by the schema: {missing}. "
+            f"Has: {df.columns}"
+        )
+    return df.select(*[F.col(c).cast(t).alias(c) for c, t in schema])
 
 
 def write_dataframe(
-    conn,
-    df: pd.DataFrame,
+    spark: "SparkSession",
+    df: "DataFrame",
     table: str,
     schema: Iterable[tuple[str, str]],
-    batch_size: int = 1_000,
 ) -> int:
-    """Replace `table` with the contents of `df`.
+    """Replace ``table`` with the contents of ``df`` (Delta overwrite).
 
-    Drops the existing table (if any), creates a Delta table with the explicit
-    schema, then inserts rows in batches. Returns the number of rows written.
-
-    Why explicit schema rather than inferring from the DataFrame?
-        * pandas dtypes don't map cleanly to Spark types (e.g. `object` could
-          be STRING or BINARY; `datetime64[ns]` could be TIMESTAMP or DATE).
-        * Callers know their target schema and should declare it. This keeps
-          column types stable across runs even if a DataFrame's dtype shifts.
-
-    Args:
-        conn: open connection from `open_connection()`.
-        df: source DataFrame. Column order MUST match `schema`.
-        table: fully-qualified target name, e.g. `usr.danielanzures.io_adherence`.
-        schema: ordered iterable of (column_name, spark_type) tuples,
-            e.g. `[("agent", "STRING"), ("delivered_hours", "BIGINT")]`.
-        batch_size: rows per `executemany` call. 1k is a reasonable default
-            for the SQL warehouse; bump up for very small rows.
-
-    Returns:
-        Number of rows inserted (== len(df)).
+    Uses ``overwrite`` + ``overwriteSchema`` (instead of DROP + CREATE) so the
+    Delta transaction log / version history is preserved across runs. Returns
+    the number of rows written.
     """
     schema = list(schema)
-    expected_cols = [c for c, _ in schema]
-    if list(df.columns) != expected_cols:
-        raise ValueError(
-            f"DataFrame columns {list(df.columns)} do not match schema column "
-            f"order {expected_cols}. Reorder df before calling."
+    out = _apply_schema(df, schema).persist()
+    try:
+        row_count = out.count()
+        LOGGER.info("Replacing %s (%d rows incoming)", table, row_count)
+        (
+            out.write.mode("overwrite")
+            .option("overwriteSchema", "true")
+            .format("delta")
+            .saveAsTable(table)
         )
-
-    cols_ddl = ", ".join(f"`{c}` {t}" for c, t in schema)
-    col_list = "`, `".join(c for c, _ in schema)
-
-    with conn.cursor() as cur:
-        LOGGER.info("Replacing %s (%d rows incoming)", table, len(df))
-        # CREATE OR REPLACE (instead of DROP + CREATE) keeps the Delta
-        # transaction log / version history intact across runs.
-        cur.execute(f"CREATE OR REPLACE TABLE {table} ({cols_ddl}) USING DELTA")
-
-        if df.empty:
-            return 0
-
-        records = [tuple(r) for r in df.itertuples(index=False, name=None)]
-        _insert_records_sql(
-            cur,
-            table=table,
-            col_list=col_list,
-            schema=schema,
-            records=records,
-            batch_size=batch_size,
-            log_label="inserted",
-        )
-
-    return len(df)
-
-
-def _sql_literal(value: Any, spark_type: str) -> str:
-    """Render one Python/pandas scalar as a Spark SQL literal."""
-    if value is None or pd.isna(value):
-        return "NULL"
-
-    typ = spark_type.upper()
-    if typ == "DATE":
-        return f"DATE '{pd.Timestamp(value).date().isoformat()}'"
-    if typ == "TIMESTAMP":
-        ts = pd.Timestamp(value)
-        if ts.tzinfo is not None:
-            ts = ts.tz_convert(None)
-        return f"TIMESTAMP '{ts.strftime('%Y-%m-%d %H:%M:%S')}'"
-    if typ in {"STRING", "VARCHAR", "CHAR"}:
-        escaped = str(value).replace("'", "''")
-        return f"'{escaped}'"
-    if typ == "BOOLEAN":
-        return "TRUE" if bool(value) else "FALSE"
-    return str(value)
-
-
-def _insert_records_sql(
-    cur,
-    *,
-    table: str,
-    col_list: str,
-    schema: list[tuple[str, str]],
-    records: list[tuple[Any, ...]],
-    batch_size: int,
-    log_label: str,
-) -> None:
-    """Insert records using multi-row SQL VALUES chunks.
-
-    The Databricks connector's ``executemany`` sends many tiny requests for our
-    workloads. A single VALUES statement per chunk is much faster for the
-    pipeline-sized pandas frames this project writes locally.
-    """
-    if not records:
-        return
-    types = [t for _, t in schema]
-    for i in range(0, len(records), batch_size):
-        chunk = records[i : i + batch_size]
-        values_sql = ", ".join(
-            "("
-            + ", ".join(_sql_literal(value, typ) for value, typ in zip(row, types))
-            + ")"
-            for row in chunk
-        )
-        cur.execute(f"INSERT INTO {table} (`{col_list}`) VALUES {values_sql}")
-        LOGGER.info(
-            "  %s %d / %d rows",
-            log_label,
-            min(i + batch_size, len(records)),
-            len(records),
-        )
+    finally:
+        out.unpersist()
+    return row_count
 
 
 # ---------------------------------------------------------------------------
 # Run snapshots & registry
 # ---------------------------------------------------------------------------
 #
-# Every build script writes two things per run: the *current* table (replaced
-# in place by `write_dataframe`) and, when snapshotting is on, an append-only
+# Every build script writes two things per run: the *current* table (replaced in
+# place by `write_dataframe`) and, when snapshotting is on, an append-only
 # `{table}_snapshots` history table tagged with `run_id` + `run_ts`. A central
-# `pipeline_runs` registry records one row per (run_id, table) write so a run
-# can be looked up, audited, and diffed against another. `publish()` ties the
-# three together; build scripts call it instead of `write_dataframe` directly.
+# `pipeline_runs` registry records one row per (run_id, table) write so a run can
+# be looked up, audited, and diffed against another. `publish()` ties the three
+# together; build scripts call it instead of `write_dataframe` directly.
 
 
 @dataclass(frozen=True)
@@ -313,30 +214,18 @@ class PublishResult:
 
 
 def utc_now() -> datetime:
-    """Current UTC time as a naive datetime (UTC wall clock).
-
-    Naive (tz-stripped) so it binds cleanly to a Spark ``TIMESTAMP`` parameter;
-    the value is always UTC by construction.
-    """
+    """Current UTC time as a naive datetime (UTC wall clock)."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def new_run_id(run_ts: datetime | None = None) -> str:
-    """Generate a lexicographically-sortable run id, e.g. ``20260616T201500Z-a1b2``.
-
-    The timestamp prefix makes ids sort chronologically; the short random suffix
-    avoids collisions when two runs start in the same second.
-    """
+    """Generate a lexicographically-sortable run id, e.g. ``20260616T201500Z-a1b2``."""
     run_ts = run_ts or utc_now()
     return f"{run_ts.strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(2)}"
 
 
 def resolve_run_id(run_id: str | None, run_ts: datetime) -> str:
-    """Pick the run id: explicit arg > ``PIPELINE_RUN_ID`` env var > generated.
-
-    Lets an orchestrator export one id for a whole pipeline invocation while
-    standalone script runs still get a unique id automatically.
-    """
+    """Pick the run id: explicit arg > ``PIPELINE_RUN_ID`` env var > generated."""
     if run_id:
         return run_id
     env_run_id = os.environ.get(RUN_ID_ENV_VAR)
@@ -362,60 +251,44 @@ def current_git_sha() -> str | None:
 
 
 def _append_snapshot(
-    conn,
-    df: pd.DataFrame,
+    spark: "SparkSession",
+    df: "DataFrame",
     snapshot_table: str,
     schema: list[tuple[str, str]],
     run_id: str,
     run_ts: datetime,
-    batch_size: int,
 ) -> None:
-    """Append `df` to `{table}_snapshots`, tagged with run_id + run_ts.
+    """Append ``df`` to ``{table}_snapshots``, tagged with run_id + run_ts.
 
-    Creates the history table on first use (base schema + `run_id` / `run_ts`,
-    partitioned by `run_id`). Idempotent per run: re-running the same `run_id`
+    Creates the history table on first use (base schema + ``run_id`` / ``run_ts``,
+    partitioned by ``run_id``). Idempotent per run: re-running the same ``run_id``
     first deletes that run's partition, so a retried build never double-counts.
     """
-    snap_cols = list(schema) + [("run_id", "STRING"), ("run_ts", "TIMESTAMP")]
-    cols_ddl = ", ".join(f"`{c}` {t}" for c, t in snap_cols)
-    col_list = "`, `".join(c for c, _ in snap_cols)
+    from pyspark.sql import functions as F
 
-    with conn.cursor() as cur:
-        cur.execute(
-            f"CREATE TABLE IF NOT EXISTS {snapshot_table} ({cols_ddl}) "
-            f"USING DELTA PARTITIONED BY (run_id)"
-        )
-        # Idempotent rerun: clear any prior rows for this run_id.
-        cur.execute(
-            f"DELETE FROM {snapshot_table} WHERE run_id = ?", [run_id]
-        )
-        if df.empty:
-            LOGGER.info("  snapshot %s: 0 rows (empty result)", snapshot_table)
-            return
+    snap = (
+        _apply_schema(df, schema)
+        .withColumn("run_id", F.lit(run_id).cast("string"))
+        .withColumn("run_ts", F.lit(run_ts).cast("timestamp"))
+    )
 
-        records: list[tuple[Any, ...]] = [
-            (*r, run_id, run_ts)
-            for r in df.itertuples(index=False, name=None)
-        ]
-        _insert_records_sql(
-            cur,
-            table=snapshot_table,
-            col_list=col_list,
-            schema=snap_cols,
-            records=records,
-            batch_size=batch_size,
-            log_label="snapshot inserted",
+    # Idempotent rerun: clear any prior rows for this run_id (no-op if new).
+    if spark.catalog.tableExists(snapshot_table):
+        spark.sql(
+            f"DELETE FROM {snapshot_table} WHERE run_id = '{run_id}'"
         )
-        LOGGER.info(
-            "  snapshot %s: appended %d rows (run_id=%s)",
-            snapshot_table,
-            len(records),
-            run_id,
-        )
+
+    (
+        snap.write.mode("append")
+        .partitionBy("run_id")
+        .format("delta")
+        .saveAsTable(snapshot_table)
+    )
+    LOGGER.info("  snapshot %s appended (run_id=%s)", snapshot_table, run_id)
 
 
 def _record_run(
-    conn,
+    spark: "SparkSession",
     *,
     registry_table: str,
     run_id: str,
@@ -430,8 +303,11 @@ def _record_run(
     git_sha: str | None,
     notes: str | None,
 ) -> None:
-    """Append one row to the central `pipeline_runs` registry."""
-    cols = [
+    """Append one row to the central ``pipeline_runs`` registry."""
+    from pyspark.sql import Row
+    from pyspark.sql import functions as F
+
+    registry_schema = [
         ("run_id", "STRING"),
         ("run_ts", "TIMESTAMP"),
         ("layer", "STRING"),
@@ -444,34 +320,26 @@ def _record_run(
         ("git_sha", "STRING"),
         ("notes", "STRING"),
     ]
-    cols_ddl = ", ".join(f"`{c}` {t}" for c, t in cols)
-    col_list = "`, `".join(c for c, _ in cols)
-    placeholders = ", ".join(["?"] * len(cols))
-    with conn.cursor() as cur:
-        cur.execute(
-            f"CREATE TABLE IF NOT EXISTS {registry_table} ({cols_ddl}) USING DELTA"
-        )
-        cur.execute(
-            f"INSERT INTO {registry_table} (`{col_list}`) VALUES ({placeholders})",
-            [
-                run_id,
-                run_ts,
-                layer,
-                table,
-                snapshot_table,
-                period_start,
-                period_end,
-                int(row_count),
-                status,
-                git_sha,
-                notes,
-            ],
-        )
+    row = Row(
+        run_id=run_id,
+        run_ts=run_ts,
+        layer=layer,
+        table_name=table,
+        snapshot_table=snapshot_table,
+        period_start=period_start,
+        period_end=period_end,
+        row_count=int(row_count),
+        status=status,
+        git_sha=git_sha,
+        notes=notes,
+    )
+    df = _apply_schema(spark.createDataFrame([row]), registry_schema)
+    df.write.mode("append").format("delta").saveAsTable(registry_table)
 
 
 def publish(
-    conn,
-    df: pd.DataFrame,
+    spark: "SparkSession",
+    df: "DataFrame",
     table: str,
     schema: Iterable[tuple[str, str]],
     *,
@@ -485,28 +353,17 @@ def publish(
     registry_table: str = DEFAULT_REGISTRY_TABLE,
     git_sha: str | None = None,
     notes: str | None = None,
-    batch_size: int = 1_000,
 ) -> PublishResult:
-    """Write `df` to the current table, snapshot it, and record the run.
+    """Write ``df`` to the current table, snapshot it, and record the run.
 
-    This is the high-level writer build scripts call (instead of
-    :func:`write_dataframe` directly). It performs, in order:
-
+    Performs, in order:
       1. Replace the current ``table`` with ``df`` (:func:`write_dataframe`).
       2. If ``snapshot``: append ``df`` to ``{table}{snapshot_suffix}`` tagged
          with ``run_id`` + ``run_ts`` (idempotent per run_id).
       3. Append a ``success`` row to the ``pipeline_runs`` registry.
 
-    The run id is resolved via :func:`resolve_run_id` (explicit arg >
-    ``PIPELINE_RUN_ID`` env var > generated), so all tables written in one
-    orchestrated invocation can share a single id. ``run_ts`` is one UTC instant
-    for the whole call.
-
     A crash before step 3 leaves no registry row for the run, so an incomplete
     run is detectable (and re-runnable with the same ``run_id``).
-
-    Returns a :class:`PublishResult` with the resolved ``run_id`` / ``run_ts``,
-    row count, and the snapshot table name (``None`` when snapshotting is off).
     """
     schema = list(schema)
     run_ts = run_ts or utc_now()
@@ -514,16 +371,14 @@ def publish(
     if git_sha is None:
         git_sha = current_git_sha()
 
-    row_count = write_dataframe(conn, df, table, schema, batch_size=batch_size)
+    row_count = write_dataframe(spark, df, table, schema)
 
     snapshot_table = f"{table}{snapshot_suffix}" if snapshot else None
     if snapshot_table is not None:
-        _append_snapshot(
-            conn, df, snapshot_table, schema, run_id, run_ts, batch_size
-        )
+        _append_snapshot(spark, df, snapshot_table, schema, run_id, run_ts)
 
     _record_run(
-        conn,
+        spark,
         registry_table=registry_table,
         run_id=run_id,
         run_ts=run_ts,

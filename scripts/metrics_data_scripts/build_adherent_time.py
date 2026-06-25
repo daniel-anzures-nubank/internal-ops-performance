@@ -2,10 +2,10 @@
 
 This script is a thin orchestrator. The math lives in
 ``metrics_data/adherent_time.py`` and is covered by
-``tests/test_adherent_time.py``. Here we only:
+``tests/metrics_data/test_adherent_time.py``. Here we only:
 
-  1. Open a Databricks SQL connection (shared `db.open_connection`).
-  2. Run the three extractors needed:
+  1. Get the ambient SparkSession (shared `db.open_connection`).
+  2. Run the three extractors needed (as Spark DataFrames):
        * ``agent_information``  (roster)
        * ``dime_slots``         (slot schedule)
        * ``productivity``       (activity log)
@@ -24,12 +24,13 @@ two can be diffed.
 
 Usage
 -----
-::
+Runs on a Databricks cluster (``spark-submit`` / a Databricks job task), where
+an ambient SparkSession and Delta are available::
 
-    uv run python scripts/metrics_data_scripts/build_adherent_time.py \\
+    python scripts/metrics_data_scripts/build_adherent_time.py \\
         --period-start 2026-05-11 --period-end 2026-05-18 --dry-run
 
-    uv run python scripts/metrics_data_scripts/build_adherent_time.py \\
+    python scripts/metrics_data_scripts/build_adherent_time.py \\
         --period-start 2026-01-01 --period-end 2026-05-24
 """
 
@@ -49,7 +50,10 @@ sys.path.insert(0, str(REPO_ROOT / "metrics_data"))
 
 from db import open_connection, run_extractor, publish  # noqa: E402
 from adherent_time import IO_ADHERENT_TIME_SCHEMA, compute_adherent_time  # noqa: E402
-from adjustments.manual import append_missing_dime_slots  # noqa: E402
+from adjustments.manual import (  # noqa: E402
+    append_missing_dime_slots,
+    read_adjustment_table,
+)
 
 LOGGER = logging.getLogger("cx_metrics.adherent_time")
 
@@ -113,71 +117,69 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
-    conn = open_connection()
-    try:
-        with _log_step("agent_information"):
-            roster = run_extractor(
-                conn, "agent_information", args.period_start, args.period_end
-            )
-            LOGGER.info("  %s roster rows", f"{len(roster):,}")
+    spark = open_connection()
 
-        with _log_step("dime_slots"):
-            dime = run_extractor(
-                conn, "dime_slots", args.period_start, args.period_end
-            )
-            dime = append_missing_dime_slots(dime)
-            LOGGER.info("  %s DIME slot rows", f"{len(dime):,}")
+    with _log_step("agent_information"):
+        roster = run_extractor(
+            spark, "agent_information", args.period_start, args.period_end
+        )
 
-        with _log_step("productivity"):
-            prod = run_extractor(
-                conn, "productivity", args.period_start, args.period_end
-            )
-            LOGGER.info("  %s productivity rows", f"{len(prod):,}")
+    with _log_step("dime_slots"):
+        dime = run_extractor(spark, "dime_slots", args.period_start, args.period_end)
+        dime = append_missing_dime_slots(
+            dime, read_adjustment_table(spark, "slots_faltantes_dime")
+        )
 
-        with _log_step("compute_adherent_time"):
-            result = compute_adherent_time(roster, dime, prod)
-            LOGGER.info("  %s rows in final adherent_time frame", f"{len(result):,}")
+    with _log_step("productivity"):
+        prod = run_extractor(spark, "productivity", args.period_start, args.period_end)
 
-        # Reorder to match the declared schema before writing — guards against
-        # a future refactor that changes column ordering in compute_adherent_time.
-        expected_cols = [c for c, _ in IO_ADHERENT_TIME_SCHEMA]
-        result = result[expected_cols]
+    with _log_step("compute_adherent_time"):
+        result = compute_adherent_time(roster, dime, prod)
 
-        if args.dry_run:
-            LOGGER.info("Dry run — not writing. Summary:")
-            print()
-            print(f"Rows:    {len(result):,}")
-            print(f"Agents:  {result['agent'].nunique():,}")
-            print(f"Dates:   {result['date'].nunique():,}")
-            print(
-                f"Squads:  {result['squad'].nunique():,} "
-                f"({', '.join(sorted(result['squad'].dropna().unique()))})"
-            )
-            print()
-            print("Head:")
-            print(result.head(10).to_string(index=False))
-            return 0
+    if args.dry_run:
+        from pyspark.sql import functions as F
 
-        with _log_step(f"write {args.target}"):
-            run = publish(
-                conn,
-                result,
-                args.target,
-                IO_ADHERENT_TIME_SCHEMA,
-                layer="metrics_data",
-                period_start=args.period_start,
-                period_end=args.period_end,
-                run_id=args.run_id,
-                snapshot=not args.no_snapshot,
-            )
-            LOGGER.info(
-                "  wrote %s rows to %s (run_id=%s)",
-                f"{run.row_count:,}", args.target, run.run_id,
-            )
-            if run.snapshot_table:
-                LOGGER.info("  snapshot -> %s", run.snapshot_table)
-    finally:
-        conn.close()
+        result = result.persist()
+        LOGGER.info("Dry run — not writing. Summary:")
+        print()
+        agg = result.agg(
+            F.count(F.lit(1)).alias("rows"),
+            F.countDistinct("agent").alias("agents"),
+            F.countDistinct("date").alias("dates"),
+        ).collect()[0]
+        print(f"Rows:    {agg['rows']:,}")
+        print(f"Agents:  {agg['agents']:,}")
+        print(f"Dates:   {agg['dates']:,}")
+        squads = [
+            r["squad"]
+            for r in result.select("squad").distinct().collect()
+            if r["squad"] is not None
+        ]
+        print(f"Squads:  {len(squads):,} ({', '.join(sorted(squads))})")
+        print()
+        print("Head:")
+        result.show(10, truncate=False)
+        result.unpersist()
+        return 0
+
+    with _log_step(f"write {args.target}"):
+        run = publish(
+            spark,
+            result,
+            args.target,
+            IO_ADHERENT_TIME_SCHEMA,
+            layer="metrics_data",
+            period_start=args.period_start,
+            period_end=args.period_end,
+            run_id=args.run_id,
+            snapshot=not args.no_snapshot,
+        )
+        LOGGER.info(
+            "  wrote %s rows to %s (run_id=%s)",
+            f"{run.row_count:,}", args.target, run.run_id,
+        )
+        if run.snapshot_table:
+            LOGGER.info("  snapshot -> %s", run.snapshot_table)
 
     return 0
 
