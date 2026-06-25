@@ -1,0 +1,30 @@
+[project]
+name = "internal-ops-performance"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "databricks-sql-connector[pyarrow]>=4.2.6",
+    "databricks-sdk>=0.108",  # used for OAuth U2M (browser) auth so a PAT isn't required
+    "pandas>=2.0.0",
+    "python-dotenv>=1.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+# Local Google Sheets access (gsheets.py). Optional — only needed to read/write
+# Sheets directly from a laptop (no Databricks). `uv sync --group sheets`.
+sheets = [
+    "gspread>=6.0",
+    "google-auth>=2.0",
+]
+
+[tool.pytest.ini_options]
+# Import roots:
+#   * "."            -> top-level `db.py` (Databricks transport, shared by scripts).
+#   * "tests"        -> `checks.py` (DQ logic, lives next to its tests).
+#   * "metrics_data" -> raw-table compute modules (e.g. `adherent_time.py`).
+#   * "metrics"      -> metrics-layer compute modules (e.g. `adherence.py`).
+pythonpath = [".", "tests", "metrics_data", "metrics"]
+testpaths = ["tests"]
