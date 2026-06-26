@@ -33,9 +33,9 @@ agents serving that squad (the shared dimension columns are still present).
 
 These raw tables are **cross-team**: every row carries a `team` column
 (`core` / `fraud` / `social media` / `content`) derived from `squad` in the
-`agent_information` extractor per `docs/team_squad_mapping.md`. The only
-squad-level exclusion is the non-team support squads **`quality` and `planning`**,
-which the extractor drops; all four performance teams flow through automatically
+`agent_information` extractor per `docs/team_squad_mapping.md`. The support
+squads **`quality` and `planning`** are kept (to match legacy `adherence_io`) but
+carry `team = NULL`; all four performance teams flow through automatically
 wherever their source data uses the shared tables.
 
 - **`adherent_time`** and **`quality_evaluations`** cover Social Media using the
