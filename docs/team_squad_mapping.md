@@ -4,9 +4,10 @@ This is the **official mapping** of performance teams to roster squads.
 
 This mapping is **encoded in the `agent_information` extractor**
 (`extractors/agent_information.sql`): it emits a lowercase `team` column derived
-from `squad`, and it **excludes** the `quality` and `planning` squads entirely.
-Because every `metrics_data/` module joins to that roster, the `team` column flows
-into all raw tables and the excluded squads never reach them. Keep this doc and
+from `squad`. The `quality` and `planning` support squads are **kept** (to match
+legacy `adherence_io`) but carry `team = NULL` — they belong to no performance
+team, so team roll-ups skip them. Because every `metrics_data/` module joins to
+that roster, the `team` column flows into all raw tables. Keep this doc and
 the extractor's `CASE` in sync.
 
 ## Mapping

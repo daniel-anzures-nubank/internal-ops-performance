@@ -69,7 +69,8 @@ numerator is built by the raw layer; this metric only applies the **denominator
 - Training / shadowing slot exclusions and outage-date carve-outs
   (e.g. the 2026-03-24..28 block for specific agents).
 - Legacy DIME-squad business exclusions (`wfm` / `enablement` / …). Note
-  `quality` and `planning` are already excluded upstream by the extractors.
+  `quality` and `planning` now flow through the extractor (kept for legacy
+  parity, `team = NULL`) rather than being excluded upstream.
 
 ## Controllable vs. uncontrollable
 

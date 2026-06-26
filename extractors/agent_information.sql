@@ -24,8 +24,9 @@
 --       - Otherwise, `last_change_date = hire_start_date`.
 --   * Normalize email-derived fields to lowercase.
 --   * Derive the performance `team` from `squad` (official mapping in
---     docs/team_squad_mapping.md) and exclude the non-team support squads
---     `quality` and `planning` (they are not part of any performance team).
+--     docs/team_squad_mapping.md). The support squads `quality` and `planning`
+--     are kept (matching legacy `adherence_io`) but carry `team = NULL` — they
+--     are not part of any performance team, so team roll-ups skip them.
 --   * Attach the agent's `actor_id` from `etl.mx__dataset.ops_actors` so downstream
 --     extractors (productivity, status history, etc.) can join on `actor_id` without
 --     re-deriving the email mapping. See "Notes" below for the dedup rule.
@@ -214,7 +215,8 @@ bdx_roster AS (
   LEFT JOIN agent_to_actor_id AS i
     ON l.agent = i.agent
   -- `content` is dropped here: the Content team's source of truth is the sheet.
-  WHERE l.squad NOT IN ('quality', 'planning', 'content')
+  -- `quality` / `planning` are kept (team = NULL) to match legacy `adherence_io`.
+  WHERE l.squad <> 'content'
 ),
 
 -- Content roster from the dedicated Google Sheet (static current-state roster).
