@@ -30,6 +30,13 @@ Filters applied here (deliberately minimal — this is a raw table)
 * Roster: ``status = 'active'`` (inner join attaches the dimensions and
   scopes output to active agents).
 
+Legacy parity (pre-2026-07-01)
+------------------------------
+Before the ``LEGACY_PHANTOM_CUTOVER`` (2026-07-01) a slot that matched no
+productivity is counted as *fully* adherent (1800s), reproducing the legacy
+phantom-adherence bug so historical metrics stay byte-for-byte with legacy.
+From the cutover on, an unmatched slot correctly scores 0.
+
 Output schema (one row per agent per DIME slot)
 -----------------------------------------------
     agent                    STRING
@@ -47,6 +54,8 @@ Output schema (one row per agent per DIME slot)
 """
 
 from __future__ import annotations
+
+from datetime import date
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
@@ -71,6 +80,14 @@ MEXICO_UTC_OFFSET_SECONDS: int = 6 * 60 * 60
 # DIME slot length: 30 minutes. Used as the per-slot cap on adherent time
 # and as the per-slot required minutes.
 SLOT_DURATION_SECONDS: int = 30 * 60
+
+# Legacy-parity cutover. The new pipeline reproduces legacy output byte-for-byte
+# for dates BEFORE this date, including the legacy "phantom-adherence" bug: a
+# scheduled slot that matched no productivity was counted as FULLY adherent
+# (a whole 1800s slot) instead of 0. From this date on, an unmatched slot
+# correctly scores 0. Same 2026-07-01 migration cutover the night-shift
+# re-attribution uses (shift_attribution.NIGHT_SHIFT_CUTOVER).
+LEGACY_PHANTOM_CUTOVER: date = date(2026, 7, 1)
 
 # After Jan 22, 2026 the staffing-hero status backfill stopped, so the legacy
 # explicitly trusts productivity rows even when status is NULL.
@@ -155,8 +172,12 @@ def compute_slot_adherence(slots: DataFrame, productivity: DataFrame) -> DataFra
       2. Per pair, ``overlap = LEAST(end) - GREATEST(start)``, clipped to
          [0, 1800].
       3. Per slot, sum overlaps and clip at 1800. Slots that matched nothing
-         get 0 (LEFT-JOIN semantics — so unworked-but-scheduled slots still
-         appear with adherent_minutes = 0).
+         appear via LEFT-JOIN semantics and are filled per the cutover below.
+
+    Legacy-phantom replication (pre-2026-07-01): legacy counted a slot that
+    matched no productivity as *fully* adherent (1800s), not 0. We reproduce
+    that for dates before ``LEGACY_PHANTOM_CUTOVER`` so historical adherence is
+    byte-for-byte with legacy; from the cutover on, an unmatched slot scores 0.
 
     Returns one row per (agent, date, slot_start, activity_type_required)
     with the additional column ``adherent_time_final`` (long seconds).
@@ -189,9 +210,18 @@ def compute_slot_adherence(slots: DataFrame, productivity: DataFrame) -> DataFra
         )
     )
 
+    # Unmatched slots (no overlapping productivity) come back NULL from the LEFT
+    # join. They score 0 — EXCEPT before the cutover, where we reproduce the
+    # legacy phantom-adherence bug (unmatched slot counted as a full 1800s).
+    # Gated on the slot's calendar date so pre-cutover output stays byte-for-byte.
+    unmatched_fill = F.when(
+        F.to_date(F.col("date")) < F.lit(LEGACY_PHANTOM_CUTOVER),
+        F.lit(SLOT_DURATION_SECONDS),
+    ).otherwise(F.lit(0))
+
     return all_slots.join(per_slot, on=keys, how="left").withColumn(
         "adherent_time_final",
-        F.coalesce(F.col("adherent_time_final"), F.lit(0)).cast("long"),
+        F.coalesce(F.col("adherent_time_final"), unmatched_fill).cast("long"),
     )
 
 

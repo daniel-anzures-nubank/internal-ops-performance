@@ -286,14 +286,26 @@ class TestComputeSlotAdherence:
         )
         assert self._final(self._one_slot(spark), prod) == 600
 
-    def test_no_overlap_still_returns_slot_with_zero(self, spark):
+    def test_no_overlap_pre_cutover_phantom_full(self, spark):
+        # Pre-2026-07-01 (date D is May): an unmatched slot reproduces the
+        # legacy phantom-adherence bug — counted as a full slot (1800s), not 0.
         prod = filter_productivity(
             make_prod(
                 spark,
                 [{"activity_start_unix": SLOT_06_UTC + 9999, "activity_end_unix": SLOT_06_UTC + 20000}],
             )
         )
-        assert self._final(self._one_slot(spark), prod) == 0
+        assert self._final(self._one_slot(spark), prod) == SLOT_DURATION_SECONDS
+
+    def test_no_overlap_post_cutover_returns_zero(self, spark):
+        # From 2026-07-01 on, an unmatched slot correctly scores 0.
+        prod = filter_productivity(
+            make_prod(
+                spark,
+                [{"activity_start_unix": SLOT_06_UTC + 9999, "activity_end_unix": SLOT_06_UTC + 20000}],
+            )
+        )
+        assert self._final(self._one_slot(spark, date=dt.date(2026, 7, 1)), prod) == 0
 
     def test_multiple_productivity_rows_sum_then_cap(self, spark):
         prod = filter_productivity(
@@ -308,8 +320,12 @@ class TestComputeSlotAdherence:
         )
         assert self._final(self._one_slot(spark), prod) == SLOT_DURATION_SECONDS
 
-    def test_empty_productivity_returns_all_slots_with_zero(self, spark):
-        assert self._final(self._one_slot(spark), empty_prod(spark)) == 0
+    def test_empty_productivity_pre_cutover_phantom(self, spark):
+        # Empty productivity → slot unmatched → pre-cutover phantom (full).
+        assert self._final(self._one_slot(spark), empty_prod(spark)) == SLOT_DURATION_SECONDS
+
+    def test_empty_productivity_post_cutover_zero(self, spark):
+        assert self._final(self._one_slot(spark, date=dt.date(2026, 7, 1)), empty_prod(spark)) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -353,9 +369,26 @@ class TestComputeAdherentTimeEndToEnd:
             "adherent_minutes",
         ]
 
-    def test_no_productivity_yields_zero_adherent_full_required(self, spark):
+    def test_no_productivity_pre_cutover_phantom_full(self, spark):
+        # Pre-cutover (date D is May 2026), an unmatched slot reproduces the
+        # legacy phantom: full adherent minutes (= required), a fake 100%.
         out = compute_adherent_time(
             make_roster(spark, [{}]), make_dime(spark, [{}]), empty_prod(spark)
+        ).collect()
+        assert len(out) == 1
+        assert out[0]["adherent_minutes"] == SLOT_DURATION_SECONDS / 60.0
+        assert out[0]["required_minutes"] == SLOT_DURATION_SECONDS / 60.0
+
+    def test_no_productivity_post_cutover_zero_adherent(self, spark):
+        # From 2026-07-01 on, an unmatched slot scores 0 adherent minutes
+        # end-to-end (the corrected behavior).
+        out = compute_adherent_time(
+            make_roster(
+                spark,
+                [{"snapshot_month": dt.date(2026, 7, 1), "snapshot_date": dt.date(2026, 7, 31)}],
+            ),
+            make_dime(spark, [{"date": dt.date(2026, 7, 1)}]),
+            empty_prod(spark),
         ).collect()
         assert len(out) == 1
         assert out[0]["adherent_minutes"] == 0.0
@@ -397,7 +430,8 @@ class TestComputeAdherentTimeEndToEnd:
         out = compute_adherent_time(make_roster(spark, [{}]), dime, empty_prod(spark)).collect()
         assert len(out) == 2
         assert all(r["required_minutes"] == SLOT_DURATION_SECONDS / 60.0 for r in out)
-        assert all(r["adherent_minutes"] == 0.0 for r in out)
+        # date D is pre-cutover, so unmatched slots phantom to full adherent.
+        assert all(r["adherent_minutes"] == SLOT_DURATION_SECONDS / 60.0 for r in out)
         assert sorted(r["slot_time"] for r in out) == ["06:00:00", "06:30:00"]
 
     def test_night_tail_attributed_to_shift_start_day(self, spark):
