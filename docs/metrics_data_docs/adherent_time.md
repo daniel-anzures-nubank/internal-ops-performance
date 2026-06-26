@@ -43,10 +43,19 @@ active social agents have DIME slots in May 2026, and
 Per agent, each DIME slot is overlap-joined against the connected productivity
 intervals. Overlap rule: `activity_end >= slot_start AND activity_start <
 slot_end`. Per pair, `overlap = LEAST(ends) - GREATEST(starts)` clipped to
-`[0, 1800]` seconds; summed per slot and capped at 1800. Slots that matched no
-productivity get `adherent_minutes = 0` (so unworked-but-scheduled slots still
-appear). DIME slot times are local; productivity is UTC, so DIME is shifted
-+6h (Mexico City, fixed UTC-6, no DST) before the comparison.
+`[0, 1800]` seconds; summed per slot and capped at 1800. DIME slot times are
+local; productivity is UTC, so DIME is shifted +6h (Mexico City, fixed UTC-6,
+no DST) before the comparison.
+
+**Unmatched slots — legacy-phantom replication (pre-2026-07-01).** A scheduled
+slot that matched no productivity scores `adherent_minutes = 0` from `2026-07-01`
+onward (the correct value — unworked-but-scheduled slots still appear).
+**Before** that cutover the new pipeline reproduces the legacy
+**phantom-adherence bug**: an unmatched slot is counted as *fully* adherent (a
+whole 1800s slot → a fake 100% adherence), so historical metrics stay
+byte-for-byte with legacy. Gated on the slot's calendar date
+(`LEGACY_PHANTOM_CUTOVER`) — the same 2026-07-01 migration cutover the
+night-shift attribution uses.
 
 ## Date attribution (night shifts)
 
