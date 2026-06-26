@@ -27,14 +27,13 @@ Business filter applied here (deferred by the raw layer)
 
 NOT applied here (future Adjustments layer — keeps this a clean baseline)
 ------------------------------------------------------------------------
-* Legacy ``dimensioned_activity`` meeting/leave carve-outs (Mouring / Weekly /
-  Permiso Medico / Huddle / Licencia / Vacacion). These ride on
-  ``activity_type_required = 'dime_invalid_notation'`` (NOT 'shrinkage'), and
-  the raw table does not carry ``dimensioned_activity`` — so they are not
-  removed here. They can be applied later by joining ``io_shrinkage_slots_raw``.
-* Legacy DIME-squad exclusions (``wfm`` / ``credit_evolution`` / ``dote``).
+* Legacy ``dimensioned_activity`` meeting/leave carve-outs and the DIME-squad
+  exclusion (``agent_dime_squad`` not in wfm / credit_evolution / dote) are
+  **applied upstream** as fixed DIME filters in the raw layer
+  (``metrics_data/adherent_time.py`` → ``filter_dime``), so they never reach
+  this metric.
 * Per-agent manual time-off adjustments and outage-date exclusions
-  (e.g. 2026-03-27, 2026-04-09).
+  (e.g. 2026-03-27, 2026-04-09) — deferred to the Adjustments layer.
 
 Output — one row per (agent, date_reference, granularity)
 ---------------------------------------------------------
