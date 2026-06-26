@@ -1,46 +1,134 @@
-"""Unit tests for ``metrics_data/occupancy_time.py``.
+"""Unit tests for ``metrics_data/occupancy_time.py`` (PySpark).
 
-Small synthetic pandas frames, no warehouse, sub-second runs.
+These tests build small, hand-crafted Spark DataFrames via the session-scoped
+``spark`` fixture (see ``tests/conftest.py``). They never touch Databricks —
+every check exercises the pure Spark transformation logic.
 
-occupancy_time is now a RAW dataset: ``filter_dime`` keeps every slot with a
-non-null ``activity_type_required`` (business exclusions move to the metrics
-layer) but STILL applies the systemic reclassifications (Control MC /
-xMC Debit Fraud / dime_invalid_notation -> 'oos') because those are part of the
-occupancy matching logic. There is no monthly benchmark anymore (it moved to
-the metrics layer); output is one row per slot with ``occupancy_minutes`` and
-``required_minutes``.
+occupancy_time is a RAW dataset: ``filter_dime`` keeps every slot with a
+non-null ``activity_type_required`` and applies the systemic reclassifications
+(Control MC / xMC Debit Fraud / dime_invalid_notation -> 'oos') plus the fixed
+legacy DIME filters (meeting/leave dimensioned_activity drop and the
+wfm/credit_evolution/dote/social DIME-squad drop — ``social`` cutover-gated).
+There is no monthly benchmark (it moved to the metrics layer); output is one
+row per slot with ``occupancy_minutes`` and ``required_minutes``.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 
-import pandas as pd
 import pytest
+from pyspark.sql import types as T
 
 from occupancy_time import (
     DIMENSIONED_ACTIVITY_TO_OOS,
     IO_OCCUPANCY_TIME_SCHEMA,
+    MEETING_LEAVE_DIMENSIONED_ACTIVITIES,
+    NOCC_DIME_SQUAD_EXCLUSIONS,
     NOCC_OUT_OF_SCOPE_SQUADS,
     SHUFFLE_OCCUPIED_STATUSES,
     SLOT_DURATION_SECONDS,
+    SOCIAL_MEDIA_OCCUPANCY_CUTOVER,
     build_jobs_union,
     compute_occupancy_time,
     compute_slot_occupancy,
     filter_dime,
 )
 
-
 # ---------------------------------------------------------------------------
-# Builders
+# Builders for synthetic input frames
 # ---------------------------------------------------------------------------
 
-D = dt.date(2026, 5, 18)
+D = dt.date(2026, 5, 18)  # pre-cutover (< 2026-07-01)
 SLOT_BASE = 1_716_000_000  # any int; only start/end deltas matter
 
 
-def make_dime_row(**overrides) -> dict:
-    base = {
+_DIME_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("date", T.DateType()),
+        T.StructField("squad", T.StringType()),
+        T.StructField("affiliation", T.StringType()),
+        T.StructField("activity_type_required", T.StringType()),
+        T.StructField("shuffle_status_required", T.StringType()),
+        T.StructField("dimensioned_activity", T.StringType()),
+        T.StructField("local_timestamp_dime_slot_starts_at", T.TimestampType()),
+        T.StructField("slot_start_local_unix", T.LongType()),
+        T.StructField("slot_end_local_unix", T.LongType()),
+    ]
+)
+
+_SHUFFLE_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("actor_affiliation", T.StringType()),
+        T.StructField("date", T.DateType()),
+        T.StructField("job_type", T.StringType()),
+        T.StructField("activity_type", T.StringType()),
+        T.StructField("status", T.StringType()),
+        T.StructField("net_time_spent_seconds", T.LongType()),
+        T.StructField("local_start_time", T.TimestampType()),
+        T.StructField("local_stop_time", T.TimestampType()),
+        T.StructField("activity_start_unix", T.LongType()),
+        T.StructField("activity_end_unix", T.LongType()),
+    ]
+)
+
+_OOS_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("date", T.DateType()),
+        T.StructField("job_classification", T.StringType()),
+        T.StructField("net_time_spent_seconds", T.LongType()),
+        T.StructField("local_start_date", T.TimestampType()),
+        T.StructField("local_stop_date", T.TimestampType()),
+        T.StructField("activity_start_unix", T.LongType()),
+        T.StructField("activity_end_unix", T.LongType()),
+        T.StructField("squad", T.StringType()),
+        T.StructField("comment", T.StringType()),
+    ]
+)
+
+_SM_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("date", T.DateType()),
+        T.StructField("net_time_spent_seconds", T.LongType()),
+        T.StructField("case_assignment_time", T.TimestampType()),
+        T.StructField("case_unassignment_time", T.TimestampType()),
+        T.StructField("activity_start_unix", T.LongType()),
+        T.StructField("activity_end_unix", T.LongType()),
+    ]
+)
+
+_ROSTER_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("actor_id", T.StringType()),
+        T.StructField("xforce", T.StringType()),
+        T.StructField("xplead", T.StringType()),
+        T.StructField("team", T.StringType()),
+        T.StructField("squad", T.StringType()),
+        T.StructField("squad_district", T.StringType()),
+        T.StructField("status", T.StringType()),
+        T.StructField("shift", T.StringType()),
+        T.StructField("snapshot_date", T.DateType()),
+        T.StructField("snapshot_month", T.DateType()),
+        T.StructField("hire_start_date", T.DateType()),
+        T.StructField("last_change_date", T.DateType()),
+    ]
+)
+
+
+def _rows_to_df(spark, schema, rows, defaults):
+    data = [{**defaults, **r} for r in rows]
+    return spark.createDataFrame(
+        [tuple(r[f.name] for f in schema.fields) for r in data], schema
+    )
+
+
+def make_dime(spark, rows):
+    defaults = {
         "agent": "jane.doe",
         "date": D,
         "squad": "core",
@@ -52,16 +140,11 @@ def make_dime_row(**overrides) -> dict:
         "slot_start_local_unix": SLOT_BASE,
         "slot_end_local_unix": SLOT_BASE + SLOT_DURATION_SECONDS,
     }
-    base.update(overrides)
-    return base
+    return _rows_to_df(spark, _DIME_SCHEMA, rows, defaults)
 
 
-def make_dime(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame([make_dime_row(**r) for r in rows])
-
-
-def make_shuffle_row(**overrides) -> dict:
-    base = {
+def make_shuffle(spark, rows):
+    defaults = {
         "agent": "jane.doe",
         "actor_affiliation": "nubank",
         "date": D,
@@ -74,16 +157,11 @@ def make_shuffle_row(**overrides) -> dict:
         "activity_start_unix": SLOT_BASE,
         "activity_end_unix": SLOT_BASE + 600,
     }
-    base.update(overrides)
-    return base
+    return _rows_to_df(spark, _SHUFFLE_SCHEMA, rows, defaults)
 
 
-def make_shuffle(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame([make_shuffle_row(**r) for r in rows])
-
-
-def make_oos_row(**overrides) -> dict:
-    base = {
+def make_oos(spark, rows):
+    defaults = {
         "agent": "jane.doe",
         "date": D,
         "job_classification": "support_ticket",
@@ -95,16 +173,11 @@ def make_oos_row(**overrides) -> dict:
         "squad": "core",
         "comment": "",
     }
-    base.update(overrides)
-    return base
+    return _rows_to_df(spark, _OOS_SCHEMA, rows, defaults)
 
 
-def make_oos(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame([make_oos_row(**r) for r in rows])
-
-
-def make_sm_row(**overrides) -> dict:
-    base = {
+def make_sm(spark, rows):
+    defaults = {
         "agent": "jane.doe",
         "date": D,
         "net_time_spent_seconds": 600,
@@ -113,15 +186,18 @@ def make_sm_row(**overrides) -> dict:
         "activity_start_unix": SLOT_BASE,
         "activity_end_unix": SLOT_BASE + 600,
     }
-    base.update(overrides)
-    return base
+    return _rows_to_df(spark, _SM_SCHEMA, rows, defaults)
 
 
-def make_sm(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame([make_sm_row(**r) for r in rows])
+def empty_shuffle(spark):
+    return spark.createDataFrame([], _SHUFFLE_SCHEMA)
 
 
-def make_roster(rows: list[dict]) -> pd.DataFrame:
+def empty_oos(spark):
+    return spark.createDataFrame([], _OOS_SCHEMA)
+
+
+def make_roster(spark, rows):
     defaults = {
         "agent": "jane.doe",
         "actor_id": "actor-1",
@@ -137,73 +213,82 @@ def make_roster(rows: list[dict]) -> pd.DataFrame:
         "hire_start_date": dt.date(2025, 1, 15),
         "last_change_date": dt.date(2025, 1, 15),
     }
-    return pd.DataFrame([{**defaults, **r} for r in rows])
+    return _rows_to_df(spark, _ROSTER_SCHEMA, rows, defaults)
 
 
 # ---------------------------------------------------------------------------
-# filter_dime — minimal raw universe + systemic reclassifications
+# filter_dime — minimal raw universe + systemic reclassifications + fixed filters
 # ---------------------------------------------------------------------------
 
 
 class TestFilterDime:
-    def test_keeps_a_well_formed_row(self):
-        out = filter_dime(make_dime([{}]))
-        assert len(out) == 1
+    def test_keeps_a_well_formed_row(self, spark):
+        assert filter_dime(make_dime(spark, [{}])).count() == 1
 
-    def test_drops_null_activity_type_required(self):
-        out = filter_dime(make_dime([{"activity_type_required": None}]))
-        assert out.empty
+    def test_drops_null_activity_type_required(self, spark):
+        assert filter_dime(make_dime(spark, [{"activity_type_required": None}])).count() == 0
 
     @pytest.mark.parametrize("act", ["lunch_break", "time_off", "shrinkage"])
-    def test_keeps_formerly_excluded_activity_types(self, act):
-        out = filter_dime(make_dime([{"activity_type_required": act}]))
-        assert len(out) == 1
+    def test_keeps_formerly_excluded_activity_types(self, spark, act):
+        # Activity-type exclusions move to the metrics layer.
+        assert filter_dime(make_dime(spark, [{"activity_type_required": act}])).count() == 1
 
-    @pytest.mark.parametrize("dim", ["Mouring", "Licencia", "Vacacion"])
-    def test_keeps_formerly_excluded_dimensioned_activities(self, dim):
-        out = filter_dime(make_dime([{"dimensioned_activity": dim}]))
-        assert len(out) == 1
+    @pytest.mark.parametrize("dim_act", list(MEETING_LEAVE_DIMENSIONED_ACTIVITIES))
+    def test_drops_meeting_leave_dimensioned_activity(self, spark, dim_act):
+        # Fixed DIME filter (all dates): leave/meeting slots are excluded.
+        assert filter_dime(make_dime(spark, [{"dimensioned_activity": dim_act}])).count() == 0
 
-    @pytest.mark.parametrize("squad", ["wfm", "credit_evolution", "dote", "social"])
-    def test_keeps_formerly_excluded_squads(self, squad):
-        out = filter_dime(make_dime([{"squad": squad}]))
-        assert len(out) == 1
+    def test_keeps_null_dimensioned_activity(self, spark):
+        assert filter_dime(make_dime(spark, [{"dimensioned_activity": None}])).count() == 1
 
-    def test_keeps_null_squad(self):
-        out = filter_dime(make_dime([{"squad": None}]))
-        assert len(out) == 1
+    @pytest.mark.parametrize("squad", ["wfm", "credit_evolution", "dote"])
+    def test_drops_dime_squad_exclusions(self, spark, squad):
+        # Fixed DIME filter (all dates): operational/WFM squads excluded.
+        assert filter_dime(make_dime(spark, [{"squad": squad}])).count() == 0
+
+    def test_drops_null_dime_squad(self, spark):
+        assert filter_dime(make_dime(spark, [{"squad": None}])).count() == 0
+
+    def test_drops_social_dime_squad_before_cutover(self, spark):
+        # Pre-cutover (date D is May 2026): social DIME slots reproduce legacy
+        # (which had no Sprinklr source) and are dropped.
+        assert filter_dime(make_dime(spark, [{"squad": "social"}])).count() == 0
+
+    def test_keeps_social_dime_squad_from_cutover(self, spark):
+        # From 2026-07-01 on, social DIME slots are kept (Social-Media occupancy
+        # turns on alongside the sm_jobs union).
+        out = filter_dime(
+            make_dime(spark, [{"squad": "social", "date": SOCIAL_MEDIA_OCCUPANCY_CUTOVER}])
+        )
+        assert out.count() == 1
+
+    def test_social_in_exclusion_constant(self, spark):
+        assert "social" in NOCC_DIME_SQUAD_EXCLUSIONS
 
     @pytest.mark.parametrize("dim_act", list(DIMENSIONED_ACTIVITY_TO_OOS))
-    def test_systemic_fraud_reclassification(self, dim_act):
+    def test_systemic_fraud_reclassification(self, spark, dim_act):
+        out = filter_dime(
+            make_dime(spark, [{"dimensioned_activity": dim_act, "activity_type_required": "chat"}])
+        ).collect()
+        assert len(out) == 1
+        assert out[0]["activity_type_required"] == "oos"
+
+    def test_systemic_invalid_notation_reclassification(self, spark):
+        out = filter_dime(
+            make_dime(spark, [{"activity_type_required": "dime_invalid_notation"}])
+        ).collect()
+        assert len(out) == 1
+        assert out[0]["activity_type_required"] == "oos"
+
+    def test_does_not_apply_per_agent_timeoff_reclassification(self, spark):
         out = filter_dime(
             make_dime(
-                [{"dimensioned_activity": dim_act, "activity_type_required": "chat"}]
+                spark,
+                [{"agent": "maria.reyes", "date": dt.date(2026, 2, 15), "activity_type_required": "chat"}],
             )
-        )
+        ).collect()
         assert len(out) == 1
-        assert out.iloc[0]["activity_type_required"] == "oos"
-
-    def test_systemic_invalid_notation_reclassification(self):
-        out = filter_dime(
-            make_dime([{"activity_type_required": "dime_invalid_notation"}])
-        )
-        assert len(out) == 1
-        assert out.iloc[0]["activity_type_required"] == "oos"
-
-    def test_does_not_apply_per_agent_timeoff_reclassification(self):
-        out = filter_dime(
-            make_dime(
-                [
-                    {
-                        "agent": "maria.reyes",
-                        "date": dt.date(2026, 2, 15),
-                        "activity_type_required": "chat",
-                    }
-                ]
-            )
-        )
-        assert len(out) == 1
-        assert out.iloc[0]["activity_type_required"] == "chat"
+        assert out[0]["activity_type_required"] == "chat"
 
 
 # ---------------------------------------------------------------------------
@@ -213,95 +298,99 @@ class TestFilterDime:
 
 class TestBuildJobsUnion:
     @pytest.mark.parametrize("status", list(SHUFFLE_OCCUPIED_STATUSES))
-    def test_keeps_all_three_occupied_statuses(self, status):
-        out = build_jobs_union(make_shuffle([{"status": status}]), make_oos([]))
+    def test_keeps_all_three_occupied_statuses(self, spark, status):
+        out = build_jobs_union(make_shuffle(spark, [{"status": status}]), empty_oos(spark))
+        assert out.count() == 1
+
+    def test_drops_other_statuses(self, spark):
+        out = build_jobs_union(make_shuffle(spark, [{"status": "cancelled"}]), empty_oos(spark))
+        assert out.count() == 0
+
+    def test_synthesizes_activity_type_oos_on_oos_side(self, spark):
+        out = build_jobs_union(empty_shuffle(spark), make_oos(spark, [{}])).collect()
         assert len(out) == 1
+        assert out[0]["activity_type"] == "oos"
 
-    def test_drops_other_statuses(self):
-        out = build_jobs_union(make_shuffle([{"status": "cancelled"}]), make_oos([]))
-        assert out.empty
+    def test_concats_shuffle_and_oos(self, spark):
+        out = build_jobs_union(make_shuffle(spark, [{}]), make_oos(spark, [{}]))
+        assert sorted(r["activity_type"] for r in out.collect()) == ["chat", "oos"]
 
-    def test_synthesizes_activity_type_oos_on_oos_side(self):
-        out = build_jobs_union(make_shuffle([]), make_oos([{}]))
+    def test_sm_jobs_synthesized_as_oos(self, spark):
+        out = build_jobs_union(empty_shuffle(spark), empty_oos(spark), make_sm(spark, [{}])).collect()
         assert len(out) == 1
-        assert out.iloc[0]["activity_type"] == "oos"
+        assert out[0]["activity_type"] == "oos"
 
-    def test_concats_shuffle_and_oos(self):
-        out = build_jobs_union(make_shuffle([{}]), make_oos([{}]))
-        assert sorted(out["activity_type"].tolist()) == ["chat", "oos"]
+    def test_sm_jobs_optional_default_none(self, spark):
+        out = build_jobs_union(make_shuffle(spark, [{}]), empty_oos(spark))
+        assert out.count() == 1
 
-    def test_sm_jobs_synthesized_as_oos(self):
-        out = build_jobs_union(make_shuffle([]), make_oos([]), make_sm([{}]))
-        assert len(out) == 1
-        assert out.iloc[0]["activity_type"] == "oos"
+    def test_concats_all_three_sources(self, spark):
+        out = build_jobs_union(make_shuffle(spark, [{}]), make_oos(spark, [{}]), make_sm(spark, [{}]))
+        assert sorted(r["activity_type"] for r in out.collect()) == ["chat", "oos", "oos"]
 
-    def test_sm_jobs_optional_default_none(self):
-        # Existing two-arg callers keep working (no SM jobs).
-        out = build_jobs_union(make_shuffle([{}]), make_oos([]))
-        assert len(out) == 1
-
-    def test_concats_all_three_sources(self):
-        out = build_jobs_union(make_shuffle([{}]), make_oos([{}]), make_sm([{}]))
-        assert sorted(out["activity_type"].tolist()) == ["chat", "oos", "oos"]
-
-    def test_luis_contreras_content_oos_plus_two_hour_correction(self):
+    def test_luis_contreras_content_oos_plus_two_hour_correction(self, spark):
         out = build_jobs_union(
-            make_shuffle([]),
-            make_oos([
-                {
-                    "agent": "luis.contreras",
-                    "date": dt.date(2026, 3, 8),
-                    "local_start_date": dt.datetime(2026, 3, 8, 23, 30),
-                    "local_stop_date": dt.datetime(2026, 3, 8, 23, 45),
-                    "activity_start_unix": 1_000,
-                    "activity_end_unix": 1_900,
-                    "squad": "content_content",
-                }
-            ]),
-        )
-
-        row = out.iloc[0]
+            empty_shuffle(spark),
+            make_oos(
+                spark,
+                [
+                    {
+                        "agent": "luis.contreras",
+                        "date": dt.date(2026, 3, 8),
+                        "local_start_date": dt.datetime(2026, 3, 8, 23, 30),
+                        "local_stop_date": dt.datetime(2026, 3, 8, 23, 45),
+                        "activity_start_unix": 1_000,
+                        "activity_end_unix": 1_900,
+                        "squad": "content_content",
+                    }
+                ],
+            ),
+        ).collect()
+        row = out[0]
         assert row["activity_start_unix"] == 1_000 + 2 * 3600
         assert row["activity_end_unix"] == 1_900 + 2 * 3600
-        assert row["date"] == dt.date(2026, 3, 9)
 
-    def test_luis_contreras_content_oos_plus_one_hour_correction(self):
+    def test_luis_contreras_content_oos_plus_one_hour_correction(self, spark):
         out = build_jobs_union(
-            make_shuffle([]),
-            make_oos([
-                {
-                    "agent": "luis.contreras",
-                    "date": dt.date(2026, 3, 9),
-                    "local_start_date": dt.datetime(2026, 3, 9, 10, 0),
-                    "local_stop_date": dt.datetime(2026, 3, 9, 10, 15),
-                    "activity_start_unix": 1_000,
-                    "activity_end_unix": 1_900,
-                    "squad": "content_content",
-                }
-            ]),
-        )
-
-        row = out.iloc[0]
+            empty_shuffle(spark),
+            make_oos(
+                spark,
+                [
+                    {
+                        "agent": "luis.contreras",
+                        "date": dt.date(2026, 3, 9),
+                        "local_start_date": dt.datetime(2026, 3, 9, 10, 0),
+                        "local_stop_date": dt.datetime(2026, 3, 9, 10, 15),
+                        "activity_start_unix": 1_000,
+                        "activity_end_unix": 1_900,
+                        "squad": "content_content",
+                    }
+                ],
+            ),
+        ).collect()
+        row = out[0]
         assert row["activity_start_unix"] == 1_000 + 3600
         assert row["activity_end_unix"] == 1_900 + 3600
 
-    def test_luis_contreras_non_content_oos_not_corrected(self):
+    def test_luis_contreras_non_content_oos_not_corrected(self, spark):
         out = build_jobs_union(
-            make_shuffle([]),
-            make_oos([
-                {
-                    "agent": "luis.contreras",
-                    "date": dt.date(2026, 3, 9),
-                    "local_start_date": dt.datetime(2026, 3, 9, 10, 0),
-                    "local_stop_date": dt.datetime(2026, 3, 9, 10, 15),
-                    "activity_start_unix": 1_000,
-                    "activity_end_unix": 1_900,
-                    "squad": "core",
-                }
-            ]),
-        )
-
-        row = out.iloc[0]
+            empty_shuffle(spark),
+            make_oos(
+                spark,
+                [
+                    {
+                        "agent": "luis.contreras",
+                        "date": dt.date(2026, 3, 9),
+                        "local_start_date": dt.datetime(2026, 3, 9, 10, 0),
+                        "local_stop_date": dt.datetime(2026, 3, 9, 10, 15),
+                        "activity_start_unix": 1_000,
+                        "activity_end_unix": 1_900,
+                        "squad": "core",
+                    }
+                ],
+            ),
+        ).collect()
+        row = out[0]
         assert row["activity_start_unix"] == 1_000
         assert row["activity_end_unix"] == 1_900
 
@@ -312,168 +401,118 @@ class TestBuildJobsUnion:
 
 
 class TestComputeSlotOccupancy:
-    def _slot_only(self):
-        return filter_dime(make_dime([{}]))
+    def _slot_only(self, spark):
+        return filter_dime(make_dime(spark, [{}]))
 
-    def _make_job(self, start_offset: int, end_offset: int, activity_type: str = "chat"):
+    def _job(self, spark, start_offset, end_offset, activity_type="chat"):
         return make_shuffle(
+            spark,
             [
                 {
                     "activity_type": activity_type,
                     "activity_start_unix": SLOT_BASE + start_offset,
                     "activity_end_unix": SLOT_BASE + end_offset,
                 }
-            ]
+            ],
         )
 
-    def test_single_matching_job_fully_inside_slot(self):
-        slots = self._slot_only()
-        jobs = build_jobs_union(self._make_job(0, 600), make_oos([]))
-        out = compute_slot_occupancy(slots, jobs)
-        assert len(out) == 1
-        assert int(out.iloc[0]["occupancy_time"]) == 600
+    def _occ(self, slots, jobs):
+        rows = compute_slot_occupancy(slots, jobs).collect()
+        assert len(rows) == 1
+        return int(rows[0]["occupancy_time"])
 
-    def test_mismatched_activity_yields_zero(self):
-        slots = self._slot_only()
-        jobs = build_jobs_union(
-            self._make_job(0, 600, activity_type="email"), make_oos([])
-        )
-        out = compute_slot_occupancy(slots, jobs)
-        assert int(out.iloc[0]["occupancy_time"]) == 0
+    def test_single_matching_job_fully_inside_slot(self, spark):
+        jobs = build_jobs_union(self._job(spark, 0, 600), empty_oos(spark))
+        assert self._occ(self._slot_only(spark), jobs) == 600
 
-    def test_job_clipped_to_slot_start(self):
-        slots = self._slot_only()
-        jobs = build_jobs_union(self._make_job(-300, 600), make_oos([]))
-        out = compute_slot_occupancy(slots, jobs)
-        assert int(out.iloc[0]["occupancy_time"]) == 600
+    def test_mismatched_activity_yields_zero(self, spark):
+        jobs = build_jobs_union(self._job(spark, 0, 600, "email"), empty_oos(spark))
+        assert self._occ(self._slot_only(spark), jobs) == 0
 
-    def test_job_clipped_to_slot_end(self):
-        slots = self._slot_only()
-        jobs = build_jobs_union(self._make_job(1500, 2400), make_oos([]))
-        out = compute_slot_occupancy(slots, jobs)
-        assert int(out.iloc[0]["occupancy_time"]) == 300
+    def test_job_clipped_to_slot_start(self, spark):
+        jobs = build_jobs_union(self._job(spark, -300, 600), empty_oos(spark))
+        assert self._occ(self._slot_only(spark), jobs) == 600
 
-    def test_job_fully_swallows_slot(self):
-        slots = self._slot_only()
-        jobs = build_jobs_union(self._make_job(-300, 2400), make_oos([]))
-        out = compute_slot_occupancy(slots, jobs)
-        assert int(out.iloc[0]["occupancy_time"]) == 1800
+    def test_job_clipped_to_slot_end(self, spark):
+        jobs = build_jobs_union(self._job(spark, 1500, 2400), empty_oos(spark))
+        assert self._occ(self._slot_only(spark), jobs) == 300
 
-    def test_two_non_overlapping_jobs_sum(self):
-        slots = self._slot_only()
+    def test_job_fully_swallows_slot(self, spark):
+        jobs = build_jobs_union(self._job(spark, -300, 2400), empty_oos(spark))
+        assert self._occ(self._slot_only(spark), jobs) == 1800
+
+    def test_two_non_overlapping_jobs_sum(self, spark):
         jobs = build_jobs_union(
             make_shuffle(
+                spark,
                 [
-                    make_shuffle_row(
-                        activity_start_unix=SLOT_BASE,
-                        activity_end_unix=SLOT_BASE + 600,
-                    ),
-                    make_shuffle_row(
-                        activity_start_unix=SLOT_BASE + 900,
-                        activity_end_unix=SLOT_BASE + 1500,
-                    ),
-                ]
+                    {"activity_start_unix": SLOT_BASE, "activity_end_unix": SLOT_BASE + 600},
+                    {"activity_start_unix": SLOT_BASE + 900, "activity_end_unix": SLOT_BASE + 1500},
+                ],
             ),
-            make_oos([]),
+            empty_oos(spark),
         )
-        out = compute_slot_occupancy(slots, jobs)
-        assert int(out.iloc[0]["occupancy_time"]) == 1200
+        assert self._occ(self._slot_only(spark), jobs) == 1200
 
-    def test_overlapping_jobs_dedup_no_double_count(self):
-        slots = self._slot_only()
+    def test_overlapping_jobs_dedup_no_double_count(self, spark):
         jobs = build_jobs_union(
             make_shuffle(
+                spark,
                 [
-                    make_shuffle_row(
-                        activity_start_unix=SLOT_BASE,
-                        activity_end_unix=SLOT_BASE + 1200,
-                    ),
-                    make_shuffle_row(
-                        activity_start_unix=SLOT_BASE + 600,
-                        activity_end_unix=SLOT_BASE + 1500,
-                    ),
-                ]
+                    {"activity_start_unix": SLOT_BASE, "activity_end_unix": SLOT_BASE + 1200},
+                    {"activity_start_unix": SLOT_BASE + 600, "activity_end_unix": SLOT_BASE + 1500},
+                ],
             ),
-            make_oos([]),
+            empty_oos(spark),
         )
-        out = compute_slot_occupancy(slots, jobs)
-        assert int(out.iloc[0]["occupancy_time"]) == 1500
+        assert self._occ(self._slot_only(spark), jobs) == 1500
 
-    def test_dedup_only_within_same_activity_type_partition(self):
-        slots = self._slot_only()
+    def test_dedup_only_within_same_activity_type_partition(self, spark):
         jobs = build_jobs_union(
             make_shuffle(
+                spark,
                 [
-                    make_shuffle_row(
-                        activity_type="chat",
-                        activity_start_unix=SLOT_BASE,
-                        activity_end_unix=SLOT_BASE + 1200,
-                    ),
-                    make_shuffle_row(
-                        activity_type="email",
-                        activity_start_unix=SLOT_BASE + 600,
-                        activity_end_unix=SLOT_BASE + 1500,
-                    ),
-                ]
+                    {"activity_type": "chat", "activity_start_unix": SLOT_BASE, "activity_end_unix": SLOT_BASE + 1200},
+                    {"activity_type": "email", "activity_start_unix": SLOT_BASE + 600, "activity_end_unix": SLOT_BASE + 1500},
+                ],
             ),
-            make_oos([]),
+            empty_oos(spark),
         )
-        out = compute_slot_occupancy(slots, jobs)
-        assert int(out.iloc[0]["occupancy_time"]) == 1200
+        # only the matching ('chat') partition counts -> 1200
+        assert self._occ(self._slot_only(spark), jobs) == 1200
 
-    def test_no_overlap_job_dropped(self):
-        slots = self._slot_only()
-        jobs = build_jobs_union(self._make_job(1800, 2400), make_oos([]))
-        out = compute_slot_occupancy(slots, jobs)
-        assert len(out) == 1
-        assert int(out.iloc[0]["occupancy_time"]) == 0
+    def test_no_overlap_job_dropped(self, spark):
+        jobs = build_jobs_union(self._job(spark, 1800, 2400), empty_oos(spark))
+        assert self._occ(self._slot_only(spark), jobs) == 0
 
-    def test_slot_with_no_matching_jobs_kept_with_zero(self):
-        slots = self._slot_only()
-        empty_jobs = build_jobs_union(make_shuffle([]), make_oos([]))
-        out = compute_slot_occupancy(slots, empty_jobs)
-        assert len(out) == 1
-        assert int(out.iloc[0]["occupancy_time"]) == 0
+    def test_slot_with_no_matching_jobs_kept_with_zero(self, spark):
+        empty = build_jobs_union(empty_shuffle(spark), empty_oos(spark))
+        assert self._occ(self._slot_only(spark), empty) == 0
 
-    def test_occupancy_time_capped_at_slot_duration(self):
-        slots = self._slot_only()
+    def test_occupancy_time_capped_at_slot_duration(self, spark):
         jobs = build_jobs_union(
             make_shuffle(
+                spark,
                 [
-                    make_shuffle_row(
-                        activity_start_unix=SLOT_BASE,
-                        activity_end_unix=SLOT_BASE + 600,
-                    ),
-                    make_shuffle_row(
-                        activity_start_unix=SLOT_BASE + 600,
-                        activity_end_unix=SLOT_BASE + 1200,
-                    ),
-                    make_shuffle_row(
-                        activity_start_unix=SLOT_BASE + 1200,
-                        activity_end_unix=SLOT_BASE + 1800,
-                    ),
-                ]
+                    {"activity_start_unix": SLOT_BASE, "activity_end_unix": SLOT_BASE + 600},
+                    {"activity_start_unix": SLOT_BASE + 600, "activity_end_unix": SLOT_BASE + 1200},
+                    {"activity_start_unix": SLOT_BASE + 1200, "activity_end_unix": SLOT_BASE + 1800},
+                ],
             ),
-            make_oos([]),
+            empty_oos(spark),
         )
-        out = compute_slot_occupancy(slots, jobs)
-        assert int(out.iloc[0]["occupancy_time"]) == 1800
+        assert self._occ(self._slot_only(spark), jobs) == 1800
 
-    def test_oos_activity_matches_oos_slot(self):
-        slots = filter_dime(make_dime([{"activity_type_required": "oos"}]))
+    def test_oos_activity_matches_oos_slot(self, spark):
+        slots = filter_dime(make_dime(spark, [{"activity_type_required": "oos"}]))
         jobs = build_jobs_union(
-            make_shuffle([]),
+            empty_shuffle(spark),
             make_oos(
-                [
-                    {
-                        "activity_start_unix": SLOT_BASE + 300,
-                        "activity_end_unix": SLOT_BASE + 900,
-                    }
-                ]
+                spark,
+                [{"activity_start_unix": SLOT_BASE + 300, "activity_end_unix": SLOT_BASE + 900}],
             ),
         )
-        out = compute_slot_occupancy(slots, jobs)
-        assert int(out.iloc[0]["occupancy_time"]) == 600
+        assert self._occ(slots, jobs) == 600
 
 
 # ---------------------------------------------------------------------------
@@ -481,22 +520,22 @@ class TestComputeSlotOccupancy:
 # ---------------------------------------------------------------------------
 
 
-def _baseline_inputs():
-    roster = make_roster([{}])
-    dime = make_dime([{}])
+def _baseline_inputs(spark):
+    roster = make_roster(spark, [{}])
+    dime = make_dime(spark, [{}])
     shuffle = make_shuffle(
-        [{"activity_start_unix": SLOT_BASE, "activity_end_unix": SLOT_BASE + 600}]
+        spark, [{"activity_start_unix": SLOT_BASE, "activity_end_unix": SLOT_BASE + 600}]
     )
-    oos = make_oos([])
+    oos = empty_oos(spark)
     return roster, dime, shuffle, oos
 
 
 class TestComputeOccupancyTime:
-    def test_basic_end_to_end_shape(self):
-        roster, dime, shuffle, oos = _baseline_inputs()
-        out = compute_occupancy_time(roster, dime, shuffle, oos)
+    def test_basic_end_to_end_shape(self, spark):
+        roster, dime, shuffle, oos = _baseline_inputs(spark)
+        out = compute_occupancy_time(roster, dime, shuffle, oos).collect()
         assert len(out) == 1
-        row = out.iloc[0]
+        row = out[0]
         assert row["agent"] == "jane.doe"
         assert row["occupancy_minutes"] == 600 / 60.0
         assert row["required_minutes"] == SLOT_DURATION_SECONDS / 60.0
@@ -504,85 +543,99 @@ class TestComputeOccupancyTime:
         assert row["squad"] == "core"
         assert row["district"] == "northeast"
         assert row["shift"] == "morning"
+        assert row["slot_time"] == "06:00:00"
 
-    def test_output_column_order_matches_schema(self):
-        roster, dime, shuffle, oos = _baseline_inputs()
+    def test_output_column_order_matches_schema(self, spark):
+        roster, dime, shuffle, oos = _baseline_inputs(spark)
         out = compute_occupancy_time(roster, dime, shuffle, oos)
-        assert list(out.columns) == [c for c, _ in IO_OCCUPANCY_TIME_SCHEMA]
+        assert out.columns == [c for c, _ in IO_OCCUPANCY_TIME_SCHEMA]
 
-    def test_drops_inactive_agent(self):
-        roster = make_roster([{"status": "inactive"}])
-        _, dime, shuffle, oos = _baseline_inputs()
-        out = compute_occupancy_time(roster, dime, shuffle, oos)
-        assert out.empty
+    def test_drops_inactive_agent(self, spark):
+        roster = make_roster(spark, [{"status": "inactive"}])
+        _, dime, shuffle, oos = _baseline_inputs(spark)
+        assert compute_occupancy_time(roster, dime, shuffle, oos).count() == 0
 
-    @pytest.mark.parametrize("squad", ["social", "content"])
-    def test_social_and_content_squads_kept(self, squad):
-        roster = make_roster([{"squad": squad}])
-        _, dime, shuffle, oos = _baseline_inputs()
-        out = compute_occupancy_time(roster, dime, shuffle, oos)
+    def test_content_squad_kept(self, spark):
+        # Roster squad 'content' is in scope (DIME squad is separate); use a
+        # non-excluded DIME squad on the slot.
+        roster = make_roster(spark, [{"squad": "content"}])
+        _, dime, shuffle, oos = _baseline_inputs(spark)
+        out = compute_occupancy_time(roster, dime, shuffle, oos).collect()
         assert len(out) == 1
-        assert out.iloc[0]["squad"] == squad
+        assert out[0]["squad"] == "content"
 
-    def test_keeps_slot_with_no_matching_jobs(self):
-        roster, dime, _, _ = _baseline_inputs()
-        out = compute_occupancy_time(roster, dime, make_shuffle([]), make_oos([]))
+    def test_keeps_slot_with_no_matching_jobs(self, spark):
+        roster, dime, _, _ = _baseline_inputs(spark)
+        out = compute_occupancy_time(roster, dime, empty_shuffle(spark), empty_oos(spark)).collect()
         assert len(out) == 1
-        assert out.iloc[0]["occupancy_minutes"] == 0.0
+        assert out[0]["occupancy_minutes"] == 0.0
 
-    def test_sm_jobs_populate_social_occupancy(self):
-        # Social agent with an 'oos' DIME slot and no shuffle/taskmaster jobs:
-        # occupancy must come from the Sprinklr SM case (10 min overlap).
-        roster = make_roster([{"squad": "social", "team": "social media"}])
-        dime = make_dime([{"activity_type_required": "oos"}])
-        out = compute_occupancy_time(
-            roster, dime, make_shuffle([]), make_oos([]), make_sm([{}])
+    def test_sm_jobs_populate_social_occupancy_from_cutover(self, spark):
+        # From 2026-07-01: social agent with an 'oos' DIME slot (DIME squad
+        # 'social' now kept) and no shuffle/taskmaster jobs gets occupancy from
+        # the Sprinklr SM case (10 min overlap).
+        cut = SOCIAL_MEDIA_OCCUPANCY_CUTOVER
+        u = int(dt.datetime(cut.year, cut.month, cut.day, 6, 0, 0, tzinfo=dt.timezone.utc).timestamp())
+        roster = make_roster(
+            spark,
+            [{"squad": "social", "team": "social media", "snapshot_month": cut, "snapshot_date": dt.date(2026, 7, 31)}],
         )
-        assert len(out) == 1
-        row = out.iloc[0]
-        assert row["squad"] == "social"
-        assert row["team"] == "social media"
-        assert row["occupancy_minutes"] == 600 / 60.0
-
-    def test_social_slot_zero_without_sm_jobs(self):
-        # Same social 'oos' slot, but no SM jobs supplied -> occupancy 0.
-        roster = make_roster([{"squad": "social", "team": "social media"}])
-        dime = make_dime([{"activity_type_required": "oos"}])
-        out = compute_occupancy_time(roster, dime, make_shuffle([]), make_oos([]))
-        assert len(out) == 1
-        assert out.iloc[0]["occupancy_minutes"] == 0.0
-
-    def test_handles_tz_aware_snapshot_month(self):
-        roster = make_roster([{}])
-        roster["snapshot_month"] = pd.to_datetime(
-            roster["snapshot_month"]
-        ).dt.tz_localize("UTC")
-        _, dime, shuffle, oos = _baseline_inputs()
-        out = compute_occupancy_time(roster, dime, shuffle, oos)
-        assert len(out) == 1
-
-    def test_handles_empty_inputs(self):
-        out = compute_occupancy_time(
-            make_roster([{}]),
-            pd.DataFrame(columns=list(make_dime([{}]).columns)),
-            make_shuffle([]),
-            make_oos([]),
+        dime = make_dime(
+            spark,
+            [
+                {
+                    "squad": "social",
+                    "activity_type_required": "oos",
+                    "date": cut,
+                    "local_timestamp_dime_slot_starts_at": dt.datetime(cut.year, cut.month, cut.day, 6, 0, 0),
+                    "slot_start_local_unix": u,
+                    "slot_end_local_unix": u + SLOT_DURATION_SECONDS,
+                }
+            ],
         )
-        assert out.empty
+        sm = make_sm(
+            spark,
+            [{"date": cut, "activity_start_unix": u, "activity_end_unix": u + 600}],
+        )
+        out = compute_occupancy_time(
+            roster, dime, empty_shuffle(spark), empty_oos(spark), sm
+        ).collect()
+        assert len(out) == 1
+        assert out[0]["squad"] == "social"
+        assert out[0]["occupancy_minutes"] == 600 / 60.0
+
+    def test_social_slot_dropped_before_cutover(self, spark):
+        # Pre-cutover: social DIME slots reproduce legacy (dropped), so even with
+        # SM jobs there is no row.
+        roster = make_roster(spark, [{"squad": "social", "team": "social media"}])
+        dime = make_dime(spark, [{"squad": "social", "activity_type_required": "oos"}])
+        out = compute_occupancy_time(
+            roster, dime, empty_shuffle(spark), empty_oos(spark), make_sm(spark, [{}])
+        )
+        assert out.count() == 0
+
+    def test_handles_empty_inputs(self, spark):
+        empty_dime = spark.createDataFrame([], _DIME_SCHEMA)
+        out = compute_occupancy_time(
+            make_roster(spark, [{}]), empty_dime, empty_shuffle(spark), empty_oos(spark)
+        )
+        assert out.count() == 0
+
+    def test_uses_month_specific_roster_snapshot(self, spark):
+        roster = make_roster(
+            spark,
+            [
+                {"snapshot_month": dt.date(2026, 4, 1), "snapshot_date": dt.date(2026, 4, 30), "squad": "wrong-april"},
+                {"snapshot_month": dt.date(2026, 5, 1), "snapshot_date": dt.date(2026, 5, 31), "squad": "correct-may"},
+            ],
+        )
+        _, dime, shuffle, oos = _baseline_inputs(spark)
+        out = compute_occupancy_time(roster, dime, shuffle, oos).collect()
+        assert len(out) == 1
+        assert out[0]["squad"] == "correct-may"
 
 
-# ---------------------------------------------------------------------------
-# Schema sanity
-# ---------------------------------------------------------------------------
-
-
-def test_schema_matches_output_columns():
-    roster, dime, shuffle, oos = _baseline_inputs()
-    out = compute_occupancy_time(roster, dime, shuffle, oos)
-    assert list(out.columns) == [c for c, _ in IO_OCCUPANCY_TIME_SCHEMA]
-
-
-def test_out_of_scope_squads_constants():
+def test_out_of_scope_squads_constant_is_empty():
     assert NOCC_OUT_OF_SCOPE_SQUADS == ()
 
 
@@ -594,38 +647,39 @@ def test_out_of_scope_squads_constants():
 class TestNightShiftAttribution:
     @staticmethod
     def _local_unix(ts: str) -> int:
-        return int(pd.Timestamp(ts).value // 10**9)
+        return int(dt.datetime.fromisoformat(ts).replace(tzinfo=dt.timezone.utc).timestamp())
 
-    def _night_slot(self, day: dt.date, ts: str) -> pd.DataFrame:
+    def _night_slot(self, spark, day, ts):
         u = self._local_unix(ts)
         return make_dime(
+            spark,
             [
                 {
                     "date": day,
-                    "local_timestamp_dime_slot_starts_at": pd.Timestamp(ts),
+                    "local_timestamp_dime_slot_starts_at": dt.datetime.fromisoformat(ts),
                     "slot_start_local_unix": u,
                     "slot_end_local_unix": u + SLOT_DURATION_SECONDS,
                 }
-            ]
+            ],
         )
 
-    def test_night_tail_attributed_to_shift_start_day(self):
+    def test_night_tail_attributed_to_shift_start_day(self, spark):
         roster = make_roster(
-            [{"shift": "night", "snapshot_month": dt.date(2026, 7, 1),
-              "snapshot_date": dt.date(2026, 7, 31)}]
+            spark,
+            [{"shift": "night", "snapshot_month": dt.date(2026, 7, 1), "snapshot_date": dt.date(2026, 7, 31)}],
         )
-        dime = self._night_slot(dt.date(2026, 7, 6), "2026-07-06 03:00:00")
-        out = compute_occupancy_time(roster, dime, make_shuffle([]), make_oos([]))
+        dime = self._night_slot(spark, dt.date(2026, 7, 6), "2026-07-06 03:00:00")
+        out = compute_occupancy_time(roster, dime, empty_shuffle(spark), empty_oos(spark)).collect()
         assert len(out) == 1
-        assert out.iloc[0]["date"] == dt.date(2026, 7, 5)
-        assert out.iloc[0]["slot_time"] == "03:00:00"
+        assert out[0]["date"] == dt.date(2026, 7, 5)
+        assert out[0]["slot_time"] == "03:00:00"
 
-    def test_morning_agent_not_re_attributed(self):
+    def test_morning_agent_not_re_attributed(self, spark):
         roster = make_roster(
-            [{"shift": "morning", "snapshot_month": dt.date(2026, 7, 1),
-              "snapshot_date": dt.date(2026, 7, 31)}]
+            spark,
+            [{"shift": "morning", "snapshot_month": dt.date(2026, 7, 1), "snapshot_date": dt.date(2026, 7, 31)}],
         )
-        dime = self._night_slot(dt.date(2026, 7, 6), "2026-07-06 03:00:00")
-        out = compute_occupancy_time(roster, dime, make_shuffle([]), make_oos([]))
+        dime = self._night_slot(spark, dt.date(2026, 7, 6), "2026-07-06 03:00:00")
+        out = compute_occupancy_time(roster, dime, empty_shuffle(spark), empty_oos(spark)).collect()
         assert len(out) == 1
-        assert out.iloc[0]["date"] == dt.date(2026, 7, 6)
+        assert out[0]["date"] == dt.date(2026, 7, 6)
