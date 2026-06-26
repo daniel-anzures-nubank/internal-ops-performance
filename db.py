@@ -28,7 +28,13 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
-from dotenv import load_dotenv
+# python-dotenv is only needed for off-cluster local runs (to load the gitignored
+# .env). On a Databricks cluster it isn't installed and there's no .env — the
+# SparkSession is already authenticated — so the import is best-effort.
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # pragma: no cover - cluster has no python-dotenv
+    load_dotenv = None
 
 if TYPE_CHECKING:  # avoid importing pyspark at module import for `--help`/lint
     from pyspark.sql import DataFrame, SparkSession
@@ -37,8 +43,10 @@ REPO_ROOT = Path(__file__).resolve().parent
 EXTRACTORS_DIR = REPO_ROOT / "extractors"
 
 # Load workspace settings from the repo-root .env (gitignored). Loaded at import
-# time so anything that imports this module can rely on os.environ.
-load_dotenv(REPO_ROOT / ".env")
+# time so anything that imports this module can rely on os.environ. No-op on a
+# cluster (dotenv absent / no .env file).
+if load_dotenv is not None:
+    load_dotenv(REPO_ROOT / ".env")
 
 LOGGER = logging.getLogger("cx_metrics.db")
 
