@@ -318,9 +318,18 @@ def _record_run(
     notes: str | None,
 ) -> None:
     """Append one row to the central ``pipeline_runs`` registry."""
-    from pyspark.sql import Row
-    from pyspark.sql import functions as F
+    from pyspark.sql import types as T
 
+    # Build with an EXPLICIT schema: the single row has NULLs (git_sha, notes,
+    # ...), so Spark (esp. Spark Connect) can't infer column types from the data
+    # and raises CANNOT_DETERMINE_TYPE. An explicit schema also avoids relying on
+    # Row(**kwargs) field ordering. Positional values must match the order below.
+    type_map = {
+        "STRING": T.StringType(),
+        "TIMESTAMP": T.TimestampType(),
+        "DATE": T.DateType(),
+        "BIGINT": T.LongType(),
+    }
     registry_schema = [
         ("run_id", "STRING"),
         ("run_ts", "TIMESTAMP"),
@@ -334,20 +343,25 @@ def _record_run(
         ("git_sha", "STRING"),
         ("notes", "STRING"),
     ]
-    row = Row(
-        run_id=run_id,
-        run_ts=run_ts,
-        layer=layer,
-        table_name=table,
-        snapshot_table=snapshot_table,
-        period_start=period_start,
-        period_end=period_end,
-        row_count=int(row_count),
-        status=status,
-        git_sha=git_sha,
-        notes=notes,
+    struct = T.StructType(
+        [T.StructField(name, type_map[sql_type]) for name, sql_type in registry_schema]
     )
-    df = _apply_schema(spark.createDataFrame([row]), registry_schema)
+    values = [
+        (
+            run_id,
+            run_ts,
+            layer,
+            table,
+            snapshot_table,
+            period_start,
+            period_end,
+            int(row_count),
+            status,
+            git_sha,
+            notes,
+        )
+    ]
+    df = spark.createDataFrame(values, struct)
     df.write.mode("append").format("delta").saveAsTable(registry_table)
 
 
