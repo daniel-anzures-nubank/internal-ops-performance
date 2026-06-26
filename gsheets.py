@@ -35,13 +35,21 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pandas as pd
-from dotenv import load_dotenv
+
+# python-dotenv is only needed to load the gitignored .env for off-cluster runs.
+# On a Databricks cluster it isn't installed (creds come from a secret-scope env
+# var instead), so the import is best-effort.
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # pragma: no cover - cluster has no python-dotenv
+    load_dotenv = None
 
 if TYPE_CHECKING:  # only for type hints; not imported at runtime
     import gspread
 
 REPO_ROOT = Path(__file__).resolve().parent
-load_dotenv(REPO_ROOT / ".env")
+if load_dotenv is not None:
+    load_dotenv(REPO_ROOT / ".env")
 
 # Read + write. Use ``.../auth/spreadsheets.readonly`` if you only ever read.
 DEFAULT_SCOPES = (
