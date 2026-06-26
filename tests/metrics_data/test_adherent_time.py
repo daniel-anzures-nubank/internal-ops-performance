@@ -19,6 +19,7 @@ from pyspark.sql import types as T
 
 from adherent_time import (
     CORE_OUT_OF_SCOPE_SQUADS,
+    DIME_SQUAD_EXCLUSIONS,
     MEETING_LEAVE_DIMENSIONED_ACTIVITIES,
     MEXICO_UTC_OFFSET_SECONDS,
     SLOT_DURATION_SECONDS,
@@ -182,12 +183,14 @@ class TestFilterDime:
     def test_keeps_formerly_excluded_activity_types(self, spark, act):
         assert filter_dime(make_dime(spark, [{"activity_type_required": act}])).count() == 1
 
-    @pytest.mark.parametrize("squad", ["wfm", "credit_evolution", "dote"])
-    def test_keeps_formerly_excluded_squads(self, spark, squad):
-        assert filter_dime(make_dime(spark, [{"squad": squad}])).count() == 1
+    @pytest.mark.parametrize("squad", list(DIME_SQUAD_EXCLUSIONS))
+    def test_drops_dime_squad_exclusions(self, spark, squad):
+        # Fixed DIME filter: operational/WFM squads are excluded from adherence.
+        assert filter_dime(make_dime(spark, [{"squad": squad}])).count() == 0
 
-    def test_keeps_null_squad(self, spark):
-        assert filter_dime(make_dime(spark, [{"squad": None}])).count() == 1
+    def test_drops_null_dime_squad(self, spark):
+        # Legacy `agent_dime_squad IS NOT NULL` — a NULL DIME squad is dropped.
+        assert filter_dime(make_dime(spark, [{"squad": None}])).count() == 0
 
     def test_adds_utc_unix_columns_with_six_hour_offset(self, spark):
         row = filter_dime(make_dime(spark, [{}])).collect()[0]

@@ -53,9 +53,13 @@ reach this metric — see `MEETING_LEAVE_DIMENSIONED_ACTIVITIES`.
 
 ## Deferred to the future Adjustments layer (NOT applied here)
 
-- Legacy DIME-squad exclusions (`wfm` / `credit_evolution` / `dote`).
 - Per-agent manual time-off adjustments and outage-date exclusions
   (e.g. 2026-03-27, 2026-04-09).
+
+(The legacy **DIME-squad exclusion** — `agent_dime_squad` not in
+`wfm`/`credit_evolution`/`dote`, NULL dropped — like the meeting/leave filter,
+is **applied upstream** by the raw layer's fixed DIME filter, so it never
+reaches this metric.)
 
 ## Output schema (one row per agent per period)
 

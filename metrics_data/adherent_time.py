@@ -24,9 +24,11 @@ Source tables (via extractors)
 
 Filters applied here (deliberately minimal — this is a raw table)
 -----------------------------------------------------------------
-* DIME: keep slots with ``activity_type_required IS NOT NULL`` and
-  ``dimensioned_activity`` not in the meeting/leave list (a fixed legacy DIME
-  filter — see ``MEETING_LEAVE_DIMENSIONED_ACTIVITIES``).
+* DIME: keep slots with ``activity_type_required IS NOT NULL``,
+  ``dimensioned_activity`` not in the meeting/leave list
+  (``MEETING_LEAVE_DIMENSIONED_ACTIVITIES``), and ``agent_dime_squad`` not in
+  the excluded DIME squads (``DIME_SQUAD_EXCLUSIONS``: wfm / credit_evolution /
+  dote) — all fixed legacy DIME filters.
 * Productivity: keep "connected" rows (the legacy ``agent_productivity``
   WHERE filter — see ``filter_productivity``).
 * Roster: ``status = 'active'`` (inner join attaches the dimensions and
@@ -114,6 +116,13 @@ MEETING_LEAVE_DIMENSIONED_ACTIVITIES: tuple[str, ...] = (
     "Vacacion",
 )
 
+# DIME squads excluded from adherence — a fixed legacy filter on the DIME
+# `agent_dime_squad` (operational / workforce-management squads, not part of the
+# adherence universe). Legacy applies `agent_dime_squad IS NOT NULL AND NOT IN
+# (...)` at the DIME stage; `metrics_data/jobs_raw.py` already excludes the same
+# set for NTPJ. Note this is the DIME squad, not the roster squad.
+DIME_SQUAD_EXCLUSIONS: tuple[str, ...] = ("wfm", "credit_evolution", "dote")
+
 
 # ---------------------------------------------------------------------------
 # Step 1: filter DIME (minimal — raw slot universe)
@@ -121,7 +130,7 @@ MEETING_LEAVE_DIMENSIONED_ACTIVITIES: tuple[str, ...] = (
 
 
 def filter_dime(dime: DataFrame) -> DataFrame:
-    """Keep DIME slots eligible for adherence, applying the two fixed DIME
+    """Keep DIME slots eligible for adherence, applying the three fixed DIME
     filters legacy applies at the DIME stage:
 
       * ``activity_type_required IS NOT NULL``;
@@ -129,9 +138,12 @@ def filter_dime(dime: DataFrame) -> DataFrame:
         :data:`MEETING_LEAVE_DIMENSIONED_ACTIVITIES` — leave/meeting slots that
         aren't adherence-eligible scheduled work (a NULL ``dimensioned_activity``
         is kept). This is a fixed data filter, **not** a manual adjustment.
+      * the DIME ``squad`` column (``agent_dime_squad``) is non-NULL and not in
+        :data:`DIME_SQUAD_EXCLUSIONS` — drops operational/WFM squads
+        (``wfm`` / ``credit_evolution`` / ``dote``), matching legacy.
 
-    Activity-type (``lunch_break`` / ``time_off`` / ``shrinkage``) and squad
-    business exclusions still move to the metrics layer.
+    Activity-type (``lunch_break`` / ``time_off`` / ``shrinkage``) exclusions
+    still move to the metrics layer.
 
     Adds two computed columns used by the overlap join:
       * ``slot_start``: UTC unix = ``slot_start_local_unix + 6h``
@@ -144,6 +156,13 @@ def filter_dime(dime: DataFrame) -> DataFrame:
             | ~F.col("dimensioned_activity").isin(
                 list(MEETING_LEAVE_DIMENSIONED_ACTIVITIES)
             )
+        )
+        # DIME-squad exclusion: `squad` here is the DIME `agent_dime_squad`
+        # (from the dime_slots extractor), not the roster squad. Match legacy's
+        # `agent_dime_squad IS NOT NULL AND NOT IN (...)`.
+        .filter(
+            F.col("squad").isNotNull()
+            & ~F.col("squad").isin(list(DIME_SQUAD_EXCLUSIONS))
         )
         .withColumn(
             "slot_start", F.col("slot_start_local_unix") + MEXICO_UTC_OFFSET_SECONDS
