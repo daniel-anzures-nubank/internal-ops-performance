@@ -20,7 +20,7 @@ Teams are groupings of roster **squads**. The raw tables carry a `squad` column 
 Two distinct codebases live side by side:
 
 - `legacy/` — the old monolithic Databricks SQL pipeline. Source of truth for metric definitions until each one is migrated.
-- The top-level Python project — a **local-first refactor in progress**, rebuilding the legacy pipeline as small, testable, pandas-based code. The eventual goal is to run it on Databricks, but we develop and validate everything locally first.
+- The top-level Python project — a **local-first refactor in progress**, rebuilding the legacy pipeline as small, testable, pandas-based code. We develop and validate everything locally first, but it **also runs on Databricks** via a git-sourced orchestration job — see [Databricks Deployment](#databricks-deployment-job--git-folder--a-duality).
 
 ## Repository Layout
 
@@ -306,6 +306,27 @@ Every build script writes its table through `db.publish()` (not `write_dataframe
 **Querying.** Latest published run of a table = `pipeline_runs` row with the max `run_id` where `status = 'success'`; pull that run's data with `SELECT * FROM {table}_snapshots WHERE run_id = :run_id`. Diff two runs by joining their snapshots on the table's business key.
 
 This is a transport concern: it lives entirely in `db.py`. The pure `metrics_data/` and `metrics/` modules are unaffected — they still just take a DataFrame and return a DataFrame.
+
+## Databricks Deployment (job ↔ git folder — a duality)
+
+The repo is wired into Databricks (workspace `nubank-e2-general`, profile `nubank-e2-general`) **two independent ways**. They do **not** share state — keep them distinct, and don't confuse "the git folder is stale" with "the job is stale."
+
+1. **The orchestration job — `[IO] Performance Metrics Pipeline`** (job id `267598911414455`). Its tasks are `spark_python_task`s with `source: GIT`, driven by a job-level `git_source` pointing at `https://github.com/daniel-anzures-nubank/internal-ops-performance`, branch `main`. **Databricks checks out `main` fresh from GitHub on every run** — the job never reads the workspace git folder below. So it always runs whatever is on `main` at run time: **to change what the pipeline does, push to `main`** (or repoint `git_source` to another branch/tag). Each task runs a `build_*.py` straight from the checkout, parameterized `--period-start {{job.parameters.period_start}} --period-end {{job.parameters.period_end}} --run-id {{job.run_id}}` (the `period_start` / `period_end` job params currently default to a single test week). It runs on the `[IO]-Performance-Metrics-Cluster` job cluster (Spark `15.4.x` LTS). **The job currently runs only the Adherence slice** — `build_adherent_time` (raw) → `build_adherence` (metric, depends on the first); wiring up the remaining metrics with DQ checks and failure guards is in progress.
+
+2. **The Databricks git folder** — `/Workspace/Users/daniel.anzures@nubank.com.mx/internal-ops-performance` (repo id `2657286665982577`), same GitHub repo + `main`. This is a **separate, interactive checkout** for browsing/editing the code in the Databricks UI. **It does not auto-update** and the job never reads it, so it can drift behind `main`; pull it by hand when you want the UI to reflect the latest: `databricks repos update 2657286665982577 --branch main -p nubank-e2-general`.
+
+**Net:** GitHub `main` is the single source of truth for both. The **job** follows `main` automatically; the **git folder** is a convenience checkout you refresh manually. Because the tasks run as `spark_python_task`s, the build scripts execute against the cluster's **ambient SparkSession** — `db.py`'s transport resolves that session (`get_spark()` / `getOrCreate`) when run on Databricks, while the pure `metrics_data/` and `metrics/` logic modules stay DataFrame-in/DataFrame-out.
+
+**Build scripts must not raise `SystemExit` on success.** Because each task runs as a git-sourced `spark_python_task` under an IPython `exec()` runner, **any `SystemExit` — even code `0` — is treated as an uncaught exception and fails the task** (which then skips every downstream task, *even though the table writes already completed*). So a `build_*.py`'s entrypoint must only exit non-zero, never `sys.exit(main())` directly:
+
+```python
+if __name__ == "__main__":
+    rc = main()
+    if rc:            # success (rc == 0) falls through cleanly; only real errors exit non-zero
+        sys.exit(rc)
+```
+
+This bit the first real job run: `build_adherent_time` wrote its ~46k rows and *then* died on `sys.exit(0)`, marking the task failed and skipping `build_adherence` — a green pipeline that reported red.
 
 ## Working Conventions
 
