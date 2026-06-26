@@ -35,6 +35,11 @@ agent per DIME slot, carrying `activity_type_required`, `required_minutes`
   `{lunch_break, time_off, shrinkage}` (case-insensitive), per the metric
   definition. The remaining slots form both the numerator and the denominator.
 
+The meeting/leave `dimensioned_activity` slots (Mouring / Weekly / Permiso
+Medico / Huddle / Licencia / Vacacion) are **already excluded upstream** by the
+raw layer's fixed DIME filter (`metrics_data/adherent_time.py`), so they never
+reach this metric — see `MEETING_LEAVE_DIMENSIONED_ACTIVITIES`.
+
 ## Derivation
 
 1. Drop the excluded activity types.
@@ -48,12 +53,6 @@ agent per DIME slot, carrying `activity_type_required`, `required_minutes`
 
 ## Deferred to the future Adjustments layer (NOT applied here)
 
-- Legacy `dimensioned_activity` meeting/leave carve-outs (Mouring / Weekly /
-  Permiso Medico / Permiso medico / Huddle / Licencia / Vacacion). These ride on
-  `activity_type_required = 'dime_invalid_notation'` (**not** `'shrinkage'`), and
-  `io_adherent_time_raw` does not carry `dimensioned_activity` — so they are not
-  removed here. They can be applied later by joining `io_shrinkage_slots_raw` on
-  `(agent, date, slot_time)` and dropping shrinkage-flagged slots.
 - Legacy DIME-squad exclusions (`wfm` / `credit_evolution` / `dote`).
 - Per-agent manual time-off adjustments and outage-date exclusions
   (e.g. 2026-03-27, 2026-04-09).

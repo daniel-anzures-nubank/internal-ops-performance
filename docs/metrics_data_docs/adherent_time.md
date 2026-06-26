@@ -20,7 +20,10 @@ applies the business exclusions listed below).
 
 ## Filters applied here (minimal — raw table)
 
-- **DIME**: keep slots with `activity_type_required IS NOT NULL` only.
+- **DIME**: keep slots with `activity_type_required IS NOT NULL`, and drop the
+  meeting/leave `dimensioned_activity` slots (Mouring / Weekly / Permiso Medico /
+  Permiso medico / Huddle / Licencia / Vacacion) — a fixed legacy DIME filter,
+  not a manual adjustment (NULL `dimensioned_activity` is kept).
 - **Productivity**: keep "connected" rows (legacy `agent_productivity` WHERE):
   - `inferred_status IN ('available', 'oos', 'training')`, OR
   - `inferred_status = 'pause' AND level_3 = 'paused_with_jobs'`, OR
@@ -70,8 +73,6 @@ attribution. See the shared rule in
 ## Deferred to the metrics layer (NOT applied here)
 
 - Activity-type exclusions (`lunch_break` / `time_off` / `shrinkage`).
-- `dimensioned_activity` exclusions (Mouring / Weekly / Permiso Medico /
-  Permiso medico / Huddle / Licencia / Vacacion).
 - DIME squad exclusions (`wfm` / `credit_evolution` / `dote` / …).
 - All manual adjustments (agent-date carve-outs, training/shadowing windows,
   maternity leave, outage dates).
