@@ -19,6 +19,7 @@ from pyspark.sql import types as T
 
 from adherent_time import (
     CORE_OUT_OF_SCOPE_SQUADS,
+    MEETING_LEAVE_DIMENSIONED_ACTIVITIES,
     MEXICO_UTC_OFFSET_SECONDS,
     SLOT_DURATION_SECONDS,
     compute_adherent_time,
@@ -165,6 +166,17 @@ class TestFilterDime:
 
     def test_drops_null_activity_type(self, spark):
         assert filter_dime(make_dime(spark, [{"activity_type_required": None}])).count() == 0
+
+    @pytest.mark.parametrize("dim_act", list(MEETING_LEAVE_DIMENSIONED_ACTIVITIES))
+    def test_drops_meeting_leave_dimensioned_activity(self, spark, dim_act):
+        # Fixed DIME filter: leave/meeting slots are excluded from adherence.
+        assert filter_dime(make_dime(spark, [{"dimensioned_activity": dim_act}])).count() == 0
+
+    def test_keeps_null_dimensioned_activity(self, spark):
+        assert filter_dime(make_dime(spark, [{"dimensioned_activity": None}])).count() == 1
+
+    def test_keeps_normal_dimensioned_activity(self, spark):
+        assert filter_dime(make_dime(spark, [{"dimensioned_activity": "BKO_ENG"}])).count() == 1
 
     @pytest.mark.parametrize("act", ["lunch_break", "time_off", "shrinkage"])
     def test_keeps_formerly_excluded_activity_types(self, spark, act):
