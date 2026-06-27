@@ -378,6 +378,43 @@ class TestComputeJobsRaw:
         )
         assert out.count() == 2
 
+    def test_dimensioned_activity_attached_from_covering_slot(self, spark):
+        import calendar
+        # Bracket the shuffle job's start (2026-05-18 06:00:00) with a DIME slot
+        # carrying dimensioned_activity 'bko_cta_tskf' (the reassigned activity).
+        # A WIDE window (±1 day) keeps this robust to the local-Spark session-tz
+        # fixture quirk (the JVM-default tz can offset unix_timestamp by hours);
+        # on the UTC cluster the real [start, start+30min) slot matches exactly.
+        start_unix = calendar.timegm(dt.datetime(2026, 5, 18, 6, 0, 0).timetuple())
+        out = compute_jobs_raw(
+            make_roster(spark, [{}]),
+            make_dime(spark, [{
+                "dimensioned_activity": "bko_cta_tskf",
+                "slot_start_local_unix": start_unix - 86400,
+                "slot_end_local_unix": start_unix + 86400,
+            }]),
+            make_shuffle(spark, [{}]),
+            empty_oos(spark),
+        ).collect()
+        assert len(out) == 1
+        assert out[0]["dimensioned_activity"] == "bko_cta_tskf"
+
+    def test_dimensioned_activity_null_when_no_covering_slot(self, spark):
+        # DIME slot's unix window (0..1800) is far from the real job start → no
+        # cover → NULL dimensioned_activity (one row, no fan-out).
+        out = compute_jobs_raw(
+            make_roster(spark, [{}]),
+            make_dime(spark, [{
+                "dimensioned_activity": "bko_cta_tskf",
+                "slot_start_local_unix": 0,
+                "slot_end_local_unix": 1800,
+            }]),
+            make_shuffle(spark, [{}]),
+            empty_oos(spark),
+        ).collect()
+        assert len(out) == 1
+        assert out[0]["dimensioned_activity"] is None
+
     def test_job_without_required_activity_kept_with_flag_zero(self, spark):
         # OOS job on a day the agent only had chat scheduled → flag 0, kept.
         out = compute_jobs_raw(

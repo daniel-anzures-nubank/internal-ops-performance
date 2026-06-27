@@ -63,12 +63,40 @@ _RAW_SCHEMA = T.StructType(
         T.StructField("end_time", T.TimestampType()),
         T.StructField("job_type", T.StringType()),
         T.StructField("activity_type", T.StringType()),
+        T.StructField("dimensioned_activity", T.StringType()),
         T.StructField("status", T.StringType()),
         T.StructField("job_id", T.StringType()),
         T.StructField("duration_seconds", T.LongType()),
         T.StructField("required_activity_on_day_flag", T.IntegerType()),
     ]
 )
+
+_REASSIGN_SCHEMA = T.StructType(
+    [
+        T.StructField("equipo", T.StringType()),
+        T.StructField("agente", T.StringType()),
+        T.StructField("actividad_dimensionada", T.StringType()),
+        T.StructField("fecha_inicio", T.StringType()),
+        T.StructField("fecha_fin", T.StringType()),
+    ]
+)
+
+
+def make_reassignments(spark, rows):
+    """Build a synced ``adj_reasignaciones_dime``-shaped Spark frame."""
+    return spark.createDataFrame(
+        [
+            (
+                r.get("equipo", "Todos"),
+                r["agente"],
+                r.get("actividad_dimensionada", ""),
+                r.get("fecha_inicio", "2026-05-01"),
+                r.get("fecha_fin", "9000-01-01"),
+            )
+            for r in rows
+        ],
+        _REASSIGN_SCHEMA,
+    )
 
 
 def make_jobs(spark, rows):
@@ -86,6 +114,7 @@ def make_jobs(spark, rows):
         "end_time": dt.datetime(2026, 5, 4, 9, 5, 0),
         "job_type": "queue-a",
         "activity_type": "backoffice",
+        "dimensioned_activity": None,
         "status": "finished",
         "job_id": "bko - queue-a - finished",
         "duration_seconds": 300,
@@ -483,30 +512,98 @@ class TestHardcodedAgentExclusions:
         day = _day_by_agent(out)
         assert "adriana.lopez" in day
 
-    def test_open_ended_exclusion(self, spark):
-        # evelyn.macedo is excluded from 2026-04-27 onwards (open-ended).
-        out = compute_ntpj(
-            make_jobs(
-                spark,
-                [
-                    {"agent": "evelyn.macedo", "date": dt.date(2026, 5, 20),
-                     "start_time": dt.datetime(2026, 5, 20, 9, 0, 0),
-                     "duration_seconds": 300},
-                    {"agent": "b.two", "date": dt.date(2026, 5, 20),
-                     "start_time": dt.datetime(2026, 5, 20, 9, 0, 0),
-                     "duration_seconds": 100},
-                ],
-            ),
-            MAY_START,
-            MAY_END,
+    def test_exclusion_set_covers_dime_ntpj_named_agents(self):
+        # Sanity: the dime_ntpj vacation / day-control agents stay hardcoded here.
+        names = {n for n, _, _ in HARDCODED_AGENT_DATE_EXCLUSIONS}
+        for surfaced in ("tania.enciso", "adriana.lopez", "rodrigo.padilla"):
+            assert surfaced in names
+
+    def test_manual_adjustments_whole_day_agents_moved_to_sheet(self):
+        # The manual_adjustments_ntpj whole-day exclusions now live in the
+        # ``Reasignaciones DIME`` sheet (blank actividad_dimensionada), NOT here.
+        names = {n for n, _, _ in HARDCODED_AGENT_DATE_EXCLUSIONS}
+        for moved in ("evelyn.macedo", "carmina.venegas", "jefferson.nunes",
+                      "luis.delgadillo"):
+            assert moved not in names
+
+
+class TestReassignments:
+    """Reasignaciones DIME tab → legacy ``manual_adjustments_ntpj``: drop jobs
+    done during a reassigned ``dimensioned_activity`` from BOTH benchmark and
+    contribution."""
+
+    def test_activity_specific_drop(self, spark):
+        # Only the bko_cta_tskf job of the reassigned agent is dropped; their
+        # other-activity job and other agents' jobs survive.
+        jobs = make_jobs(
+            spark,
+            [
+                {"agent": "daniel.cano", "dimensioned_activity": "bko_cta_tskf",
+                 "job_id": "oos - taskforce", "duration_seconds": 900},
+                {"agent": "daniel.cano", "dimensioned_activity": "chat",
+                 "job_id": "chat - finished", "activity_type": "chat",
+                 "duration_seconds": 300},
+            ],
         )
+        reassign = make_reassignments(
+            spark,
+            [{"agente": "daniel.cano", "actividad_dimensionada": "bko_cta_tskf",
+              "fecha_inicio": "2026-04-09", "fecha_fin": "9000-01-01"}],
+        )
+        out = compute_ntpj(jobs, MAY_START, MAY_END, reassignments=reassign)
+        # The bko_cta_tskf job is gone from the (single) daniel.cano day row;
+        # only the chat job remains (job_id 'chat - finished').
+        rows = [r for r in out.collect() if r["date_granularity"] == "day"]
+        assert len(rows) == 1
+        assert rows[0]["numerator"] == 300.0  # only the chat job's seconds
+
+    def test_blank_activity_is_whole_day(self, spark):
+        # Blank actividad_dimensionada drops every job the agent ran that day.
+        jobs = make_jobs(
+            spark,
+            [
+                {"agent": "evelyn.macedo", "dimensioned_activity": "bko_lcyc",
+                 "duration_seconds": 300},
+                {"agent": "evelyn.macedo", "dimensioned_activity": None,
+                 "job_id": "chat - finished", "activity_type": "chat",
+                 "duration_seconds": 200},
+                {"agent": "keep.me", "duration_seconds": 100},
+            ],
+        )
+        reassign = make_reassignments(
+            spark,
+            [{"agente": "evelyn.macedo", "actividad_dimensionada": "",
+              "fecha_inicio": "2026-04-27", "fecha_fin": "9000-01-01"}],
+        )
+        out = compute_ntpj(jobs, MAY_START, MAY_END, reassignments=reassign)
         day = _day_by_agent(out)
         assert "evelyn.macedo" not in day
+        assert "keep.me" in day
 
-    def test_exclusion_set_covers_surfaced_named_agents(self):
-        # Sanity: the named-date agents surfaced in the Apr-May parity diff are
-        # present. (ivette.melendez / daniel.cano are resolved by Fix 1's
-        # cross-support queue normalization, NOT this named-date list.)
-        names = {n for n, _, _ in HARDCODED_AGENT_DATE_EXCLUSIONS}
-        for surfaced in ("evelyn.macedo", "tania.enciso", "adriana.lopez"):
-            assert surfaced in names
+    def test_excluded_job_leaves_the_benchmark_pool(self, spark):
+        # The reassigned job is removed from the shared benchmark too: another
+        # agent sharing the same job_id sees a benchmark that EXCLUDES it.
+        # job_id 'oos - shared': reassigned agent dur=900 (dropped), peer dur=300.
+        jobs = make_jobs(
+            spark,
+            [
+                {"agent": "daniel.cano", "dimensioned_activity": "bko_cta_tskf",
+                 "job_id": "oos - shared", "activity_type": "oos",
+                 "duration_seconds": 900},
+                {"agent": "peer.agent", "dimensioned_activity": "oos",
+                 "job_id": "oos - shared", "activity_type": "oos",
+                 "duration_seconds": 300},
+            ],
+        )
+        reassign = make_reassignments(
+            spark,
+            [{"agente": "daniel.cano", "actividad_dimensionada": "bko_cta_tskf",
+              "fecha_inicio": "2026-04-09", "fecha_fin": "9000-01-01"}],
+        )
+        out = compute_ntpj(jobs, MAY_START, MAY_END, reassignments=reassign)
+        day = _day_by_agent(out)
+        # Benchmark = 300/1 (only peer's job; daniel's 900 excluded). peer ran
+        # 300 → metric 100%. If daniel's job had stayed in the pool the benchmark
+        # would be (900+300)/2=600 → peer metric 50%.
+        assert "daniel.cano" not in day
+        assert round(day["peer.agent"]["metric_value"], 1) == 100.0

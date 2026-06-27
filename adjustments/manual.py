@@ -41,6 +41,7 @@ COL_TIME_END = "hora_fin"
 COL_LABEL = "etiqueta_correcta"
 COL_QUEUES = "queues_a_excluir"
 COL_JOB = "job_clasificacion"
+COL_DIMENSIONED_ACTIVITY = "actividad_dimensionada"
 
 
 def adjustment_table_name(name: str, schema: str = ADJUSTMENT_SCHEMA) -> str:
@@ -295,6 +296,42 @@ def drop_excluded_jobs(jobs: DataFrame, exclusions: DataFrame | None) -> DataFra
         job = _str(row.get(COL_JOB))
         drop = drop | (
             _scope_mask(jobs, row) & _job_date_mask(jobs, row) & _contains_any(text, [job])
+        )
+    return jobs.filter(~drop)
+
+
+def drop_reassignment_jobs(
+    jobs: DataFrame, reassignments: DataFrame | None
+) -> DataFrame:
+    """Drop jobs done during a DIME activity the agent was reassigned away from.
+
+    Reproduces legacy ``manual_adjustments_ntpj`` (``[IO] NTPJ Dataset.sql:148-240``):
+    an agent temporarily pulled onto a BKO task force (Lifecycle / Cuenta) has the
+    jobs they run during the reassigned ``dimensioned_activity`` excluded from
+    NTPJ — from BOTH the benchmark pool and the contribution (legacy applies
+    ``c.exclude IS NOT TRUE`` in both ``expected_duration_per_job_ntpj`` and
+    ``ntpj_initial_base``). Source: the ``Reasignaciones DIME`` sheet tab.
+
+    Per row: drop jobs matching the scope (``equipo``/``agente``) and the date
+    window where, if ``actividad_dimensionada`` is set, the job's
+    ``dimensioned_activity`` (the DIME slot the job started in — attached in
+    ``jobs_raw``) equals it; a BLANK ``actividad_dimensionada`` matches every
+    activity (a whole-day exclusion). Applied to the per-job frame BEFORE the
+    benchmark / contribution split so excluded jobs leave both.
+    """
+    rows = _rows(reassignments)
+    if not rows:
+        return jobs
+    drop = F.lit(False)
+    for row in rows:
+        activity = _str(row.get(COL_DIMENSIONED_ACTIVITY)).lower()
+        activity_match = (
+            F.lower(F.col("dimensioned_activity")) == F.lit(activity)
+            if activity
+            else F.lit(True)
+        )
+        drop = drop | (
+            _scope_mask(jobs, row) & _job_date_mask(jobs, row) & activity_match
         )
     return jobs.filter(~drop)
 

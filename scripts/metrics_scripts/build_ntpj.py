@@ -166,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
             general_exclusions=read_adjustment_table(spark, "exclusiones_generales"),
             cross_support=read_adjustment_table(spark, "cross_support"),
             job_exclusions=read_adjustment_table(spark, "exclusiones_jobs"),
+            reassignments=read_adjustment_table(spark, "reasignaciones_dime"),
         )
 
     if args.dry_run:

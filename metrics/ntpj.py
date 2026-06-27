@@ -92,6 +92,7 @@ from metric_utils import aggregate_long, empty_metric_frame
 from adjustments.manual import (
     drop_cross_support_jobs,
     drop_excluded_jobs,
+    drop_reassignment_jobs,
     drop_slot_windows,
 )
 
@@ -141,7 +142,6 @@ OUTAGE_DATES: tuple[date, ...] = (date(2026, 3, 27), date(2026, 4, 9))
 # ``adj_exclusiones_generales`` adjustment sheet so this list can be deleted.
 #
 # Each entry is ``(agent, start_date_inclusive, end_date_inclusive)``.
-_FAR_FUTURE: date = date(2099, 12, 31)
 HARDCODED_AGENT_DATE_EXCLUSIONS: tuple[tuple[str, date, date], ...] = (
     # -- maternity leave --
     ("maria.reyes", date(2026, 2, 1), date(2026, 2, 28)),
@@ -169,24 +169,16 @@ HARDCODED_AGENT_DATE_EXCLUSIONS: tuple[tuple[str, date, date], ...] = (
     ("karen.ortega", date(2026, 3, 24), date(2026, 3, 28)),
     # -- one-off manual exclusion --
     ("jonathan.pineda", date(2026, 2, 26), date(2026, 2, 26)),
-    # -- manual exclusion, May 1st 2026 --
-    ("jefferson.nunes", date(2026, 5, 1), date(2026, 5, 1)),
-    ("patricia.gomez", date(2026, 5, 1), date(2026, 5, 1)),
-    # -- license, carmina.venegas Apr-Aug 2026 --
-    ("carmina.venegas", date(2026, 4, 19), date(2026, 8, 19)),
-    # -- holiday, May 1st 2026 --
-    ("cecilia.ortiz", date(2026, 5, 1), date(2026, 5, 1)),
-    ("federico.gaona", date(2026, 5, 1), date(2026, 5, 1)),
-    ("ignacio.herbert", date(2026, 5, 1), date(2026, 5, 1)),
-    ("marcos.caudillo", date(2026, 5, 1), date(2026, 5, 1)),
-    ("maria.castillo", date(2026, 5, 1), date(2026, 5, 1)),
-    # -- exclude evelyn.macedo from Apr 27 2026 onwards (open-ended) --
-    ("evelyn.macedo", date(2026, 4, 27), _FAR_FUTURE),
-    # -- days off --
-    ("jorge.delgado", date(2026, 5, 19), date(2026, 5, 20)),
-    ("claudia.brigada", date(2026, 6, 7), date(2026, 6, 7)),
-    ("omar.morales", date(2026, 5, 4), date(2026, 5, 4)),
-    ("luis.delgadillo", date(2026, 5, 28), date(2026, 5, 28)),
+    # NOTE: the ``manual_adjustments_ntpj`` whole-day exclusions (jefferson.nunes /
+    # patricia.gomez / carmina.venegas / cecilia.ortiz / federico.gaona /
+    # ignacio.herbert / marcos.caudillo / maria.castillo / evelyn.macedo /
+    # jorge.delgado / claudia.brigada / omar.morales / luis.delgadillo) used to live
+    # here too, but have been MOVED to the ``Reasignaciones DIME`` adjustment sheet
+    # (blank ``actividad_dimensionada`` = whole-day) so they now feed BOTH the
+    # benchmark and the contribution (matching legacy ``manual_adjustments_ntpj``).
+    # The entries that REMAIN above come from ``dime_ntpj`` (lines 523-538) — a
+    # separate legacy mechanism that drops the DIME required-set, i.e. the
+    # contribution only — so they stay hardcoded here.
 )
 
 
@@ -262,6 +254,7 @@ def compute_ntpj(
     general_exclusions: DataFrame | None = None,
     cross_support: DataFrame | None = None,
     job_exclusions: DataFrame | None = None,
+    reassignments: DataFrame | None = None,
 ) -> DataFrame:
     """Compute the NTPJ metric at all granularities.
 
@@ -274,6 +267,11 @@ def compute_ntpj(
             drop (``None`` to skip).
         cross_support: ``adj_cross_support`` queue exclusions (``None`` to skip).
         job_exclusions: ``adj_exclusiones_jobs`` job exclusions (``None`` to skip).
+        reassignments: ``adj_reasignaciones_dime`` DIME-activity reassignment
+            exclusions — agents pulled onto a BKO task force whose jobs during the
+            reassigned ``dimensioned_activity`` (blank = whole-day) leave both the
+            benchmark and the contribution. Reproduces legacy
+            ``manual_adjustments_ntpj`` (``None`` to skip).
 
     Returns:
         Tidy long-format metric rows (see module docstring).
@@ -290,6 +288,10 @@ def compute_ntpj(
     adjusted = drop_slot_windows(adjusted, general_exclusions)
     adjusted = drop_cross_support_jobs(adjusted, cross_support)
     adjusted = drop_excluded_jobs(adjusted, job_exclusions)
+    # DIME-activity reassignments (matches legacy manual_adjustments_ntpj). Uses
+    # the per-job ``dimensioned_activity`` attached in jobs_raw; applied here so
+    # excluded jobs leave both the benchmark and the contribution.
+    adjusted = drop_reassignment_jobs(adjusted, reassignments)
     adjusted = adjusted.drop("slot_time")
 
     # Finished only — applies to both the benchmark and the contribution.
