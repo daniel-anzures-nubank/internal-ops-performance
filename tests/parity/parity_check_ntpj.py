@@ -68,9 +68,16 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics_data"))
+sys.path.insert(0, str(REPO_ROOT / "metrics"))
 
 from db import open_connection, run_extractor  # noqa: E402
-from ntpj import compute_ntpj  # noqa: E402
+from jobs_raw import compute_jobs_raw  # noqa: E402
+from ntpj import (  # noqa: E402
+    ACTIVE_ROSTER_STATUS,
+    FINISHED_STATUS,
+    OUTAGE_DATES,
+    _expected_duration_by_month,
+)
 
 LOGGER = logging.getLogger("cx_metrics.parity.ntpj")
 
@@ -203,14 +210,24 @@ def _run_new_pipeline(
     baseline_lookback_months: int,
     jobs_end: date,
 ) -> pd.DataFrame:
-    """Replay scripts/build_ntpj.py in-memory.
+    """Replay the new two-layer NTPJ pipeline in-memory, at the legacy grain.
 
-    ``jobs_end`` is the upper bound on the shuffle/OOS extraction; it can
-    extend past ``period_end`` so the monthly ``exp_duration_job`` baseline
-    sees the same volume of jobs the legacy table did. DIME and the roster
-    stay clamped to ``period_end`` (no point pulling DIME the warehouse
-    hasn't published yet).
+    The new pipeline is two layers: ``compute_jobs_raw`` (one row per job, with
+    a LEFT-joined roster + ``roster_status``) then ``metrics/ntpj.py`` (the
+    benchmark + ratio). The legacy ``normalized_time_per_job`` table is keyed
+    on (agent, start_date, job_id) with count / duration / exp_duration_job /
+    required_hours, NOT the tidy long metric output. So here we reproduce that
+    intermediate grain directly from ``compute_jobs_raw`` using the SAME
+    benchmark logic the metric uses (``_expected_duration_by_month``), to make
+    a like-for-like diff against legacy.
+
+    ``conn`` is a SparkSession (``db.open_connection``). ``jobs_end`` is the
+    upper bound on the shuffle/OOS extraction; it can extend past ``period_end``
+    so the monthly ``exp_duration_job`` baseline sees the same volume of jobs
+    the legacy table did. DIME and the roster stay clamped to ``period_end``.
     """
+    from pyspark.sql import functions as F
+
     jobs_start = _subtract_months(
         _floor_month(period_start), baseline_lookback_months
     )
@@ -225,33 +242,58 @@ def _run_new_pipeline(
     )
 
     LOGGER.info("Pulling agent_information ...")
-    t0 = time.perf_counter()
-    agent_info = run_extractor(conn, "agent_information", period_start, period_end)
-    LOGGER.info("  %s rows in %.1fs", f"{len(agent_info):,}", time.perf_counter() - t0)
-
+    agent_info = run_extractor(conn, "agent_information", jobs_start, period_end)
     LOGGER.info("Pulling dime_slots ...")
-    t0 = time.perf_counter()
-    dime = run_extractor(conn, "dime_slots", period_start, period_end)
-    LOGGER.info("  %s rows in %.1fs", f"{len(dime):,}", time.perf_counter() - t0)
-
+    dime = run_extractor(conn, "dime_slots", jobs_start, period_end)
     LOGGER.info("Pulling shuffle_jobs (lookback included) ...")
-    t0 = time.perf_counter()
     shuffle = run_extractor(conn, "shuffle_jobs", jobs_start, jobs_end)
-    LOGGER.info("  %s rows in %.1fs", f"{len(shuffle):,}", time.perf_counter() - t0)
-
     LOGGER.info("Pulling oos_jobs (lookback included) ...")
-    t0 = time.perf_counter()
     oos = run_extractor(conn, "oos_jobs", jobs_start, jobs_end)
-    LOGGER.info("  %s rows in %.1fs", f"{len(oos):,}", time.perf_counter() - t0)
 
-    LOGGER.info("Computing NTPJ ...")
+    LOGGER.info("Computing jobs_raw + NTPJ benchmark (legacy grain) ...")
     t0 = time.perf_counter()
-    new = compute_ntpj(agent_info, dime, shuffle, oos)
+    jobs_raw = compute_jobs_raw(agent_info, dime, shuffle, oos)
+
+    # Mirror metrics/ntpj.py: outage drop, finished-only, monthly benchmark
+    # from ALL finished jobs, contribution = required + active, LEFT-joined.
+    cal = F.to_date(F.col("date"))
+    adjusted = jobs_raw.filter(~cal.isin(list(OUTAGE_DATES)))
+    finished = adjusted.filter(
+        F.lower(F.col("status")) == F.lit(FINISHED_STATUS)
+    ).withColumn("month", F.trunc(F.to_date(F.col("date")), "month"))
+
+    monthly_totals = finished.groupBy("job_id", "month").agg(
+        F.sum("duration_seconds").alias("tot_duration"),
+        F.count(F.lit(1)).alias("tot_count"),
+    )
+    expected = _expected_duration_by_month(monthly_totals)
+
+    contrib = finished.filter(
+        (F.col("required_activity_on_day_flag") == F.lit(1))
+        & (F.lower(F.col("roster_status")) == F.lit(ACTIVE_ROSTER_STATUS))
+    )
+    per_job = contrib.groupBy(
+        "agent", "squad", "district", "activity_type", F.col("date").alias("start_date"),
+        "month", "job_id",
+    ).agg(
+        F.count(F.lit(1)).alias("count"),
+        F.sum("duration_seconds").alias("duration"),
+    )
+    per_job = per_job.join(expected, on=["job_id", "month"], how="left")
+    # required_hours is the legacy DIME slot-count/2 — approximate here as the
+    # per-(agent, date, activity_type) job count is NOT it; the diagnostic
+    # compares exp_duration_job / count / duration faithfully and reports
+    # required_hours as NULL (it lives in the DIME layer, not jobs_raw).
+    per_job = per_job.withColumn("required_hours", F.lit(None).cast("double"))
+    per_job = per_job.withColumnRenamed("exp_duration_job", "exp_duration_job")
+
+    new = per_job.select(
+        "agent", "start_date", "job_id", "activity_type", "squad",
+        F.col("district").alias("squad_district"),
+        "count", "duration", "exp_duration_job", "required_hours",
+    ).toPandas()
     LOGGER.info("  %s output rows in %.1fs", f"{len(new):,}", time.perf_counter() - t0)
 
-    # Restrict to the requested period — the new pipeline only outputs rows
-    # for dates with DIME slots in the period, but we make this explicit for
-    # safety in case the extractor ever leaks rows.
     new = new[
         (new["start_date"] >= period_start) & (new["start_date"] <= period_end)
     ].copy()
@@ -264,6 +306,7 @@ def _run_new_pipeline(
 
 
 def _pull_legacy(conn, period_start: date, period_end: date) -> pd.DataFrame:
+    """Pull the legacy table via Spark (``conn`` is a SparkSession)."""
     LOGGER.info("Pulling legacy %s ...", LEGACY_TABLE)
     t0 = time.perf_counter()
     # `squad_district` is selected so we can classify Content-roster rows
@@ -282,13 +325,10 @@ def _pull_legacy(conn, period_start: date, period_end: date) -> pd.DataFrame:
           exp_duration_job,
           required_hours
         FROM {LEGACY_TABLE}
-        WHERE start_date >= :period_start AND start_date <= :period_end
+        WHERE start_date >= DATE '{period_start.isoformat()}'
+          AND start_date <= DATE '{period_end.isoformat()}'
     """
-    with conn.cursor() as cur:
-        cur.execute(
-            sql, parameters={"period_start": period_start, "period_end": period_end}
-        )
-        df = cur.fetchall_arrow().to_pandas()
+    df = conn.sql(sql).toPandas()
     LOGGER.info("  %s rows in %.1fs", f"{len(df):,}", time.perf_counter() - t0)
     return df
 
@@ -706,18 +746,16 @@ def main(argv: list[str] | None = None) -> int:
             args.period_end,
         )
 
+    # `conn` is a SparkSession (db.open_connection); nothing to close.
     conn = open_connection()
-    try:
-        new_df = _run_new_pipeline(
-            conn,
-            args.period_start,
-            args.period_end,
-            args.baseline_lookback_months,
-            jobs_end,
-        )
-        legacy_df = _pull_legacy(conn, args.period_start, args.period_end)
-    finally:
-        conn.close()
+    new_df = _run_new_pipeline(
+        conn,
+        args.period_start,
+        args.period_end,
+        args.baseline_lookback_months,
+        jobs_end,
+    )
+    legacy_df = _pull_legacy(conn, args.period_start, args.period_end)
 
     return report(
         new=new_df,
