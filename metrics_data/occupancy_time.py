@@ -485,6 +485,22 @@ def compute_occupancy_time(
     # roster's own ``squad``.
     per_slot = per_slot.drop("squad")
 
+    # Collapse to ONE row per physical slot, summing occupancy across any
+    # duplicate slot rows, then (re)cap at the slot length. A single slot can
+    # appear more than once at this point because the same (agent, date,
+    # slot_start) can carry >1 DIME ``agent_dime_squad`` — most commonly because
+    # ``append_missing_dime_slots`` re-adds a now-backfilled slot under a
+    # different squad label (e.g. ``Content`` vs ``content_content``), which the
+    # ``.distinct()`` on slot keys keeps as separate rows. Jobs match on
+    # agent/date/time (not squad), so each duplicate carries identical occupancy;
+    # without this collapse a 30-min slot would double to 60. Legacy reproduces
+    # exactly this — its final ``normalized_occupancy_final`` groups to one row
+    # per ``slot_start`` and applies ``LEAST(SUM(occupancy_time), 1800)`` AFTER
+    # summing — so we sum here and let the post-roster cap below bound it.
+    per_slot = per_slot.groupBy(
+        "agent", "date", "slot_start", "slot_end", "activity_type_required"
+    ).agg(F.sum("occupancy_time").alias("occupancy_time"))
+
     # Night-shift agents that cross midnight are re-attributed to the day their
     # shift started (>= 2026-07-01 only). `slot_start` is local-time unix, so it
     # renders straight to the local slot timestamp.

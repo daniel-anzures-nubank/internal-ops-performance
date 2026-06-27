@@ -690,6 +690,40 @@ class TestComputeOccupancyTime:
         assert out[0]["occupancy_minutes"] == 600 / 60.0
         assert out[0]["occupancy_minutes"] <= SLOT_DURATION_SECONDS / 60.0
 
+    def test_duplicate_dime_squad_slots_collapse_and_cap(self, spark):
+        # The same physical slot (agent, date, slot_start, activity_type) can
+        # appear under >1 DIME agent_dime_squad — most often because
+        # append_missing_dime_slots re-adds a now-backfilled slot under a
+        # different squad label (e.g. "Content" vs "content_content"). Jobs match
+        # on agent/date/time (not squad), so each duplicate carries identical
+        # occupancy. They MUST collapse to one row per slot, and total occupancy
+        # is capped at the slot length AFTER summing (legacy
+        # normalized_occupancy_final does LEAST(SUM(occupancy_time), 1800)).
+        dime = make_dime(
+            spark,
+            [
+                {"agent": "omar.ramirez", "squad": "content_content", "activity_type_required": "oos"},
+                {"agent": "omar.ramirez", "squad": "content", "activity_type_required": "oos"},
+            ],
+        )
+        roster = make_roster(spark, [{"agent": "omar.ramirez", "squad": "content", "team": "content"}])
+        # A job that fully covers the 30-min slot, so each duplicate row would be
+        # 1800s; summed = 3600s, which must cap to 1800s (30 min), not 60.
+        shuffle = make_shuffle(
+            spark,
+            [
+                {
+                    "agent": "omar.ramirez",
+                    "activity_type": "oos",
+                    "activity_start_unix": SLOT_BASE,
+                    "activity_end_unix": SLOT_BASE + SLOT_DURATION_SECONDS,
+                }
+            ],
+        )
+        out = compute_occupancy_time(roster, dime, shuffle, empty_oos(spark)).collect()
+        assert len(out) == 1
+        assert out[0]["occupancy_minutes"] == SLOT_DURATION_SECONDS / 60.0  # 30, not 60
+
 
 def test_out_of_scope_squads_constant_is_empty():
     assert NOCC_OUT_OF_SCOPE_SQUADS == ()
