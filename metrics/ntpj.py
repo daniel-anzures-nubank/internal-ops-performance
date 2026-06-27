@@ -44,9 +44,13 @@ Filters applied here
       job's ``activity_type`` that day — legacy "required_hours IS NOT NULL").
     - ``roster_status == 'active'`` (legacy applies the active filter only to
       the contribution, not the benchmark — see ``ntpj_all_info_2025/2026``).
-* Outage-date drop: ``date NOT IN (2026-03-27, 2026-04-09)`` — legacy drops
-  these for ALL agents in both ``expected_duration_per_job_ntpj`` and
-  ``ntpj_calculations``, so they leave both the benchmark and the contribution.
+* Outage-date drop: ``date NOT IN (2026-03-27, 2026-04-09)`` — **contribution
+  only**. Legacy's ``expected_duration_per_job_ntpj`` self-join filters the
+  outage dates on the **target (`a`) side only**; the benchmark value averages
+  over the **`b` side, which is never outage-filtered**, so outage-day jobs
+  still feed the per-job_id benchmark pool. ``ntpj_calculations`` then drops the
+  outage dates from the emitted contribution. We reproduce this asymmetry —
+  keep outage days in the benchmark, drop them from the contribution.
 * Hardcoded per-agent date exclusions (vacation / leave / holiday / license /
   days off) — un-ported legacy hardcodes reproduced from ``dime_ntpj`` /
   ``manual_adjustments_ntpj`` / ``ntpj_all_info_2026``. Contribution-only (the
@@ -105,7 +109,9 @@ BENCHMARK_CUTOVER_MONTH: date = date(2026, 4, 1)
 TRAILING_WINDOW_MONTHS = 4
 
 # Legacy whole-pipeline outage-date drops (general access problems). Dropped for
-# ALL agents in both the benchmark and the contribution.
+# ALL agents from the CONTRIBUTION only — they remain in the benchmark pool
+# (legacy's expected_duration_per_job_ntpj filters only the self-join target
+# side). See compute_ntpj.
 OUTAGE_DATES: tuple[date, ...] = (date(2026, 3, 27), date(2026, 4, 9))
 
 
@@ -286,11 +292,11 @@ def compute_ntpj(
     adjusted = drop_excluded_jobs(adjusted, job_exclusions)
     adjusted = adjusted.drop("slot_time")
 
-    # Outage-date drop (all agents; both benchmark and contribution).
-    cal = F.to_date(F.col("date"))
-    adjusted = adjusted.filter(~cal.isin(list(OUTAGE_DATES)))
-
     # Finished only — applies to both the benchmark and the contribution.
+    # NOTE: the outage-date drop is deliberately NOT applied here (it would
+    # remove 2026-04-09 from the benchmark pool too). Legacy keeps outage dates
+    # in the benchmark self-join's `b` side and drops them only from the
+    # contribution — see the contribution filter below.
     finished = adjusted.filter(
         F.lower(F.col("status")) == F.lit(FINISHED_STATUS)
     ).withColumn("month", F.trunc(F.to_date(F.col("date")), "month"))
@@ -303,9 +309,17 @@ def compute_ntpj(
     expected = _expected_duration_by_month(monthly_totals)
 
     # --- agent contribution: required activities + active roster only -------
+    # The outage-date drop (2026-03-27 / 2026-04-09) is CONTRIBUTION-ONLY:
+    # legacy filters outage dates from the target/contribution side
+    # (`ntpj_calculations`) but NOT from the benchmark self-join's `b` side
+    # (`expected_duration_per_job_ntpj` filters only `a`), so outage-day jobs
+    # still feed the per-job_id benchmark pool. Reproducing that asymmetry is
+    # what makes April's benchmark match legacy (April is the only month whose
+    # current-month benchmark contains an outage date).
     contrib = finished.filter(
         (F.col("required_activity_on_day_flag") == F.lit(1))
         & (F.lower(F.col("roster_status")) == F.lit(ACTIVE_ROSTER_STATUS))
+        & (~F.to_date(F.col("date")).isin(list(OUTAGE_DATES)))
     )
 
     # Un-ported legacy hardcodes: drop specific agent-days (vacation / leave /

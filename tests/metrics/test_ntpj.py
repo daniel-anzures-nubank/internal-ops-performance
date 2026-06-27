@@ -252,16 +252,19 @@ class TestComputeNtpj:
         assert row["denominator"] == 200
         assert row["metric_value"] == 100.0
 
-    def test_outage_dates_dropped(self, spark):
-        # 2026-04-09 is a legacy outage date — dropped from both benchmark and
-        # contribution. Only the 2026-04-10 job survives.
+    def test_outage_dates_dropped_from_contribution_but_kept_in_benchmark(self, spark):
+        # 2026-04-09 is a legacy outage date. It is dropped from the CONTRIBUTION
+        # (no 04-09 output row) but KEPT in the benchmark pool — legacy's
+        # expected_duration_per_job_ntpj filters the outage only on the self-join
+        # target side, so the 04-09 job still feeds exp_duration_job. Two jobs of
+        # the same job_id: 04-09 dur=900, 04-10 dur=300.
         out = compute_ntpj(
             make_jobs(
                 spark,
                 [
                     {"agent": "a.one", "date": dt.date(2026, 4, 9),
                      "start_time": dt.datetime(2026, 4, 9, 9, 0, 0),
-                     "duration_seconds": 999},
+                     "duration_seconds": 900},
                     {"agent": "a.one", "date": dt.date(2026, 4, 10),
                      "start_time": dt.datetime(2026, 4, 10, 9, 0, 0),
                      "duration_seconds": 300},
@@ -271,10 +274,13 @@ class TestComputeNtpj:
             dt.date(2026, 4, 30),
         )
         day = out.filter(out["date_granularity"] == "day").collect()
+        # Only the 04-10 contribution row survives (04-09 dropped from output).
         assert len(day) == 1
         assert day[0]["date_reference"] == dt.date(2026, 4, 10)
-        # benchmark from only the surviving job (300/1) -> 100%
-        assert day[0]["metric_value"] == 100.0
+        # Benchmark INCLUDES the 04-09 job: exp = (900+300)/2 = 600.
+        # metric = actual 300 / (600 * 1) * 100 = 50.0  (NOT 100.0, which is what
+        # dropping 04-09 from the benchmark would have given).
+        assert day[0]["metric_value"] == 50.0
 
     def test_contribution_job_always_builds_its_own_benchmark(self, spark):
         # A finished contribution job is itself in the benchmark pool, so its
