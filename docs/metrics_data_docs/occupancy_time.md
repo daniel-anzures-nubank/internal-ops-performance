@@ -46,20 +46,53 @@ into this one table via the same per-slot overlap logic:
 | `oos_jobs` | `etl.mx__dataset.taskmaster_consolidated_registry` | out-of-shuffle job executions (Core/Fraud/Content) |
 | `sm_jobs` | `usr.sprinklr_api_data_integration.sprinklr_normalized_occupancy_data` | Social-Media case assignments (occupancy source for social agents); unioned as `oos` jobs |
 
-## Filters applied here (minimal — raw table)
+## Filters applied here (matching legacy at the DIME stage — raw table)
 
-- **DIME**: keep slots with `activity_type_required IS NOT NULL` only.
+- **DIME**: keep slots with `activity_type_required IS NOT NULL`.
 - **DIME systemic reclassifications are KEPT** (part of the occupancy matching
   logic, not a business exclusion):
   - `dimensioned_activity IN ('Control MC', 'xMC Debit Fraud')` →
     `activity_type_required = 'oos'`
   - `activity_type_required = 'dime_invalid_notation'` →
     `activity_type_required = 'oos'`
+- **DIME fixed legacy filters** (applied at the slot stage, so both the agent
+  occupancy and the per-squad benchmark exclude them — legacy NOcc dataset
+  lines 234–236):
+  - `dimensioned_activity` not in (`Mouring`, `Weekly`, `Permiso Medico`,
+    `Permiso medico`, `Huddle`, `Licencia`, `Vacacion`); a NULL is kept.
+    **Fixed — all dates.**
+  - `agent_dime_squad` non-NULL and not in (`wfm`, `credit_evolution`, `dote`,
+    `social`). NOTE this list **includes `social`** (unlike adherence). The
+    wfm/credit_evolution/dote drop is **fixed — all dates**; the `social` drop is
+    **cutover-gated** (see Social-Media occupancy below).
 - **Jobs**: shuffle `status IN ('finished', 'transferred', 'skipped')`
   (occupancy counts *attempted* work, wider than NTPJ's `finished` only); OOS
   and SM rows get a synthetic `activity_type = 'oos'`. `sm_jobs` drops case rows
   with a NULL assignment/unassignment time (no measurable interval).
 - **Roster**: `status = 'active'` (inner join on `(agent, snapshot_month)`).
+
+## Social-Media occupancy (cutover-gated at 2026-07-01)
+
+Legacy excluded `agent_dime_squad = 'social'` DIME slots **and** had no Sprinklr
+source (its `jobs_join` was shuffle ∪ oos only), so legacy produced no
+Social-Media occupancy. The new code both keeps `social` DIME slots and unions
+`sm_jobs`. To stay byte-for-byte with legacy **before** the cutover, this is
+gated per-slot at `SOCIAL_MEDIA_OCCUPANCY_CUTOVER` (`2026-07-01`):
+
+- `date < 2026-07-01`: `agent_dime_squad = 'social'` slots are dropped and SM
+  jobs can never match a slot — reproducing legacy (no Social-Media occupancy).
+- `date >= 2026-07-01`: `social` slots are kept and `sm_jobs` populates their
+  occupancy — Social-Media occupancy turns on.
+
+This mirrors the night-shift / phantom-adherence `2026-07-01` cutover handling.
+
+## luis.contreras OOS timestamp correction
+
+Approved raw-data correction from `Correcciones Generales Datos`: his laptop
+clock lagged Taskmaster during H1 2026, so his Content OOS job start/stop
+timestamps are shifted **forward** before the overlap math (+2h through
+2026-03-08, +1h from 2026-03-09 to 2026-05-19). Applied on `oos_jobs` rows where
+`agent = 'luis.contreras'` and the squad contains `content`.
 
 ## How occupancy_minutes is computed
 
@@ -82,11 +115,14 @@ plain calendar-day attribution. See the shared rule in
 ## Deferred to the metrics layer (NOT applied here)
 
 - Activity-type exclusions (`lunch_break` / `time_off` / `shrinkage`).
-- `dimensioned_activity` exclusions (Mouring / Weekly / Permiso Medico /
-  Permiso medico / Huddle / Licencia / Vacacion).
-- DIME squad exclusions (`wfm` / `credit_evolution` / `dote` / …).
 - The monthly district/shift occupancy benchmark (`occupancy_exp`).
-- All per-agent manual adjustments / outage-date carve-outs.
+- All per-agent manual adjustments / outage-date carve-outs (e.g. the
+  2026-03-27 / 2026-04-09 global drops, vacation/leave windows, the
+  `xplead = 'david.fernandez'` 2026-03-10 drop).
+
+The `dimensioned_activity` meeting/leave exclusion and the DIME-squad exclusion
+are **no longer deferred** — they are applied here (see the fixed legacy filters
+above), matching where legacy applies them.
 
 ## Output schema (one row per agent per DIME slot)
 

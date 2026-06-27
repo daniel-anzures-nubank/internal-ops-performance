@@ -1,4 +1,4 @@
-"""occupancy_time — raw per-slot occupancy/required minutes (one row per DIME slot).
+"""occupancy_time — raw per-slot occupancy/required minutes (one row per DIME slot, PySpark).
 
 This is a RAW dataset, not a finished metric. It is the occupancy twin of
 ``adherent_time``: for every DIME slot an active agent was scheduled for, how
@@ -10,7 +10,8 @@ and its district/shift benchmark.
 Public API
 ----------
 ``compute_occupancy_time(agent_info, dime, shuffle_jobs, oos_jobs, sm_jobs=None)``
-returns one row per (agent, date, slot) with ``occupancy_minutes`` and
+takes Spark DataFrames (the extractor outputs) and returns one Spark DataFrame
+with one row per (agent, date, slot) carrying ``occupancy_minutes`` and
 ``required_minutes``.
 
 Source tables (via extractors)
@@ -25,15 +26,25 @@ Source tables (via extractors)
   Social-Media case assignments — the occupancy source for social agents, who do
   not appear in the shuffle / taskmaster job tables. Unioned in as ``oos`` jobs.
 
-Filters applied here (deliberately minimal — this is a raw table)
------------------------------------------------------------------
-* DIME: keep slots with ``activity_type_required IS NOT NULL`` only.
+Filters applied here (matching legacy at the DIME stage; see legacy parity below)
+---------------------------------------------------------------------------------
+* DIME: keep slots with ``activity_type_required IS NOT NULL``.
 * DIME systemic reclassifications are KEPT (they are part of the occupancy
   matching logic, not a business exclusion):
     - ``dimensioned_activity`` in ('Control MC', 'xMC Debit Fraud') →
       ``activity_type_required = 'oos'``
     - ``activity_type_required == 'dime_invalid_notation'`` →
       ``activity_type_required = 'oos'``
+* DIME fixed legacy filters (applied here at the slot stage so both the agent
+  occupancy AND the per-squad benchmark exclude them — see legacy parity below):
+    - ``dimensioned_activity`` not in
+      :data:`MEETING_LEAVE_DIMENSIONED_ACTIVITIES` (leave/meeting slots; NULL
+      kept).
+    - ``agent_dime_squad`` non-NULL and not in
+      :data:`NOCC_DIME_SQUAD_EXCLUSIONS` (wfm / credit_evolution / dote).
+      ``social`` DIME slots are KEPT on all dates — Social-Media occupancy is
+      sourced from Sprinklr ``sm_jobs`` and is intentionally ON for the whole
+      history (see "Legacy parity" below).
 * Jobs: shuffle ``status IN ('finished', 'transferred', 'skipped')`` (NOcc
   counts attempted work, wider than NTPJ's 'finished'); OOS and SM rows get a
   synthetic ``activity_type = 'oos'``.
@@ -43,12 +54,31 @@ Filters applied here (deliberately minimal — this is a raw table)
   2026-05-19).
 * Roster: ``status = 'active'`` (inner join attaches dimensions / scopes output).
 
-Filters deferred to the future metrics layer (NOT applied here)
----------------------------------------------------------------
+Legacy parity (and the Social-Media divergence)
+-----------------------------------------------
+The new pipeline reproduces legacy ``[IO] Normalized Occupancy Dataset.sql``
+byte-for-byte (including legacy's bugs) per the project's legacy-parity decision,
+**with one deliberate, documented exception: Social-Media occupancy.**
+
+* Legacy excluded ``agent_dime_squad = 'social'`` DIME slots AND had no Sprinklr
+  ``sm_jobs`` source (its ``jobs_join`` was shuffle ∪ oos only), so legacy
+  produced NO Social-Media occupancy. The data owner has since confirmed that
+  Social-Media Normalized Occupancy data genuinely EXISTS for the whole history,
+  sourced from Sprinklr ``sm_jobs``. We therefore KEEP ``agent_dime_squad =
+  'social'`` DIME slots and union ``sm_jobs`` on ALL dates, turning Social-Media
+  occupancy ON for the entire period. This is an intentional divergence from
+  legacy (which had no Sprinklr source), approved as an exception to the
+  byte-for-byte rule — not the night-shift / phantom cutover handling.
+
+* NOTE this is distinct from the night-shift re-attribution, which still uses its
+  own ``shift_attribution.NIGHT_SHIFT_CUTOVER`` (untouched).
+
+The two **fixed** DIME filters (meeting/leave ``dimensioned_activity`` drop and
+the wfm/credit_evolution/dote DIME-squad drop) apply on ALL dates.
+
+Filters deferred to the metrics layer (NOT applied here)
+--------------------------------------------------------
 * Activity-type exclusions (``lunch_break`` / ``time_off`` / ``shrinkage``).
-* ``dimensioned_activity`` exclusions (Mouring / Weekly / Permiso Medico /
-  Permiso medico / Huddle / Licencia / Vacacion).
-* DIME squad exclusions (``wfm`` / ``credit_evolution`` / ``dote`` / …).
 * The monthly district/shift occupancy benchmark (``occupancy_exp``) — that is
   a metric-layer computation, removed from this raw table.
 * All per-agent manual adjustments / outage-date carve-outs.
@@ -58,8 +88,9 @@ Why the occupancy calc needs interval dedup
 A single slot can have multiple overlapping jobs of the same activity type
 (an agent juggling two chats). Naively summing per-job overlaps would
 double-count the overlapping portion. We merge overlapping same-activity
-intervals with the classic ``prev_max_end`` running-max trick (legacy used a
-window function).
+intervals with the classic ``prev_max_end`` running-max trick — legacy used a
+window function and we port it to a Spark ``Window.partitionBy(...).orderBy(...)``
+running max via ``lag`` over the unbounded-preceding frame.
 
 Output schema (one row per agent per DIME slot)
 -----------------------------------------------
@@ -79,8 +110,10 @@ Output schema (one row per agent per DIME slot)
 
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
+from datetime import date
+
+from pyspark.sql import DataFrame, Window
+from pyspark.sql import functions as F
 
 from shift_attribution import night_agent_months, shift_start_date
 
@@ -95,6 +128,36 @@ DIME_INVALID_NOTATION_VALUE: str = "dime_invalid_notation"
 # Roster-level squad exclusions. Currently empty — all squads in scope.
 NOCC_OUT_OF_SCOPE_SQUADS: tuple[str, ...] = ()
 
+# Meeting/leave dimensioned_activity tokens excluded from occupancy. Fixed DIME
+# data filter (NOT a manual adjustment): leave (Licencia, Vacacion, Permiso
+# Medico) or meetings (Mouring, Weekly, Huddle). Legacy excludes them with the
+# same `dimensioned_activity NOT IN (...)` filter at the DIME stage (NOcc dataset
+# line 234), incl. the 'Permiso Medico'/'Permiso medico' case variants. Applied
+# on ALL dates.
+MEETING_LEAVE_DIMENSIONED_ACTIVITIES: tuple[str, ...] = (
+    "Mouring",
+    "Weekly",
+    "Permiso Medico",
+    "Permiso medico",
+    "Huddle",
+    "Licencia",
+    "Vacacion",
+)
+
+# DIME squads excluded from occupancy — a fixed legacy filter on the DIME
+# `agent_dime_squad`. Legacy's NOcc dataset (line 236) used
+# `NOT IN ('wfm', 'credit_evolution', 'dote', 'social')`, but we intentionally
+# DROP `social` from this exclusion set: Social-Media occupancy genuinely exists
+# for the whole history (sourced from Sprinklr `sm_jobs`), so `social` DIME slots
+# are kept on ALL dates. This is a documented divergence from legacy (which had
+# no Sprinklr source); see module docstring. The remaining set matches
+# adherence's DIME_SQUAD_EXCLUSIONS (wfm / credit_evolution / dote).
+NOCC_DIME_SQUAD_EXCLUSIONS: tuple[str, ...] = (
+    "wfm",
+    "credit_evolution",
+    "dote",
+)
+
 # Shuffle status filter: occupancy counts work the agent ATTEMPTED, not just
 # work that succeeded. So we keep transferred/skipped in addition to
 # 'finished'. (NTPJ, which measures throughput, uses only 'finished'.)
@@ -105,107 +168,15 @@ SLOT_DURATION_SECONDS: int = 30 * 60
 
 LUIS_CONTRERAS_AGENT = "luis.contreras"
 
-
-# ---------------------------------------------------------------------------
-# Small utilities
-# ---------------------------------------------------------------------------
-
-
-def _as_naive_datetime(series: pd.Series) -> pd.Series:
-    """Coerce a datetime Series to tz-naive ``datetime64[ns]``.
-
-    Strips warehouse-returned UTC tz off month-truncated timestamps so
-    snapshot_month joins behave predictably across hand-built test frames
-    and real warehouse data.
-    """
-    s = pd.to_datetime(series)
-    if s.dt.tz is not None:
-        return s.dt.tz_localize(None)
-    return s
-
-
-def _seconds_to_hms(unix_seconds: pd.Series) -> pd.Series:
-    """Format a LOCAL unix-seconds Series as a time-of-day string "HH:MM:SS".
-
-    Renders the seconds-into-day (``unix % 86400``) as zero-padded
-    ``HH:MM:SS``. occupancy_time's ``slot_start`` is already local-time unix,
-    so the result is the wall-clock slot time. Standardized with
-    adherent_time so the slot column has an identical shape in both tables.
-    """
-    if len(unix_seconds) == 0:
-        return pd.Series([], dtype="object", index=unix_seconds.index)
-    tod = (unix_seconds.astype("int64") % 86400).astype("int64")
-    h = (tod // 3600).map("{:02d}".format)
-    m = ((tod % 3600) // 60).map("{:02d}".format)
-    s = (tod % 60).map("{:02d}".format)
-    return h + ":" + m + ":" + s
-
-
-def _apply_luis_contreras_oos_timestamp_correction(
-    oos_jobs: pd.DataFrame,
-) -> pd.DataFrame:
-    """Shift approved Content OOS job timestamps for luis.contreras.
-
-    Source: `Correcciones Generales Datos`.
-    His laptop clock lagged behind Taskmaster during H1 2026, so the recorded
-    local start/stop times must move forward before NOCC overlap calculations.
-    This correction is deliberately hardcoded because the tab is not a scalable
-    rules table yet.
-    """
-    if oos_jobs.empty:
-        return oos_jobs.copy()
-
-    out = oos_jobs.copy()
-    start_date = pd.to_datetime(out["local_start_date"])
-    agent = out["agent"].astype("string").str.lower()
-    squad = out["squad"].astype("string").str.lower()
-    is_luis_content_oos = (
-        (agent == LUIS_CONTRERAS_AGENT)
-        & squad.str.contains("content", regex=False, na=False)
-    )
-
-    correction_hours = pd.Series(0, index=out.index, dtype="int64")
-    correction_hours = correction_hours.mask(
-        is_luis_content_oos
-        & start_date.dt.date.between(
-            pd.Timestamp("2026-01-01").date(),
-            pd.Timestamp("2026-03-08").date(),
-        ),
-        2,
-    )
-    correction_hours = correction_hours.mask(
-        is_luis_content_oos
-        & start_date.dt.date.between(
-            pd.Timestamp("2026-03-09").date(),
-            pd.Timestamp("2026-05-19").date(),
-        ),
-        1,
-    )
-    needs_correction = correction_hours > 0
-    if not needs_correction.any():
-        return out
-
-    delta = pd.to_timedelta(correction_hours, unit="h")
-    out.loc[needs_correction, "local_start_date"] = (
-        pd.to_datetime(out.loc[needs_correction, "local_start_date"])
-        + delta.loc[needs_correction]
-    )
-    out.loc[needs_correction, "local_stop_date"] = (
-        pd.to_datetime(out.loc[needs_correction, "local_stop_date"])
-        + delta.loc[needs_correction]
-    )
-    out.loc[needs_correction, "activity_start_unix"] = (
-        pd.to_numeric(out.loc[needs_correction, "activity_start_unix"], errors="coerce")
-        + correction_hours.loc[needs_correction] * 3600
-    )
-    out.loc[needs_correction, "activity_end_unix"] = (
-        pd.to_numeric(out.loc[needs_correction, "activity_end_unix"], errors="coerce")
-        + correction_hours.loc[needs_correction] * 3600
-    )
-    out.loc[needs_correction, "date"] = pd.to_datetime(
-        out.loc[needs_correction, "local_start_date"]
-    ).dt.date
-    return out
+# Per-slot interval-dedup partition / result keys.
+SLOT_KEYS: tuple[str, ...] = (
+    "agent",
+    "squad",
+    "date",
+    "slot_start",
+    "slot_end",
+    "activity_type_required",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -213,212 +184,270 @@ def _apply_luis_contreras_oos_timestamp_correction(
 # ---------------------------------------------------------------------------
 
 
-def filter_dime(dime: pd.DataFrame) -> pd.DataFrame:
-    """Keep raw slots and apply occupancy's systemic reclassifications.
+def filter_dime(dime: DataFrame) -> DataFrame:
+    """Keep raw slots, apply occupancy's systemic reclassifications, and the
+    fixed legacy DIME filters.
 
-    Drops only:
-      * NULL ``activity_type_required``
+    Drops:
+      * NULL ``activity_type_required``;
+      * ``dimensioned_activity`` in
+        :data:`MEETING_LEAVE_DIMENSIONED_ACTIVITIES` (leave/meeting; NULL kept);
+      * ``squad`` (the DIME ``agent_dime_squad``) NULL or in
+        :data:`NOCC_DIME_SQUAD_EXCLUSIONS` (wfm / credit_evolution / dote). This
+        drop is unconditional on ALL dates. ``social`` DIME slots are KEPT on all
+        dates — Social-Media occupancy is sourced from Sprinklr ``sm_jobs`` and is
+        intentionally ON for the whole history (a documented divergence from
+        legacy; see module docstring).
 
-    Then applies two systemic reclassifications (NOT manual adjustments) so
-    the job-matching logic is identical to the legacy NOcc dataset:
+    Then applies two systemic reclassifications (NOT manual adjustments) so the
+    job-matching logic is identical to the legacy NOcc dataset:
       * ``dimensioned_activity`` in ('Control MC', 'xMC Debit Fraud') →
         ``activity_type_required = 'oos'``
       * ``activity_type_required == 'dime_invalid_notation'`` →
         ``activity_type_required = 'oos'``
 
-    Business exclusions (activity-type / dimensioned_activity / squad) are
-    NOT applied here — they move to the metrics layer.
+    Activity-type (``lunch_break`` / ``time_off`` / ``shrinkage``) exclusions
+    still move to the metrics layer.
     """
-    mask = dime["activity_type_required"].notna()
-    out = dime.loc[mask].copy()
+    out = dime.filter(F.col("activity_type_required").isNotNull())
 
-    is_fraud_oos = out["dimensioned_activity"].isin(DIMENSIONED_ACTIVITY_TO_OOS)
-    is_invalid_notation = out["activity_type_required"] == DIME_INVALID_NOTATION_VALUE
-    out.loc[is_fraud_oos | is_invalid_notation, "activity_type_required"] = "oos"
+    # Meeting/leave drop (fixed; all dates). NULL dimensioned_activity is kept.
+    out = out.filter(
+        F.col("dimensioned_activity").isNull()
+        | ~F.col("dimensioned_activity").isin(
+            list(MEETING_LEAVE_DIMENSIONED_ACTIVITIES)
+        )
+    )
+
+    # DIME-squad drop. `squad` here is the DIME `agent_dime_squad`.
+    # wfm/credit_evolution/dote unconditionally (all dates). `social` is kept on
+    # all dates (Sprinklr-sourced Social-Media occupancy, ON for the whole
+    # history — see module docstring).
+    out = out.filter(
+        F.col("squad").isNotNull()
+        & ~F.col("squad").isin(list(NOCC_DIME_SQUAD_EXCLUSIONS))
+    )
+
+    # Systemic reclassifications → 'oos'.
+    is_fraud_oos = F.col("dimensioned_activity").isin(
+        list(DIMENSIONED_ACTIVITY_TO_OOS)
+    )
+    is_invalid_notation = (
+        F.col("activity_type_required") == F.lit(DIME_INVALID_NOTATION_VALUE)
+    )
+    out = out.withColumn(
+        "activity_type_required",
+        F.when(
+            is_fraud_oos | is_invalid_notation, F.lit("oos")
+        ).otherwise(F.col("activity_type_required")),
+    )
 
     return out
 
 
 # ---------------------------------------------------------------------------
-# Step 2: union shuffle + OOS jobs
+# Step 2: union shuffle + OOS (+ optional Social-Media) jobs
 # ---------------------------------------------------------------------------
 
 
+def _apply_luis_contreras_oos_timestamp_correction(oos_jobs: DataFrame) -> DataFrame:
+    """Shift approved Content OOS job timestamps for luis.contreras.
+
+    Source: `Correcciones Generales Datos`. His laptop clock lagged Taskmaster
+    during H1 2026, so the recorded local start/stop times must move forward
+    before NOCC overlap calculations: +2h through 2026-03-08, +1h from 2026-03-09
+    to 2026-05-19. Hardcoded because the tab is not a scalable rules table yet.
+    """
+    start_date = F.to_date(F.col("local_start_date"))
+    agent = F.lower(F.col("agent"))
+    squad = F.lower(F.col("squad"))
+    is_luis_content_oos = (agent == F.lit(LUIS_CONTRERAS_AGENT)) & squad.contains(
+        "content"
+    )
+
+    correction_hours = (
+        F.when(
+            is_luis_content_oos
+            & (start_date >= F.lit(date(2026, 1, 1)))
+            & (start_date <= F.lit(date(2026, 3, 8))),
+            F.lit(2),
+        )
+        .when(
+            is_luis_content_oos
+            & (start_date >= F.lit(date(2026, 3, 9)))
+            & (start_date <= F.lit(date(2026, 5, 19))),
+            F.lit(1),
+        )
+        .otherwise(F.lit(0))
+    )
+    secs = correction_hours.cast("long") * F.lit(3600)
+
+    return (
+        oos_jobs.withColumn("_corr_hours", correction_hours)
+        .withColumn("_corr_secs", secs)
+        .withColumn(
+            "activity_start_unix",
+            F.col("activity_start_unix").cast("long") + F.col("_corr_secs"),
+        )
+        .withColumn(
+            "activity_end_unix",
+            F.col("activity_end_unix").cast("long") + F.col("_corr_secs"),
+        )
+        # Re-derive `date` from the shifted start so a correction that crosses
+        # midnight re-attributes the row (matches the pandas behaviour). The unix
+        # columns are local-time unix (legacy reads the local timestamp via
+        # UNIX_TIMESTAMP as if UTC), so timestamp_seconds renders the local wall
+        # clock under the UTC session tz.
+        .withColumn(
+            "date",
+            F.when(
+                F.col("_corr_hours") > 0,
+                F.to_date(F.timestamp_seconds(F.col("activity_start_unix"))),
+            ).otherwise(F.col("date")),
+        )
+        .drop("_corr_hours", "_corr_secs")
+    )
+
+
 def build_jobs_union(
-    shuffle_jobs: pd.DataFrame,
-    oos_jobs: pd.DataFrame,
-    sm_jobs: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    """Concatenate shuffle, OOS, and Social-Media jobs into one overlap frame.
+    shuffle_jobs: DataFrame,
+    oos_jobs: DataFrame,
+    sm_jobs: DataFrame | None = None,
+) -> DataFrame:
+    """Concatenate shuffle, OOS, and (optional) Social-Media jobs into one frame.
 
     * Shuffle: filter to ``status IN ('finished', 'transferred', 'skipped')``.
-    * OOS: synthesize ``activity_type='oos'`` (taskmaster has no activity_type).
+    * OOS: synthesize ``activity_type='oos'`` (taskmaster has no activity_type),
+      after the luis.contreras timestamp correction.
     * SM (Sprinklr ``sm_jobs``): each social case assignment is an occupancy
       interval; synthesize ``activity_type='oos'`` so it matches DIME slots whose
-      ``activity_type_required='oos'`` — the social-agent equivalent of OOS work,
-      exactly as the legacy SM notebook treats it.
+      ``activity_type_required='oos'`` — exactly as the legacy SM notebook treats
+      it. Unioned in on ALL dates so Social-Media occupancy is populated for the
+      whole history (see module docstring).
 
     Output columns:
         agent STRING, date DATE, activity_type STRING,
         activity_start_unix BIGINT, activity_end_unix BIGINT
     """
-    cols = ["agent", "date", "activity_type", "activity_start_unix", "activity_end_unix"]
+    cols = [
+        "agent",
+        "date",
+        "activity_type",
+        "activity_start_unix",
+        "activity_end_unix",
+    ]
 
-    def _empty() -> pd.DataFrame:
-        return pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
+    shuffle_part = shuffle_jobs.filter(
+        F.col("status").isin(list(SHUFFLE_OCCUPIED_STATUSES))
+    ).select(*cols)
 
-    if shuffle_jobs.empty:
-        shuffle_part = _empty()
-    else:
-        s = shuffle_jobs.loc[
-            shuffle_jobs["status"].isin(SHUFFLE_OCCUPIED_STATUSES)
-        ].copy()
-        shuffle_part = s[cols]
+    oos_part = (
+        _apply_luis_contreras_oos_timestamp_correction(oos_jobs)
+        .withColumn("activity_type", F.lit("oos"))
+        .select(*cols)
+    )
 
-    if oos_jobs.empty:
-        oos_part = _empty()
-    else:
-        o = _apply_luis_contreras_oos_timestamp_correction(oos_jobs)
-        o["activity_type"] = "oos"
-        oos_part = o[cols]
+    union = shuffle_part.unionByName(oos_part)
 
-    if sm_jobs is None or sm_jobs.empty:
-        sm_part = _empty()
-    else:
-        m = sm_jobs.copy()
-        m["activity_type"] = "oos"
-        sm_part = m[cols]
+    if sm_jobs is not None:
+        sm_part = sm_jobs.withColumn("activity_type", F.lit("oos")).select(*cols)
+        union = union.unionByName(sm_part)
 
-    return pd.concat([shuffle_part, oos_part, sm_part], ignore_index=True)
+    return union
 
 
 # ---------------------------------------------------------------------------
-# Step 3: per-slot occupancy (the overlap join + interval dedup math)
+# Step 3: per-slot occupancy (the overlap join + interval-dedup math)
 # ---------------------------------------------------------------------------
 
 
-def compute_slot_occupancy(
-    dime_filtered: pd.DataFrame, jobs: pd.DataFrame
-) -> pd.DataFrame:
+def compute_slot_occupancy(dime_filtered: DataFrame, jobs: DataFrame) -> DataFrame:
     """For each DIME slot, sum occupied seconds and cap at 1800.
 
     Algorithm (mirrors the legacy ``slot_jobs`` -> ``occupancy_base`` ->
     ``occupancy_agg`` chain):
 
-      1. Per agent, build (slot × job) pairs and keep only temporally
+      1. Per agent+date, build (slot × job) pairs and keep only temporally
          overlapping ones: ``job_end > slot_start AND job_start < slot_end``.
       2. Clip each job to the slot bounds.
-      3. Within partition ``(slot_keys, job.activity_type)``, sort by
-         ``(cjob_start, cjob_end)`` and compute the running max of previous
-         ``cjob_end`` (``prev_max_end``; slot's first row → slot_start).
-      4. For each job, ``contribution = activity_occuped × max(0,
-         cjob_end - max(cjob_start, prev_max_end))`` where
-         ``activity_occuped = 1`` iff
+      3. Within partition ``(slot_keys, job.activity_type)``, order by
+         ``(cjob_start, cjob_end)`` and take the running max of previous
+         ``cjob_end`` over ``ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING``
+         (``prev_max_end``; first row → slot_start) — legacy's window ported to
+         a Spark ``Window`` + ``lag``-style unbounded-preceding running max.
+      4. ``contribution = activity_occuped × max(0, cjob_end -
+         max(cjob_start, prev_max_end))`` where ``activity_occuped = 1`` iff
          ``slot.activity_type_required == job.activity_type``.
       5. Sum contributions per slot. Cap at 1800. LEFT-JOIN semantics: slots
          with no matching job keep ``occupancy_time = 0``.
 
     Returns one row per (agent, squad, date, slot_start, slot_end,
-    activity_type_required) with ``occupancy_time`` (int seconds).
+    activity_type_required) with ``occupancy_time`` (long seconds).
     """
-    SLOT_KEYS = [
-        "agent",
-        "squad",
-        "date",
-        "slot_start",
-        "slot_end",
-        "activity_type_required",
-    ]
-
-    if dime_filtered.empty:
-        return pd.DataFrame(
-            {**{k: pd.Series(dtype=dime_filtered[k].dtype if k in dime_filtered.columns else "object")
-                for k in SLOT_KEYS},
-             "occupancy_time": pd.Series(dtype="int64")}
-        )
+    keys = list(SLOT_KEYS)
 
     slots = (
-        dime_filtered.rename(
-            columns={
-                "slot_start_local_unix": "slot_start",
-                "slot_end_local_unix": "slot_end",
-            }
-        )[SLOT_KEYS]
-        .drop_duplicates()
-        .reset_index(drop=True)
+        dime_filtered.withColumnRenamed("slot_start_local_unix", "slot_start")
+        .withColumnRenamed("slot_end_local_unix", "slot_end")
+        .select(*keys)
+        .distinct()
     )
 
-    common_agents = set(slots["agent"].unique()) & set(jobs["agent"].unique())
+    # Half-open overlap, equivalent to legacy's 3-clause OR for positive-duration
+    # jobs (the rare zero-duration-at-slot-start edge is documented in the build
+    # plan as a known parity risk).
+    joined = slots.join(jobs, on=["agent", "date"], how="inner").filter(
+        (F.col("activity_end_unix") > F.col("slot_start"))
+        & (F.col("activity_start_unix") < F.col("slot_end"))
+    )
 
-    pair_frames: list[pd.DataFrame] = []
-    if common_agents:
-        slots_by_agent = slots.groupby("agent")
-        jobs_by_agent = jobs.groupby("agent")
-        for agent in common_agents:
-            s = slots_by_agent.get_group(agent)
-            j = jobs_by_agent.get_group(agent)
-            m = s.merge(j, on=["agent", "date"], suffixes=("", "_j"))
-            if m.empty:
-                continue
-            # Half-open overlap rule, vectorized
-            ok = (m["activity_end_unix"] > m["slot_start"]) & (
-                m["activity_start_unix"] < m["slot_end"]
-            )
-            m = m.loc[ok].copy()
-            if m.empty:
-                continue
-            # Clip job interval to slot bounds
-            m["cjob_start"] = m[["slot_start", "activity_start_unix"]].max(axis=1)
-            m["cjob_end"] = m[["slot_end", "activity_end_unix"]].min(axis=1)
-            # Activity match
-            m["activity_occuped"] = (
-                m["activity_type_required"] == m["activity_type"]
-            ).astype("int64")
-            # Interval-dedup: cumulative max of cjob_end within partition,
-            # shifted by one row, defaulting to slot_start.
-            partition_keys = SLOT_KEYS + ["activity_type"]
-            m = m.sort_values(partition_keys + ["cjob_start", "cjob_end"]).reset_index(
-                drop=True
-            )
-            m["prev_max_end"] = m.groupby(partition_keys, dropna=False)[
-                "cjob_end"
-            ].transform(lambda x: x.cummax().shift(1))
-            m["prev_max_end"] = np.where(
-                m["prev_max_end"].isna(),
-                m["slot_start"],
-                m["prev_max_end"],
-            )
-            # Contribution
-            effective_start = m[["cjob_start", "prev_max_end"]].max(axis=1)
-            m["contribution"] = np.where(
-                m["activity_occuped"] == 1,
-                (m["cjob_end"] - effective_start).clip(lower=0),
-                0,
-            )
-            pair_frames.append(m[SLOT_KEYS + ["contribution"]])
+    cjob_start = F.greatest(F.col("slot_start"), F.col("activity_start_unix"))
+    cjob_end = F.least(F.col("slot_end"), F.col("activity_end_unix"))
+    activity_occuped = (
+        F.col("activity_type_required") == F.col("activity_type")
+    ).cast("int")
 
-    if pair_frames:
-        pairs = pd.concat(pair_frames, ignore_index=True)
-        per_slot = (
-            pairs.groupby(SLOT_KEYS, as_index=False, dropna=False)["contribution"]
-            .sum()
-            .rename(columns={"contribution": "occupancy_time"})
-        )
-        per_slot["occupancy_time"] = per_slot["occupancy_time"].clip(
-            upper=SLOT_DURATION_SECONDS
-        )
-    else:
-        per_slot = pd.DataFrame(
-            {**{k: pd.Series(dtype=slots[k].dtype) for k in SLOT_KEYS},
-             "occupancy_time": pd.Series(dtype="float64")}
-        )
+    clipped = joined.select(
+        *keys,
+        "activity_type",
+        cjob_start.alias("cjob_start"),
+        cjob_end.alias("cjob_end"),
+        activity_occuped.alias("activity_occuped"),
+    )
 
-    # LEFT-JOIN to keep slots with no matching job (occupancy_time = 0).
-    out = slots.merge(per_slot, on=SLOT_KEYS, how="left")
-    out["occupancy_time"] = pd.to_numeric(
-        out["occupancy_time"], errors="coerce"
-    ).fillna(0).astype("int64")
-    return out
+    # Interval-dedup: running max of cjob_end over the rows strictly preceding the
+    # current one, within (slot keys + job activity_type), ordered by
+    # (cjob_start, cjob_end). NULL on the first row -> slot_start.
+    dedup_window = (
+        Window.partitionBy(*keys, "activity_type")
+        .orderBy(F.col("cjob_start"), F.col("cjob_end"))
+        .rowsBetween(Window.unboundedPreceding, -1)
+    )
+    prev_max_end = F.coalesce(
+        F.max("cjob_end").over(dedup_window), F.col("slot_start")
+    )
+
+    effective_start = F.greatest(F.col("cjob_start"), prev_max_end)
+    contribution = F.when(
+        F.col("activity_occuped") == 1,
+        F.greatest(F.lit(0).cast("long"), F.col("cjob_end") - effective_start),
+    ).otherwise(F.lit(0).cast("long"))
+
+    per_slot = (
+        clipped.withColumn("contribution", contribution)
+        .groupBy(*keys)
+        .agg(F.sum("contribution").alias("occupancy_time"))
+        .withColumn(
+            "occupancy_time",
+            F.least(F.col("occupancy_time"), F.lit(SLOT_DURATION_SECONDS)),
+        )
+    )
+
+    # LEFT-JOIN back to keep slots with no matching job (occupancy_time = 0).
+    return slots.join(per_slot, on=keys, how="left").withColumn(
+        "occupancy_time",
+        F.coalesce(F.col("occupancy_time"), F.lit(0)).cast("long"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -427,18 +456,21 @@ def compute_slot_occupancy(
 
 
 def compute_occupancy_time(
-    agent_info: pd.DataFrame,
-    dime: pd.DataFrame,
-    shuffle_jobs: pd.DataFrame,
-    oos_jobs: pd.DataFrame,
-    sm_jobs: pd.DataFrame | None = None,
-) -> pd.DataFrame:
+    agent_info: DataFrame,
+    dime: DataFrame,
+    shuffle_jobs: DataFrame,
+    oos_jobs: DataFrame,
+    sm_jobs: DataFrame | None = None,
+) -> DataFrame:
     """End-to-end occupancy_time pipeline (raw per-slot occupancy minutes).
 
     ``sm_jobs`` (Sprinklr ``sm_jobs`` extractor) is optional: when provided, the
     Social-Media case assignments are unioned in as ``oos``-typed jobs so social
     agents' occupancy is populated from Sprinklr (they have no shuffle/taskmaster
-    jobs). It is harmless for non-social agents (no SM jobs match them).
+    jobs). ``social`` DIME slots are kept and ``sm_jobs`` is unioned on ALL dates
+    (see ``filter_dime`` / module docstring): Social-Media occupancy is
+    intentionally ON for the whole history, a documented divergence from legacy
+    (which had no Sprinklr source).
     """
     # --- DIME side ----------------------------------------------------------
     dime_f = filter_dime(dime)
@@ -451,73 +483,119 @@ def compute_occupancy_time(
     # The DIME ``squad`` was only needed for the per-slot interval-dedup
     # partition; drop it before the roster join to avoid colliding with the
     # roster's own ``squad``.
-    per_slot = per_slot.drop(columns=["squad"])
+    per_slot = per_slot.drop("squad")
+
+    # Collapse to ONE row per physical slot, summing occupancy across any
+    # duplicate slot rows, then (re)cap at the slot length. A single slot can
+    # appear more than once at this point because the same (agent, date,
+    # slot_start) can carry >1 DIME ``agent_dime_squad`` — most commonly because
+    # ``append_missing_dime_slots`` re-adds a now-backfilled slot under a
+    # different squad label (e.g. ``Content`` vs ``content_content``), which the
+    # ``.distinct()`` on slot keys keeps as separate rows. Jobs match on
+    # agent/date/time (not squad), so each duplicate carries identical occupancy;
+    # without this collapse a 30-min slot would double to 60. Legacy reproduces
+    # exactly this — its final ``normalized_occupancy_final`` groups to one row
+    # per ``slot_start`` and applies ``LEAST(SUM(occupancy_time), 1800)`` AFTER
+    # summing — so we sum here and let the post-roster cap below bound it.
+    per_slot = per_slot.groupBy(
+        "agent", "date", "slot_start", "slot_end", "activity_type_required"
+    ).agg(F.sum("occupancy_time").alias("occupancy_time"))
 
     # Night-shift agents that cross midnight are re-attributed to the day their
-    # shift started (>= 2026-07-01 only). `slot_start` is already local-time
-    # unix, so it renders straight to the local slot timestamp.
+    # shift started (>= 2026-07-01 only). `slot_start` is local-time unix, so it
+    # renders straight to the local slot timestamp.
     night_months = night_agent_months(agent_info)
-    per_slot["_local_ts"] = pd.to_datetime(per_slot["slot_start"], unit="s")
-    per_slot["date"] = shift_start_date(
+    per_slot = per_slot.withColumn(
+        "_local_ts", F.timestamp_seconds(F.col("slot_start"))
+    )
+    per_slot = shift_start_date(
         per_slot,
         agent_col="agent",
         local_ts_col="_local_ts",
         calendar_date_col="date",
         night_months=night_months,
-    )
-    per_slot = per_slot.drop(columns="_local_ts")
+    ).drop("_local_ts")
 
     # --- roster join --------------------------------------------------------
-    roster = agent_info.loc[
-        (agent_info["status"] == "active")
-        & ~agent_info["squad"].isin(NOCC_OUT_OF_SCOPE_SQUADS),
-        [
-            "agent",
-            "xforce",
-            "xplead",
-            "team",
-            "squad",
-            "squad_district",
-            "shift",
-            "snapshot_month",
-        ],
-    ].copy()
-    roster = roster.rename(columns={"squad_district": "district"})
-    roster["snapshot_month"] = _as_naive_datetime(roster["snapshot_month"])
-
-    per_slot["snapshot_month"] = _as_naive_datetime(
-        pd.to_datetime(per_slot["date"]).dt.to_period("M").dt.to_timestamp()
-    )
-    enriched = per_slot.merge(roster, on=["agent", "snapshot_month"], how="inner")
-
-    # --- final shape --------------------------------------------------------
-    enriched["occupancy_time"] = enriched["occupancy_time"].clip(
-        upper=SLOT_DURATION_SECONDS
-    )
-    # `slot_start` is local-time unix, so it renders straight to wall-clock.
-    enriched["slot_time"] = _seconds_to_hms(enriched["slot_start"])
-    enriched["occupancy_minutes"] = enriched["occupancy_time"].astype("float64") / 60.0
-    enriched["required_minutes"] = float(SLOT_DURATION_SECONDS) / 60.0
-
-    out = enriched[[
+    roster = agent_info.filter(F.col("status") == "active")
+    if NOCC_OUT_OF_SCOPE_SQUADS:
+        roster = roster.filter(~F.col("squad").isin(list(NOCC_OUT_OF_SCOPE_SQUADS)))
+    roster = roster.select(
         "agent",
         "xforce",
         "xplead",
         "team",
         "squad",
-        "district",
+        F.col("squad_district").alias("district"),
         "shift",
-        "date",
-        "slot_time",
-        "activity_type_required",
-        "required_minutes",
-        "occupancy_minutes",
-    ]].copy()
+        F.to_date(F.col("snapshot_date")).alias("_snapshot_date"),
+        F.trunc(F.to_date(F.col("snapshot_month")), "month").alias("snapshot_month"),
+    )
 
-    out["required_minutes"] = out["required_minutes"].astype("float64")
-    out["occupancy_minutes"] = out["occupancy_minutes"].astype("float64")
+    # Deduplicate the roster to exactly ONE row per (agent, snapshot_month) BEFORE
+    # the slot join. The content branch of `agent_information` (see
+    # extractors/agent_information.sql `content_monthly`) cross-joins each Google-
+    # Sheet content row against every month, so a content agent who appears on
+    # more than one sheet row (e.g. supporting multiple `target_squad`s) yields
+    # ≥2 rows per (agent, snapshot_month) that are identical on every column this
+    # view selects (only `target_squad`, which occupancy does not use, differs).
+    # Without this dedup the inner join below fans out — every slot is duplicated,
+    # so a 30-min slot sums to 60 min and the per-slot ≤30-min invariant breaks.
+    # Keep the latest snapshot deterministically (recency, then stable tiebreaks).
+    roster_dedup_window = Window.partitionBy("agent", "snapshot_month").orderBy(
+        F.col("_snapshot_date").desc_nulls_last(),
+        F.col("squad").asc_nulls_last(),
+        F.col("district").asc_nulls_last(),
+        F.col("shift").asc_nulls_last(),
+    )
+    roster = (
+        roster.withColumn(
+            "_roster_rn", F.row_number().over(roster_dedup_window)
+        )
+        .filter(F.col("_roster_rn") == 1)
+        .drop("_roster_rn", "_snapshot_date")
+    )
 
-    return out.sort_values(["date", "agent", "slot_time"]).reset_index(drop=True)
+    enriched = per_slot.withColumn(
+        "snapshot_month", F.trunc(F.to_date(F.col("date")), "month")
+    ).join(roster, on=["agent", "snapshot_month"], how="inner")
+
+    # --- final shape --------------------------------------------------------
+    enriched = enriched.withColumn(
+        "occupancy_time",
+        F.least(F.col("occupancy_time"), F.lit(SLOT_DURATION_SECONDS)),
+    )
+    # `slot_start` is local-time unix, so it renders straight to wall-clock.
+    out = (
+        enriched.withColumn(
+            "slot_time",
+            F.date_format(F.timestamp_seconds(F.col("slot_start")), "HH:mm:ss"),
+        )
+        .withColumn(
+            "occupancy_minutes",
+            (F.col("occupancy_time").cast("double") / F.lit(60.0)).cast("double"),
+        )
+        .withColumn(
+            "required_minutes",
+            F.lit(float(SLOT_DURATION_SECONDS) / 60.0).cast("double"),
+        )
+        .select(
+            "agent",
+            "xforce",
+            "xplead",
+            "team",
+            "squad",
+            "district",
+            "shift",
+            F.to_date(F.col("date")).alias("date"),
+            "slot_time",
+            "activity_type_required",
+            "required_minutes",
+            "occupancy_minutes",
+        )
+    )
+
+    return out.orderBy("date", "agent", "slot_time")
 
 
 # ---------------------------------------------------------------------------

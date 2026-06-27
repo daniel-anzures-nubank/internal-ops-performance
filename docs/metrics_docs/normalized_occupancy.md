@@ -45,6 +45,19 @@ is computed from the slots in the read window, so prefer whole-month builds.
 - **Drop non-productive slots**: `activity_type_required` in
   `{lunch_break, time_off, shrinkage}` (case-insensitive). The remaining slots
   feed both the agent occupancy and the benchmark.
+- **Manual approved adjustment** (`Ajustes Index`): suppress `nitza.zarza` from
+  the NO **output** for Apr–May 2026. Her slots still feed the district/shift
+  benchmark (the drop happens *after* the benchmark join), matching the legacy
+  placement of this filter.
+
+## Fixed DIME filters (applied upstream, no longer deferred)
+
+The legacy `dimensioned_activity` meeting/leave carve-out and the DIME-squad
+exclusion (`wfm` / `credit_evolution` / `dote` / `social`) are applied in the
+**raw layer** (`metrics_data/occupancy_time.py` → `filter_dime`), at the slot
+stage, so they already constrain both the agent occupancy and the peer benchmark
+here. The `social` slice is cutover-gated at `2026-07-01`. (Occupancy's
+DIME-squad list **includes `social`** — unlike adherence's.)
 
 ## Output convention
 
@@ -57,12 +70,21 @@ To keep the shared `metric_value = numerator / denominator * 100` contract:
 
 ## Deferred to the future Adjustments layer (NOT applied here)
 
-- Legacy `dimensioned_activity` meeting/leave carve-outs and the per-agent
-  `time_off` reclassifications (the raw table doesn't carry
-  `dimensioned_activity`).
-- DIME-squad exclusions (`wfm` / `credit_evolution` / `dote`) — so they
-  currently still feed the benchmark.
-- Per-agent vacation / outage-date exclusions (e.g. 2026-03-27, 2026-04-09).
+- Per-agent `time_off` reclassifications and vacation / outage-date exclusions
+  (e.g. 2026-03-27, 2026-04-09, the `jose.velez` et al. 2026-03-24…28 group, the
+  `xplead = 'david.fernandez'` 2026-03-10 drop). These are wired via
+  `drop_slot_windows` once the `adj_*` tables are populated.
+
+## Era gating (legacy `date >= 2026-03-01` floor + 2025 roster pin) — deferred
+
+Legacy `normalized_occupancy_final` filters `date >= '2026-03-01'` and pins all
+pre-Dec-2025 slots to the `snapshot_month = '2025-12-01'` roster snapshot. The
+new pipeline has **neither** the floor nor the 2025 pin — it joins each slot to
+its own month snapshot and emits NO for whatever period is read. This is safe in
+practice because the publish window starts at `2026-03-01` (backfill begins in
+2026). If a build is ever run with `--period-start` before `2026-03-01`, the
+output will diverge from legacy (legacy emits nothing before March 2026); add the
+floor + 2025 pin then. Same approach adherence takes (it has no floor either).
 
 ## Output schema (one row per agent per period)
 
