@@ -47,6 +47,11 @@ Filters applied here
 * Outage-date drop: ``date NOT IN (2026-03-27, 2026-04-09)`` — legacy drops
   these for ALL agents in both ``expected_duration_per_job_ntpj`` and
   ``ntpj_calculations``, so they leave both the benchmark and the contribution.
+* Hardcoded per-agent date exclusions (vacation / leave / holiday / license /
+  days off) — un-ported legacy hardcodes reproduced from ``dime_ntpj`` /
+  ``manual_adjustments_ntpj`` / ``ntpj_all_info_2026``. Contribution-only (the
+  agent's jobs on those dates leave the metric). See
+  :data:`HARDCODED_AGENT_DATE_EXCLUSIONS`.
 * Manual adjustments (when the ``adj_*`` tables are present): outage / cross-
   support / job exclusions via ``drop_slot_windows`` / ``drop_cross_support_jobs``
   / ``drop_excluded_jobs``, applied to the adjusted frame BEFORE the benchmark
@@ -102,6 +107,95 @@ TRAILING_WINDOW_MONTHS = 4
 # Legacy whole-pipeline outage-date drops (general access problems). Dropped for
 # ALL agents in both the benchmark and the contribution.
 OUTAGE_DATES: tuple[date, ...] = (date(2026, 3, 27), date(2026, 4, 9))
+
+
+# ---------------------------------------------------------------------------
+# Hardcoded per-agent NTPJ exclusions (UN-PORTED LEGACY HARDCODES)
+# ---------------------------------------------------------------------------
+#
+# Source / legacy parity: ``legacy/[IO] NTPJ Dataset.sql`` hardcodes per-agent
+# vacation / leave / holiday / license / day-off date exclusions that were never
+# moved to the ``adj_*`` adjustment sheets. They appear in three places that all
+# converge on the SAME net effect — the agent's jobs on those dates leave the
+# metric:
+#   * ``dime_ntpj``                (lines 523-538) — drops the DIME required-set,
+#                                   so ``required_hours IS NOT NULL`` removes the
+#                                   contribution row;
+#   * ``manual_adjustments_ntpj``  (lines 201-223) — ``exclude = TRUE`` CASE;
+#   * ``ntpj_all_info_2026``       (lines 612-627) — final ``NOT (...)`` filters.
+#
+# We reproduce the net effect with a single contribution-side filter (the
+# contribution is already scoped to active roster + required-activity flag),
+# mirroring the existing NTPJ hardcode precedent (``nitza.zarza`` /
+# ``luis.contreras`` in the occupancy modules). These are documented legacy facts
+# applied UNCONDITIONALLY in legacy (no 2026-07-01 cutover gate), so we apply them
+# as-is — they are pre-cutover historical days off.
+#
+# TODO: these are un-ported legacy hardcodes; they should eventually move to the
+# ``adj_exclusiones_generales`` adjustment sheet so this list can be deleted.
+#
+# Each entry is ``(agent, start_date_inclusive, end_date_inclusive)``.
+_FAR_FUTURE: date = date(2099, 12, 31)
+HARDCODED_AGENT_DATE_EXCLUSIONS: tuple[tuple[str, date, date], ...] = (
+    # -- maternity leave --
+    ("maria.reyes", date(2026, 2, 1), date(2026, 2, 28)),
+    # -- vacation --
+    ("tania.enciso", date(2026, 5, 8), date(2026, 5, 9)),
+    ("yerck.tellez", date(2026, 3, 3), date(2026, 3, 3)),
+    ("yerck.tellez", date(2026, 4, 28), date(2026, 4, 28)),
+    ("gabriela.vega", date(2026, 5, 12), date(2026, 5, 12)),
+    ("dulce.rivera", date(2026, 3, 29), date(2026, 3, 29)),
+    ("nadia.tovias", date(2026, 4, 23), date(2026, 4, 23)),
+    ("rodrigo.padilla", date(2026, 3, 10), date(2026, 3, 10)),
+    ("israel.cadena", date(2026, 3, 19), date(2026, 3, 19)),
+    ("uriel.alfaro", date(2026, 4, 6), date(2026, 4, 7)),
+    ("uriel.alfaro", date(2026, 5, 13), date(2026, 5, 15)),
+    ("yuridia.agama", date(2026, 5, 11), date(2026, 5, 14)),
+    ("alexis.torres", date(2026, 5, 21), date(2026, 5, 22)),
+    ("lucia.espinosa", date(2026, 4, 11), date(2026, 4, 11)),
+    ("adriana.lopez", date(2026, 5, 14), date(2026, 5, 14)),
+    # -- day controls (2026-03-24 .. 2026-03-28) --
+    ("jose.velez", date(2026, 3, 24), date(2026, 3, 28)),
+    ("carlos.gonzalez", date(2026, 3, 24), date(2026, 3, 28)),
+    ("jorge.ortega", date(2026, 3, 24), date(2026, 3, 28)),
+    ("luisa.castaneda", date(2026, 3, 24), date(2026, 3, 28)),
+    ("janet.castro", date(2026, 3, 24), date(2026, 3, 28)),
+    ("karen.ortega", date(2026, 3, 24), date(2026, 3, 28)),
+    # -- one-off manual exclusion --
+    ("jonathan.pineda", date(2026, 2, 26), date(2026, 2, 26)),
+    # -- manual exclusion, May 1st 2026 --
+    ("jefferson.nunes", date(2026, 5, 1), date(2026, 5, 1)),
+    ("patricia.gomez", date(2026, 5, 1), date(2026, 5, 1)),
+    # -- license, carmina.venegas Apr-Aug 2026 --
+    ("carmina.venegas", date(2026, 4, 19), date(2026, 8, 19)),
+    # -- holiday, May 1st 2026 --
+    ("cecilia.ortiz", date(2026, 5, 1), date(2026, 5, 1)),
+    ("federico.gaona", date(2026, 5, 1), date(2026, 5, 1)),
+    ("ignacio.herbert", date(2026, 5, 1), date(2026, 5, 1)),
+    ("marcos.caudillo", date(2026, 5, 1), date(2026, 5, 1)),
+    ("maria.castillo", date(2026, 5, 1), date(2026, 5, 1)),
+    # -- exclude evelyn.macedo from Apr 27 2026 onwards (open-ended) --
+    ("evelyn.macedo", date(2026, 4, 27), _FAR_FUTURE),
+    # -- days off --
+    ("jorge.delgado", date(2026, 5, 19), date(2026, 5, 20)),
+    ("claudia.brigada", date(2026, 6, 7), date(2026, 6, 7)),
+    ("omar.morales", date(2026, 5, 4), date(2026, 5, 4)),
+    ("luis.delgadillo", date(2026, 5, 28), date(2026, 5, 28)),
+)
+
+
+def _hardcoded_exclusion_mask(df: DataFrame) -> "F.Column":
+    """OR-mask matching any ``(agent, date)`` in :data:`HARDCODED_AGENT_DATE_EXCLUSIONS`."""
+    cal = F.to_date(F.col("date"))
+    agent = F.lower(F.col("agent"))
+    mask = F.lit(False)
+    for name, start, end in HARDCODED_AGENT_DATE_EXCLUSIONS:
+        mask = mask | (
+            (agent == F.lit(name))
+            & (cal >= F.lit(start))
+            & (cal <= F.lit(end))
+        )
+    return mask
 
 
 def _expected_duration_by_month(monthly_totals: DataFrame) -> DataFrame:
@@ -213,6 +307,13 @@ def compute_ntpj(
         (F.col("required_activity_on_day_flag") == F.lit(1))
         & (F.lower(F.col("roster_status")) == F.lit(ACTIVE_ROSTER_STATUS))
     )
+
+    # Un-ported legacy hardcodes: drop specific agent-days (vacation / leave /
+    # holiday / license / days off). Contribution-only — legacy applies these via
+    # dime_ntpj / manual_adjustments_ntpj / ntpj_all_info_2026, whose net effect is
+    # to remove the agent's jobs on those dates. See
+    # HARDCODED_AGENT_DATE_EXCLUSIONS.
+    contrib = contrib.filter(~_hardcoded_exclusion_mask(contrib))
 
     base = contrib.groupBy(
         "agent",

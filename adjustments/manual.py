@@ -222,20 +222,58 @@ def _contains_any(text: Column, values: list[str]) -> Column:
     return mask
 
 
+def _normalized_queue_col(job_type: Column) -> Column:
+    """Normalize a shuffle ``job_type`` (``received_source_q``) to the sheet's
+    hyphenated queue token, mirroring legacy ``[IO] NTPJ Dataset.sql`` line 406:
+
+        LOWER(REPLACE(REPLACE(received_source_q, 'incredible_machine__', ''), '_', '-'))
+
+    The raw shuffle queue is prefixed + underscored
+    (``incredible_machine__backoffice_payment_srf``) while the sheet's
+    ``queues_a_excluir`` is stripped + hyphenated (``backoffice-payment-srf``).
+    Without this normalization the values never match and the exclusion silently
+    drops nothing — leaving cross-support jobs in both the agent contribution AND
+    the shared monthly ``exp_duration_job`` benchmark pool.
+    """
+    return F.regexp_replace(
+        F.regexp_replace(F.lower(job_type), "incredible_machine__", ""),
+        "_",
+        "-",
+    )
+
+
+def _normalized_queue_matches_any(job_type: Column, values: list[str]) -> Column:
+    """True when the normalized ``job_type`` token EQUALS any of ``values``.
+
+    Legacy joins on equality of the normalized source-queue token to the
+    excluded queue (``... = excl.queue``), not a loose substring match, so we
+    reproduce exact-token equality here.
+    """
+    normalized = _normalized_queue_col(job_type)
+    mask = F.lit(False)
+    for value in values:
+        value = value.strip().lower()
+        if value:
+            mask = mask | (normalized == F.lit(value))
+    return mask
+
+
 def drop_cross_support_jobs(
     jobs: DataFrame, cross_support: DataFrame | None
 ) -> DataFrame:
     rows = _rows(cross_support)
     if not rows:
         return jobs
-    text = F.concat_ws(" ", F.col("job_id"), F.col("job_type"))
+    # Match the sheet's hyphenated queue against the normalized ``job_type``
+    # token (legacy compares the normalized ``received_source_q`` to
+    # ``excl.queue`` by equality — see ``_normalized_queue_matches_any``).
     drop = F.lit(False)
     for row in rows:
         queues = _str(row.get(COL_QUEUES)).splitlines()
         drop = drop | (
             _scope_mask(jobs, row)
             & _job_date_mask(jobs, row)
-            & _contains_any(text, queues)
+            & _normalized_queue_matches_any(F.col("job_type"), queues)
         )
     return jobs.filter(~drop)
 
@@ -244,6 +282,13 @@ def drop_excluded_jobs(jobs: DataFrame, exclusions: DataFrame | None) -> DataFra
     rows = _rows(exclusions)
     if not rows:
         return jobs
+    # NOTE: ``exclusiones_jobs`` targets OOS content classifications (free text
+    # with spaces / parentheses, e.g. ``99 Minute - Carrier reports (OOS_LCYC)``),
+    # NOT the ``incredible_machine__`` shuffle queue. Legacy matches these against
+    # the raw ``job_classification`` in ``oos_jobs_ntpj`` (lines 454-459), so the
+    # cross-support queue normalization is deliberately NOT applied here — it would
+    # mangle the parenthesized OOS token and stop these exclusions from matching.
+    # We keep the original loose substring match against the combined job text.
     text = F.concat_ws(" ", F.col("job_id"), F.col("job_type"))
     drop = F.lit(False)
     for row in rows:

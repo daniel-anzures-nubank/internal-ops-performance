@@ -15,10 +15,38 @@ import datetime as dt
 from pyspark.sql import types as T
 
 from ntpj import (
+    HARDCODED_AGENT_DATE_EXCLUSIONS,
     IO_NTPJ_METRIC_SCHEMA,
     METRIC_NAME,
     compute_ntpj,
 )
+
+_CROSS_SUPPORT_SCHEMA = T.StructType(
+    [
+        T.StructField("equipo", T.StringType()),
+        T.StructField("agente", T.StringType()),
+        T.StructField("queues_a_excluir", T.StringType()),
+        T.StructField("fecha_inicio", T.StringType()),
+        T.StructField("fecha_fin", T.StringType()),
+    ]
+)
+
+
+def make_cross_support(spark, rows):
+    """Build a synced ``adj_cross_support``-shaped Spark frame (snake_case cols)."""
+    return spark.createDataFrame(
+        [
+            (
+                r.get("equipo", "Core"),
+                r["agente"],
+                r["queues_a_excluir"],
+                r.get("fecha_inicio", "2026-05-01"),
+                r.get("fecha_fin", "9000-01-01"),
+            )
+            for r in rows
+        ],
+        _CROSS_SUPPORT_SCHEMA,
+    )
 
 _RAW_SCHEMA = T.StructType(
     [
@@ -337,3 +365,142 @@ class TestComputeNtpj:
     def test_output_schema_and_column_order(self, spark):
         out = compute_ntpj(make_jobs(spark, [{}]), MAY_START, MAY_END)
         assert out.columns == [c for c, _ in IO_NTPJ_METRIC_SCHEMA]
+
+
+class TestCrossSupportQueueNormalization:
+    """Fix 1: the sheet's hyphenated queue must match the prefixed/underscored
+    shuffle ``job_type`` (``incredible_machine__<queue_underscored>``)."""
+
+    def test_prefixed_underscored_job_type_is_dropped(self, spark):
+        # The sheet lists the hyphenated queue ``backoffice-payment-srf``; the raw
+        # shuffle job_type is ``incredible_machine__backoffice_payment_srf``.
+        # Before Fix 1 the loose lowercase ``contains`` never matched, so the
+        # cross-support job leaked into BOTH the contribution and the benchmark.
+        jobs = make_jobs(
+            spark,
+            [
+                {
+                    "agent": "daniel.cano",
+                    "team": "core",
+                    "job_type": "incredible_machine__backoffice_payment_srf",
+                    "job_id": "bko - incredible_machine__backoffice_payment_srf - finished",
+                    "duration_seconds": 500,
+                },
+            ],
+        )
+        cross_support = make_cross_support(
+            spark,
+            [
+                {
+                    "agente": "daniel.cano",
+                    "queues_a_excluir": "backoffice-payment-srf",
+                    "fecha_inicio": "2026-04-09",
+                    "fecha_fin": "9000-01-01",
+                }
+            ],
+        )
+        out = compute_ntpj(jobs, MAY_START, MAY_END, cross_support=cross_support)
+        # The cross-support job is the only job: after the drop nothing remains.
+        assert out.count() == 0
+
+    def test_non_matching_queue_is_kept(self, spark):
+        # A queue NOT in the sheet must survive (normalized equality, not a loose
+        # substring — ``backoffice-payment`` must NOT drop ``...payment-srf``).
+        jobs = make_jobs(
+            spark,
+            [
+                {
+                    "agent": "daniel.cano",
+                    "team": "core",
+                    "job_type": "incredible_machine__backoffice_payment_srf",
+                    "job_id": "bko - incredible_machine__backoffice_payment_srf - finished",
+                    "duration_seconds": 500,
+                },
+            ],
+        )
+        cross_support = make_cross_support(
+            spark,
+            [
+                {
+                    "agente": "daniel.cano",
+                    "queues_a_excluir": "backoffice-payment",  # partial token
+                    "fecha_inicio": "2026-04-09",
+                    "fecha_fin": "9000-01-01",
+                }
+            ],
+        )
+        out = compute_ntpj(jobs, MAY_START, MAY_END, cross_support=cross_support)
+        day = _day_by_agent(out)["daniel.cano"]
+        assert day["numerator"] == 500
+
+
+class TestHardcodedAgentExclusions:
+    """Fix 2: un-ported legacy per-agent date exclusions remove the agent's jobs."""
+
+    def test_excluded_agent_day_is_dropped(self, spark):
+        # adriana.lopez 2026-05-14 is a hardcoded vacation exclusion. A benchmark
+        # buddy (b.two, not excluded) keeps the benchmark pool non-empty so we can
+        # assert adriana drops out of the CONTRIBUTION specifically.
+        out = compute_ntpj(
+            make_jobs(
+                spark,
+                [
+                    {"agent": "adriana.lopez", "date": dt.date(2026, 5, 14),
+                     "start_time": dt.datetime(2026, 5, 14, 9, 0, 0),
+                     "duration_seconds": 300},
+                    {"agent": "b.two", "date": dt.date(2026, 5, 14),
+                     "start_time": dt.datetime(2026, 5, 14, 9, 0, 0),
+                     "duration_seconds": 100},
+                ],
+            ),
+            MAY_START,
+            MAY_END,
+        )
+        day = _day_by_agent(out)
+        assert "adriana.lopez" not in day
+        assert "b.two" in day
+
+    def test_excluded_agent_kept_outside_window(self, spark):
+        # adriana.lopez on a DIFFERENT day (2026-05-15) is unaffected.
+        out = compute_ntpj(
+            make_jobs(
+                spark,
+                [
+                    {"agent": "adriana.lopez", "date": dt.date(2026, 5, 15),
+                     "start_time": dt.datetime(2026, 5, 15, 9, 0, 0),
+                     "duration_seconds": 300},
+                ],
+            ),
+            MAY_START,
+            MAY_END,
+        )
+        day = _day_by_agent(out)
+        assert "adriana.lopez" in day
+
+    def test_open_ended_exclusion(self, spark):
+        # evelyn.macedo is excluded from 2026-04-27 onwards (open-ended).
+        out = compute_ntpj(
+            make_jobs(
+                spark,
+                [
+                    {"agent": "evelyn.macedo", "date": dt.date(2026, 5, 20),
+                     "start_time": dt.datetime(2026, 5, 20, 9, 0, 0),
+                     "duration_seconds": 300},
+                    {"agent": "b.two", "date": dt.date(2026, 5, 20),
+                     "start_time": dt.datetime(2026, 5, 20, 9, 0, 0),
+                     "duration_seconds": 100},
+                ],
+            ),
+            MAY_START,
+            MAY_END,
+        )
+        day = _day_by_agent(out)
+        assert "evelyn.macedo" not in day
+
+    def test_exclusion_set_covers_surfaced_named_agents(self):
+        # Sanity: the named-date agents surfaced in the Apr-May parity diff are
+        # present. (ivette.melendez / daniel.cano are resolved by Fix 1's
+        # cross-support queue normalization, NOT this named-date list.)
+        names = {n for n, _, _ in HARDCODED_AGENT_DATE_EXCLUSIONS}
+        for surfaced in ("evelyn.macedo", "tania.enciso", "adriana.lopez"):
+            assert surfaced in names
