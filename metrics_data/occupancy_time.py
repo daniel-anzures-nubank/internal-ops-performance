@@ -41,9 +41,10 @@ Filters applied here (matching legacy at the DIME stage; see legacy parity below
       :data:`MEETING_LEAVE_DIMENSIONED_ACTIVITIES` (leave/meeting slots; NULL
       kept).
     - ``agent_dime_squad`` non-NULL and not in
-      :data:`NOCC_DIME_SQUAD_EXCLUSIONS` (wfm / credit_evolution / dote /
-      ``social``). NOTE the occupancy list INCLUDES ``social`` (unlike
-      adherence); the ``social`` exclusion is cutover-gated (see below).
+      :data:`NOCC_DIME_SQUAD_EXCLUSIONS` (wfm / credit_evolution / dote).
+      ``social`` DIME slots are KEPT on all dates — Social-Media occupancy is
+      sourced from Sprinklr ``sm_jobs`` and is intentionally ON for the whole
+      history (see "Legacy parity" below).
 * Jobs: shuffle ``status IN ('finished', 'transferred', 'skipped')`` (NOcc
   counts attempted work, wider than NTPJ's 'finished'); OOS and SM rows get a
   synthetic ``activity_type = 'oos'``.
@@ -53,22 +54,27 @@ Filters applied here (matching legacy at the DIME stage; see legacy parity below
   2026-05-19).
 * Roster: ``status = 'active'`` (inner join attaches dimensions / scopes output).
 
-Legacy parity (pre-2026-07-01)
-------------------------------
+Legacy parity (and the Social-Media divergence)
+-----------------------------------------------
 The new pipeline reproduces legacy ``[IO] Normalized Occupancy Dataset.sql``
-byte-for-byte for dates BEFORE the ``SOCIAL_MEDIA_OCCUPANCY_CUTOVER``
-(2026-07-01), including the legacy Social-Media omission:
+byte-for-byte (including legacy's bugs) per the project's legacy-parity decision,
+**with one deliberate, documented exception: Social-Media occupancy.**
 
 * Legacy excluded ``agent_dime_squad = 'social'`` DIME slots AND had no Sprinklr
-  ``sm_jobs`` source (its ``jobs_join`` was shuffle ∪ oos only). So before the
-  cutover we (a) DROP ``agent_dime_squad = 'social'`` DIME slots and (b) SKIP the
-  ``sm_jobs`` union; from the cutover on we keep ``social`` and union ``sm_jobs``
-  so Social-Media occupancy turns on. This mirrors the
-  ``shift_attribution.NIGHT_SHIFT_CUTOVER`` / adherence phantom cutover handling.
+  ``sm_jobs`` source (its ``jobs_join`` was shuffle ∪ oos only), so legacy
+  produced NO Social-Media occupancy. The data owner has since confirmed that
+  Social-Media Normalized Occupancy data genuinely EXISTS for the whole history,
+  sourced from Sprinklr ``sm_jobs``. We therefore KEEP ``agent_dime_squad =
+  'social'`` DIME slots and union ``sm_jobs`` on ALL dates, turning Social-Media
+  occupancy ON for the entire period. This is an intentional divergence from
+  legacy (which had no Sprinklr source), approved as an exception to the
+  byte-for-byte rule — not the night-shift / phantom cutover handling.
+
+* NOTE this is distinct from the night-shift re-attribution, which still uses its
+  own ``shift_attribution.NIGHT_SHIFT_CUTOVER`` (untouched).
 
 The two **fixed** DIME filters (meeting/leave ``dimensioned_activity`` drop and
-the wfm/credit_evolution/dote DIME-squad drop) apply on ALL dates — only the
-``social`` slice and the ``sm_jobs`` union are cutover-gated.
+the wfm/credit_evolution/dote DIME-squad drop) apply on ALL dates.
 
 Filters deferred to the metrics layer (NOT applied here)
 --------------------------------------------------------
@@ -139,29 +145,18 @@ MEETING_LEAVE_DIMENSIONED_ACTIVITIES: tuple[str, ...] = (
 )
 
 # DIME squads excluded from occupancy — a fixed legacy filter on the DIME
-# `agent_dime_squad` (NOcc dataset line 236: `NOT IN ('wfm', 'credit_evolution',
-# 'dote', 'social')`). NOTE this set INCLUDES `social` — unlike adherence's
-# DIME_SQUAD_EXCLUSIONS (wfm/credit_evolution/dote only). The wfm/credit_evolution/
-# dote drop is unconditional; the `social` drop is cutover-gated (see
-# SOCIAL_DIME_SQUAD / SOCIAL_MEDIA_OCCUPANCY_CUTOVER below).
+# `agent_dime_squad`. Legacy's NOcc dataset (line 236) used
+# `NOT IN ('wfm', 'credit_evolution', 'dote', 'social')`, but we intentionally
+# DROP `social` from this exclusion set: Social-Media occupancy genuinely exists
+# for the whole history (sourced from Sprinklr `sm_jobs`), so `social` DIME slots
+# are kept on ALL dates. This is a documented divergence from legacy (which had
+# no Sprinklr source); see module docstring. The remaining set matches
+# adherence's DIME_SQUAD_EXCLUSIONS (wfm / credit_evolution / dote).
 NOCC_DIME_SQUAD_EXCLUSIONS: tuple[str, ...] = (
     "wfm",
     "credit_evolution",
     "dote",
-    "social",
 )
-
-# The DIME squad that legacy dropped only because it had no Sprinklr source. We
-# keep it from the cutover on (when sm_jobs is also unioned).
-SOCIAL_DIME_SQUAD: str = "social"
-
-# Legacy-parity cutover for Social-Media occupancy. BEFORE this date we
-# reproduce legacy: drop `agent_dime_squad = 'social'` DIME slots and skip the
-# sm_jobs union (legacy had no Sprinklr source). FROM this date on, social slots
-# are kept and sm_jobs is unioned in, turning Social-Media occupancy on. Same
-# 2026-07-01 migration cutover the night-shift re-attribution uses
-# (shift_attribution.NIGHT_SHIFT_CUTOVER).
-SOCIAL_MEDIA_OCCUPANCY_CUTOVER: date = date(2026, 7, 1)
 
 # Shuffle status filter: occupancy counts work the agent ATTEMPTED, not just
 # work that succeeded. So we keep transferred/skipped in addition to
@@ -189,7 +184,7 @@ SLOT_KEYS: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 
 
-def filter_dime(dime: DataFrame, cutover: date = SOCIAL_MEDIA_OCCUPANCY_CUTOVER) -> DataFrame:
+def filter_dime(dime: DataFrame) -> DataFrame:
     """Keep raw slots, apply occupancy's systemic reclassifications, and the
     fixed legacy DIME filters.
 
@@ -198,9 +193,11 @@ def filter_dime(dime: DataFrame, cutover: date = SOCIAL_MEDIA_OCCUPANCY_CUTOVER)
       * ``dimensioned_activity`` in
         :data:`MEETING_LEAVE_DIMENSIONED_ACTIVITIES` (leave/meeting; NULL kept);
       * ``squad`` (the DIME ``agent_dime_squad``) NULL or in
-        :data:`NOCC_DIME_SQUAD_EXCLUSIONS`. The wfm/credit_evolution/dote part is
-        unconditional; the ``social`` part is gated on ``date < cutover``
-        (pre-cutover reproduces legacy, which had no Sprinklr source for social).
+        :data:`NOCC_DIME_SQUAD_EXCLUSIONS` (wfm / credit_evolution / dote). This
+        drop is unconditional on ALL dates. ``social`` DIME slots are KEPT on all
+        dates — Social-Media occupancy is sourced from Sprinklr ``sm_jobs`` and is
+        intentionally ON for the whole history (a documented divergence from
+        legacy; see module docstring).
 
     Then applies two systemic reclassifications (NOT manual adjustments) so the
     job-matching logic is identical to the legacy NOcc dataset:
@@ -223,16 +220,12 @@ def filter_dime(dime: DataFrame, cutover: date = SOCIAL_MEDIA_OCCUPANCY_CUTOVER)
     )
 
     # DIME-squad drop. `squad` here is the DIME `agent_dime_squad`.
-    # wfm/credit_evolution/dote unconditionally; `social` only before the cutover.
-    unconditional = [
-        s for s in NOCC_DIME_SQUAD_EXCLUSIONS if s != SOCIAL_DIME_SQUAD
-    ]
-    is_social = F.col("squad") == F.lit(SOCIAL_DIME_SQUAD)
-    social_excluded = is_social & (F.to_date(F.col("date")) < F.lit(cutover))
+    # wfm/credit_evolution/dote unconditionally (all dates). `social` is kept on
+    # all dates (Sprinklr-sourced Social-Media occupancy, ON for the whole
+    # history — see module docstring).
     out = out.filter(
         F.col("squad").isNotNull()
-        & ~F.col("squad").isin(unconditional)
-        & ~social_excluded
+        & ~F.col("squad").isin(list(NOCC_DIME_SQUAD_EXCLUSIONS))
     )
 
     # Systemic reclassifications → 'oos'.
@@ -329,7 +322,8 @@ def build_jobs_union(
     * SM (Sprinklr ``sm_jobs``): each social case assignment is an occupancy
       interval; synthesize ``activity_type='oos'`` so it matches DIME slots whose
       ``activity_type_required='oos'`` — exactly as the legacy SM notebook treats
-      it. Passed in only from the Social-Media cutover on (see module docstring).
+      it. Unioned in on ALL dates so Social-Media occupancy is populated for the
+      whole history (see module docstring).
 
     Output columns:
         agent STRING, date DATE, activity_type STRING,
@@ -467,27 +461,21 @@ def compute_occupancy_time(
     shuffle_jobs: DataFrame,
     oos_jobs: DataFrame,
     sm_jobs: DataFrame | None = None,
-    cutover: date = SOCIAL_MEDIA_OCCUPANCY_CUTOVER,
 ) -> DataFrame:
     """End-to-end occupancy_time pipeline (raw per-slot occupancy minutes).
 
     ``sm_jobs`` (Sprinklr ``sm_jobs`` extractor) is optional: when provided, the
     Social-Media case assignments are unioned in as ``oos``-typed jobs so social
     agents' occupancy is populated from Sprinklr (they have no shuffle/taskmaster
-    jobs). To reproduce legacy byte-for-byte before the cutover, the union (and
-    the keeping of ``agent_dime_squad = 'social'`` DIME slots) is gated per-slot
-    on ``date >= cutover`` (see ``filter_dime`` / module docstring): pre-cutover
-    rows neither keep social DIME slots nor receive SM occupancy, exactly as
-    legacy did.
+    jobs). ``social`` DIME slots are kept and ``sm_jobs`` is unioned on ALL dates
+    (see ``filter_dime`` / module docstring): Social-Media occupancy is
+    intentionally ON for the whole history, a documented divergence from legacy
+    (which had no Sprinklr source).
     """
     # --- DIME side ----------------------------------------------------------
-    dime_f = filter_dime(dime, cutover=cutover)
+    dime_f = filter_dime(dime)
 
     # --- jobs side ----------------------------------------------------------
-    # sm_jobs only matter for social slots, which are themselves only kept from
-    # the cutover on; the per-slot social gate in filter_dime means a pre-cutover
-    # social SM job can never match a slot, so this is safe to always pass when
-    # provided. Pre-cutover social slots are already dropped.
     jobs = build_jobs_union(shuffle_jobs, oos_jobs, sm_jobs)
 
     # --- per-slot occupancy -------------------------------------------------
@@ -524,7 +512,32 @@ def compute_occupancy_time(
         "squad",
         F.col("squad_district").alias("district"),
         "shift",
+        F.to_date(F.col("snapshot_date")).alias("_snapshot_date"),
         F.trunc(F.to_date(F.col("snapshot_month")), "month").alias("snapshot_month"),
+    )
+
+    # Deduplicate the roster to exactly ONE row per (agent, snapshot_month) BEFORE
+    # the slot join. The content branch of `agent_information` (see
+    # extractors/agent_information.sql `content_monthly`) cross-joins each Google-
+    # Sheet content row against every month, so a content agent who appears on
+    # more than one sheet row (e.g. supporting multiple `target_squad`s) yields
+    # ≥2 rows per (agent, snapshot_month) that are identical on every column this
+    # view selects (only `target_squad`, which occupancy does not use, differs).
+    # Without this dedup the inner join below fans out — every slot is duplicated,
+    # so a 30-min slot sums to 60 min and the per-slot ≤30-min invariant breaks.
+    # Keep the latest snapshot deterministically (recency, then stable tiebreaks).
+    roster_dedup_window = Window.partitionBy("agent", "snapshot_month").orderBy(
+        F.col("_snapshot_date").desc_nulls_last(),
+        F.col("squad").asc_nulls_last(),
+        F.col("district").asc_nulls_last(),
+        F.col("shift").asc_nulls_last(),
+    )
+    roster = (
+        roster.withColumn(
+            "_roster_rn", F.row_number().over(roster_dedup_window)
+        )
+        .filter(F.col("_roster_rn") == 1)
+        .drop("_roster_rn", "_snapshot_date")
     )
 
     enriched = per_slot.withColumn(

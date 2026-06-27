@@ -8,7 +8,9 @@ occupancy_time is a RAW dataset: ``filter_dime`` keeps every slot with a
 non-null ``activity_type_required`` and applies the systemic reclassifications
 (Control MC / xMC Debit Fraud / dime_invalid_notation -> 'oos') plus the fixed
 legacy DIME filters (meeting/leave dimensioned_activity drop and the
-wfm/credit_evolution/dote/social DIME-squad drop — ``social`` cutover-gated).
+wfm/credit_evolution/dote DIME-squad drop). ``social`` DIME slots are KEPT on
+all dates — Social-Media occupancy is sourced from Sprinklr ``sm_jobs`` and is
+intentionally ON for the whole history (a documented divergence from legacy).
 There is no monthly benchmark (it moved to the metrics layer); output is one
 row per slot with ``occupancy_minutes`` and ``required_minutes``.
 """
@@ -28,12 +30,17 @@ from occupancy_time import (
     NOCC_OUT_OF_SCOPE_SQUADS,
     SHUFFLE_OCCUPIED_STATUSES,
     SLOT_DURATION_SECONDS,
-    SOCIAL_MEDIA_OCCUPANCY_CUTOVER,
     build_jobs_union,
     compute_occupancy_time,
     compute_slot_occupancy,
     filter_dime,
 )
+
+# Former Social-Media cutover date (2026-07-01). The SM-occupancy gate was
+# removed (social occupancy is now ON for all dates — Sprinklr-sourced, a
+# documented divergence from legacy), but several tests still exercise a
+# post-July date to confirm social occupancy works there too.
+POST_JULY = dt.date(2026, 7, 1)
 
 # ---------------------------------------------------------------------------
 # Builders for synthetic input frames
@@ -249,21 +256,20 @@ class TestFilterDime:
     def test_drops_null_dime_squad(self, spark):
         assert filter_dime(make_dime(spark, [{"squad": None}])).count() == 0
 
-    def test_drops_social_dime_squad_before_cutover(self, spark):
-        # Pre-cutover (date D is May 2026): social DIME slots reproduce legacy
-        # (which had no Sprinklr source) and are dropped.
-        assert filter_dime(make_dime(spark, [{"squad": "social"}])).count() == 0
+    def test_keeps_social_dime_squad_before_july(self, spark):
+        # Social DIME slots are kept on ALL dates now (date D is May 2026):
+        # Social-Media occupancy is Sprinklr-sourced and intentionally ON for the
+        # whole history — a documented divergence from legacy.
+        assert filter_dime(make_dime(spark, [{"squad": "social"}])).count() == 1
 
-    def test_keeps_social_dime_squad_from_cutover(self, spark):
-        # From 2026-07-01 on, social DIME slots are kept (Social-Media occupancy
-        # turns on alongside the sm_jobs union).
-        out = filter_dime(
-            make_dime(spark, [{"squad": "social", "date": SOCIAL_MEDIA_OCCUPANCY_CUTOVER}])
-        )
+    def test_keeps_social_dime_squad_post_july(self, spark):
+        # Still kept on/after the former cutover date.
+        out = filter_dime(make_dime(spark, [{"squad": "social", "date": POST_JULY}]))
         assert out.count() == 1
 
-    def test_social_in_exclusion_constant(self, spark):
-        assert "social" in NOCC_DIME_SQUAD_EXCLUSIONS
+    def test_social_not_in_exclusion_constant(self, spark):
+        # social was intentionally removed from the NOcc DIME-squad exclusions.
+        assert "social" not in NOCC_DIME_SQUAD_EXCLUSIONS
 
     @pytest.mark.parametrize("dim_act", list(DIMENSIONED_ACTIVITY_TO_OOS))
     def test_systemic_fraud_reclassification(self, spark, dim_act):
@@ -570,11 +576,11 @@ class TestComputeOccupancyTime:
         assert len(out) == 1
         assert out[0]["occupancy_minutes"] == 0.0
 
-    def test_sm_jobs_populate_social_occupancy_from_cutover(self, spark):
-        # From 2026-07-01: social agent with an 'oos' DIME slot (DIME squad
-        # 'social' now kept) and no shuffle/taskmaster jobs gets occupancy from
+    def test_sm_jobs_populate_social_occupancy_post_july(self, spark):
+        # On/after the former cutover: social agent with an 'oos' DIME slot (DIME
+        # squad 'social' kept) and no shuffle/taskmaster jobs gets occupancy from
         # the Sprinklr SM case (10 min overlap).
-        cut = SOCIAL_MEDIA_OCCUPANCY_CUTOVER
+        cut = POST_JULY
         u = int(dt.datetime(cut.year, cut.month, cut.day, 6, 0, 0, tzinfo=dt.timezone.utc).timestamp())
         roster = make_roster(
             spark,
@@ -604,15 +610,33 @@ class TestComputeOccupancyTime:
         assert out[0]["squad"] == "social"
         assert out[0]["occupancy_minutes"] == 600 / 60.0
 
-    def test_social_slot_dropped_before_cutover(self, spark):
-        # Pre-cutover: social DIME slots reproduce legacy (dropped), so even with
-        # SM jobs there is no row.
+    def test_sm_jobs_populate_social_occupancy_before_july(self, spark):
+        # Social-Media occupancy is now ON for all dates (Sprinklr source). Even
+        # pre-July (date D is May 2026), a social DIME slot is KEPT and the SM
+        # case populates its occupancy — a documented divergence from legacy,
+        # which dropped social slots and had no Sprinklr source.
+        u = SLOT_BASE
         roster = make_roster(spark, [{"squad": "social", "team": "social media"}])
-        dime = make_dime(spark, [{"squad": "social", "activity_type_required": "oos"}])
-        out = compute_occupancy_time(
-            roster, dime, empty_shuffle(spark), empty_oos(spark), make_sm(spark, [{}])
+        dime = make_dime(
+            spark,
+            [
+                {
+                    "squad": "social",
+                    "activity_type_required": "oos",
+                    "slot_start_local_unix": u,
+                    "slot_end_local_unix": u + SLOT_DURATION_SECONDS,
+                }
+            ],
         )
-        assert out.count() == 0
+        sm = make_sm(
+            spark, [{"activity_start_unix": u, "activity_end_unix": u + 600}]
+        )
+        out = compute_occupancy_time(
+            roster, dime, empty_shuffle(spark), empty_oos(spark), sm
+        ).collect()
+        assert len(out) == 1
+        assert out[0]["squad"] == "social"
+        assert out[0]["occupancy_minutes"] == 600 / 60.0
 
     def test_handles_empty_inputs(self, spark):
         empty_dime = spark.createDataFrame([], _DIME_SCHEMA)
@@ -633,6 +657,38 @@ class TestComputeOccupancyTime:
         out = compute_occupancy_time(roster, dime, shuffle, oos).collect()
         assert len(out) == 1
         assert out[0]["squad"] == "correct-may"
+
+    def test_duplicate_roster_rows_do_not_fan_out_slots(self, spark):
+        # Content/enablement agents get ≥2 rows per (agent, snapshot_month) from
+        # agent_information's content branch (cross-join of multiple Google-Sheet
+        # rows against every month, differing only in target_squad). Those rows
+        # are identical on every dimension occupancy selects. The roster join must
+        # NOT fan out: one slot must stay one row with occupancy <= 30 min, not
+        # double to 60. The roster is deduped to one row per (agent, month) first.
+        roster = make_roster(
+            spark,
+            [
+                {"agent": "omar.ramirez", "squad": "content", "team": "content"},
+                {"agent": "omar.ramirez", "squad": "content", "team": "content"},
+            ],
+        )
+        dime = make_dime(spark, [{"agent": "omar.ramirez"}])
+        shuffle = make_shuffle(
+            spark,
+            [
+                {
+                    "agent": "omar.ramirez",
+                    "activity_start_unix": SLOT_BASE,
+                    "activity_end_unix": SLOT_BASE + 600,
+                }
+            ],
+        )
+        out = compute_occupancy_time(roster, dime, shuffle, empty_oos(spark)).collect()
+        # Exactly one row per slot (no doubling), occupancy is the single 10-min
+        # value (600 / 60), not 20, and never exceeds the 30-min slot.
+        assert len(out) == 1
+        assert out[0]["occupancy_minutes"] == 600 / 60.0
+        assert out[0]["occupancy_minutes"] <= SLOT_DURATION_SECONDS / 60.0
 
 
 def test_out_of_scope_squads_constant_is_empty():

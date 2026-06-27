@@ -56,11 +56,12 @@ NOT applied here (future Adjustments layer)
 Note on the fixed DIME filters
 ------------------------------
 Legacy's ``dimensioned_activity`` meeting/leave carve-out and the DIME-squad
-exclusion (wfm / credit_evolution / dote / social) are applied **upstream** as
-fixed DIME filters in the raw layer (``metrics_data/occupancy_time.py`` →
-``filter_dime``), so — unlike before — they DO already constrain both the agent
-occupancy and the peer benchmark here. The ``social`` slice is cutover-gated at
-2026-07-01 in the raw layer.
+exclusion (wfm / credit_evolution / dote) are applied **upstream** as fixed DIME
+filters in the raw layer (``metrics_data/occupancy_time.py`` → ``filter_dime``),
+so — unlike before — they DO already constrain both the agent occupancy and the
+peer benchmark here. ``social`` DIME slots are KEPT on all dates: Social-Media
+occupancy is Sprinklr-sourced (``sm_jobs``) and intentionally ON for the whole
+history, a documented divergence from legacy (see the raw layer's docstring).
 
 Output — tidy long format, one row per (agent, date_reference, granularity)
 ---------------------------------------------------------------------------
