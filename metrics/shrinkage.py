@@ -111,6 +111,33 @@ SHRINKAGE_EXCLUDED_ACTIVITY_TYPES: tuple[str, ...] = ("lunch_break",)
 PRE_CUTOVER_NON_REQUIRED_ACTIVITY = "dime_invalid_notation"
 POST_CUTOVER_NON_REQUIRED_ACTIVITY = "time_off"
 
+# Org-wide outage rows (``descripcion = 'Fallas Generales'``) live in the shared
+# ``exclusiones_generales`` tab and legitimately drop whole-team slots for
+# Adherence / Normalized Occupancy (legacy excluded those outage days for both).
+# Legacy *shrinkage* has NO outage carve-out (``[IO] Shrinkage Dataset.sql`` has
+# no 2026-03-27 / 04-09 org-wide drop), so to stay byte-for-byte we must NOT apply
+# these rows to shrinkage. All other general-exclusion rows — the CNVB
+# day-controls (legacy hardcode, lines 294-295) and the 2026-03-10 Core-wide
+# standardization — are retained. Matched case-insensitively on ``descripcion``.
+SHRINKAGE_SKIP_GENERAL_EXCLUSION_DESCRIPTIONS: tuple[str, ...] = ("fallas generales",)
+
+
+def _drop_outage_exclusions(
+    general_exclusions: DataFrame | None,
+) -> DataFrame | None:
+    """Remove org-wide outage rows from the general-exclusion windows.
+
+    Shrinkage must not apply the shared ``exclusiones_generales`` outage rows
+    (``descripcion = 'Fallas Generales'``): legacy shrinkage had no outage
+    carve-out, while Adherence / Normalized Occupancy do drop those days. See
+    ``parity.md`` (Shrinkage) and ``SHRINKAGE_SKIP_GENERAL_EXCLUSION_DESCRIPTIONS``.
+    """
+    if general_exclusions is None or "descripcion" not in general_exclusions.columns:
+        return general_exclusions
+    skip = [s.lower() for s in SHRINKAGE_SKIP_GENERAL_EXCLUSION_DESCRIPTIONS]
+    desc = F.lower(F.trim(F.col("descripcion")))
+    return general_exclusions.filter(desc.isNull() | ~desc.isin(skip))
+
 
 def compute_shrinkage(
     shrinkage_slots: DataFrame,
@@ -138,6 +165,7 @@ def compute_shrinkage(
     spark = shrinkage_slots.sparkSession
 
     work = reclassify_dime_slots(shrinkage_slots, dime_inconsistencies)
+    general_exclusions = _drop_outage_exclusions(general_exclusions)
     work = drop_slot_windows(work, general_exclusions, training, shadowing)
     work = apply_no_shrinkage(work, no_shrinkage)
 

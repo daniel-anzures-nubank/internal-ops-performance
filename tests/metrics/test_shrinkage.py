@@ -301,6 +301,49 @@ class TestAdjustments:
         assert row["denominator"] == 1.0
         assert row["metric_value"] == 100.0
 
+    def test_outage_general_exclusion_does_not_apply_to_shrinkage(self, spark):
+        # Org-wide outage rows (descripcion='Fallas Generales') live in the shared
+        # exclusiones_generales tab and drop whole-team slots for Adherence /
+        # Normalized Occupancy, but legacy shrinkage had NO outage carve-out — so
+        # shrinkage must NOT drop them. The 09:00 shrinkage slot must survive.
+        raw = make_raw(
+            spark,
+            [
+                {"slot_time": "09:00:00", "activity_type_required": "shrinkage", "shrinkage_flag": 1},
+                {"slot_time": "09:30:00", "activity_type_required": "available"},
+            ],
+        )
+        schema = T.StructType(
+            [
+                T.StructField("agente", T.StringType()),
+                T.StructField("equipo", T.StringType()),
+                T.StructField("fecha_inicio", T.StringType()),
+                T.StructField("fecha_fin", T.StringType()),
+                T.StructField("hora_inicio", T.StringType()),
+                T.StructField("hora_fin", T.StringType()),
+                T.StructField("etiqueta_correcta", T.StringType()),
+                T.StructField("descripcion", T.StringType()),
+            ]
+        )
+        outage = spark.createDataFrame(
+            [("Todos", "Todos", "2026-05-04", "2026-05-04", "00:00", "23:59", None, "Fallas Generales")],
+            schema,
+        )
+        # Outage row is ignored -> both slots remain -> 1/2 = 50%.
+        row = _one(compute_shrinkage(raw, general_exclusions=outage))
+        assert row["numerator"] == 1.0
+        assert row["denominator"] == 2.0
+        assert row["metric_value"] == 50.0
+
+        # A non-outage general-exclusion row (e.g. CNVB audit) still drops the slot.
+        cnvb = spark.createDataFrame(
+            [("Todos", "Todos", "2026-05-04", "2026-05-04", "09:00", "09:30", None, "Auditorías CNVB")],
+            schema,
+        )
+        dropped = _one(compute_shrinkage(raw, general_exclusions=cnvb))
+        assert dropped["numerator"] == 0.0
+        assert dropped["denominator"] == 1.0
+
     def test_apply_no_shrinkage_keeps_required_clears_numerator(self, spark):
         # No Shrinkage keeps the slot in the required base but clears the
         # shrinkage numerator flag. A 09:00 shrinkage slot becomes 0 numerator
