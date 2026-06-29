@@ -4,33 +4,36 @@ Metrics-layer script. Thin orchestrator — the math lives in
 ``metrics/shrinkage.py`` and is covered by ``tests/metrics/test_shrinkage.py``.
 Here we only:
 
-  1. Open a Databricks SQL connection (shared `db.open_connection`).
+  1. Get the ambient SparkSession (shared ``db.open_connection``).
   2. Read the raw input table ``io_shrinkage_slots_raw`` for the period
-     (via `db.read_table` — the metrics layer reads the already-built
-     `io_*_raw` tables).
+     (via ``db.read_table`` — the metrics layer reads the already-built
+     ``io_*_raw`` tables).
   3. Call ``compute_shrinkage`` (agent grain) and ``compute_shrinkage_rollups``
-     (XForce + XPLead slot-weighted roll-ups) and concat them at all
+     (XForce + XPLead slot-weighted roll-ups) and union them at all
      granularities.
-  4. Either print a summary (`--dry-run`) or replace the target Delta table.
+  4. Either print a summary (``--dry-run``) or replace the target Delta table.
 
 Tables
 ------
-* Input:  ``usr.danielanzures.io_shrinkage_slots_raw`` (override `--source`).
-* Output: ``usr.danielanzures.io_shrinkage_metric`` (override `--target`).
+* Input:  ``usr.danielanzures.io_shrinkage_slots_raw`` (override ``--source``).
+* Output: ``usr.danielanzures.io_shrinkage_metric`` (override ``--target``).
 
 Manual adjustments
 ------------------
-None applied here (no adjustments layer yet) — see `metrics/shrinkage.py` for
-the list of legacy carve-outs deferred to the future Adjustments layer.
+The shrinkage adjustment tabs are read from their synced ``adj_*`` Delta tables,
+if present, and applied in ``compute_shrinkage`` (see ``metrics/shrinkage.py``):
+``exclusiones_generales`` / ``training`` / ``shadowing`` (slot-window drops),
+``inconsistencias_dime`` (relabels), ``no_shrinkage`` (clear-numerator-keep-
+required).
 
 Usage
 -----
-::
+Runs on a Databricks cluster (``spark-submit`` / a Databricks job task)::
 
-    uv run python scripts/metrics_scripts/build_shrinkage.py \\
+    python scripts/metrics_scripts/build_shrinkage.py \\
         --period-start 2026-05-01 --period-end 2026-05-24 --dry-run
 
-    uv run python scripts/metrics_scripts/build_shrinkage.py \\
+    python scripts/metrics_scripts/build_shrinkage.py \\
         --period-start 2026-01-01 --period-end 2026-05-24
 """
 
@@ -43,11 +46,30 @@ import time
 from datetime import date
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Locate the repo root (contains `db.py` + `extractors/`) so the sibling
+# top-level modules import. We can't rely on `__file__`: Databricks runs a
+# git-sourced `spark_python_task` via `exec()` with no `__file__` set, so we
+# search upward from every path we can discover (file, argv, cwd).
+def _repo_root() -> Path:
+    starts: list[Path] = []
+    try:
+        starts.append(Path(__file__).resolve())
+    except NameError:
+        pass
+    if sys.argv and sys.argv[0]:
+        starts.append(Path(sys.argv[0]).resolve())
+    starts.append(Path.cwd().resolve())
+    for start in starts:
+        for cand in (start, *start.parents):
+            if (cand / "db.py").is_file() and (cand / "extractors").is_dir():
+                return cand
+    return Path.cwd()
+
+
+REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics"))
-
-import pandas as pd  # noqa: E402
 
 from db import open_connection, read_table, publish  # noqa: E402
 from metric_utils import GRANULARITIES  # noqa: E402
@@ -56,7 +78,7 @@ from shrinkage import (  # noqa: E402
     compute_shrinkage,
     compute_shrinkage_rollups,
 )
-from adjustments.manual import read_adjustment_csv  # noqa: E402
+from adjustments.manual import read_adjustment_table  # noqa: E402
 
 LOGGER = logging.getLogger("cx_metrics.shrinkage")
 
@@ -124,78 +146,91 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
-    conn = open_connection()
-    try:
-        with _log_step(f"read {args.source}"):
-            shrinkage_slots = read_table(
-                conn, args.source, args.period_start, args.period_end
-            )
-            LOGGER.info("  %s raw slot rows", f"{len(shrinkage_slots):,}")
+    spark = open_connection()
 
-        with _log_step("compute_shrinkage"):
-            agent = compute_shrinkage(
-                shrinkage_slots,
-                general_exclusions=read_adjustment_csv("exclusiones_generales"),
-                dime_inconsistencies=read_adjustment_csv("inconsistencias_dime"),
-                training=read_adjustment_csv("training"),
-                shadowing=read_adjustment_csv("shadowing"),
-                no_shrinkage=read_adjustment_csv("no_shrinkage"),
-            )
-            rollups = compute_shrinkage_rollups(agent)
-            result = pd.concat([agent, rollups], ignore_index=True)
-            LOGGER.info(
-                "  %s metric rows (%s agent + %s roll-up)",
-                f"{len(result):,}", f"{len(agent):,}", f"{len(rollups):,}",
-            )
+    with _log_step(f"read {args.source}"):
+        shrinkage_slots = read_table(
+            spark, args.source, args.period_start, args.period_end
+        )
 
-        expected_cols = [c for c, _ in IO_SHRINKAGE_METRIC_SCHEMA]
-        result = result[expected_cols]
+    with _log_step("compute_shrinkage"):
+        agent = compute_shrinkage(
+            shrinkage_slots,
+            general_exclusions=read_adjustment_table(spark, "exclusiones_generales"),
+            dime_inconsistencies=read_adjustment_table(spark, "inconsistencias_dime"),
+            training=read_adjustment_table(spark, "training"),
+            shadowing=read_adjustment_table(spark, "shadowing"),
+            no_shrinkage=read_adjustment_table(spark, "no_shrinkage"),
+        )
+        rollups = compute_shrinkage_rollups(agent)
+        result = agent.unionByName(rollups)
 
-        if args.dry_run:
-            LOGGER.info("Dry run — not writing. Summary:")
-            print()
-            for g in GRANULARITIES:
-                sub = result[result["date_granularity"] == g]
-                ag = sub[sub["metric"] == "shrinkage"]
-                print(f"{g:>9}: {len(sub):,} rows, {ag['agent'].nunique():,} agents")
-            print("\nRows by metric: " + ", ".join(
-                f"{name}={cnt:,}"
-                for name, cnt in result["metric"].value_counts().items()
-            ))
-            print(f"Agents: {result['agent'].nunique():,}   "
-                  f"Teams: {', '.join(sorted(result['team'].dropna().unique()))}")
-            if not result.empty:
-                mv = result["metric_value"].dropna()
-                print(f"metric_value (%): min={mv.min():.1f}  "
-                      f"max={mv.max():.1f}  mean={mv.mean():.1f}")
-            print("\nHead (day grain):")
+    if args.dry_run:
+        from pyspark.sql import functions as F
+
+        result = result.persist()
+        LOGGER.info("Dry run — not writing. Summary:")
+        print()
+        by_gran = {
+            r["date_granularity"]: (r["rows"], r["agents"])
+            for r in result.filter(F.col("metric") == "shrinkage")
+            .groupBy("date_granularity")
+            .agg(
+                F.count(F.lit(1)).alias("rows"),
+                F.countDistinct("agent").alias("agents"),
+            )
+            .collect()
+        }
+        for g in GRANULARITIES:
+            rows, agents = by_gran.get(g, (0, 0))
+            print(f"{g:>9}: {rows:,} agent rows, {agents:,} agents")
+        print("\nRows by metric: " + ", ".join(
+            f"{r['metric']}={r['cnt']:,}"
+            for r in result.groupBy("metric")
+            .agg(F.count(F.lit(1)).alias("cnt"))
+            .orderBy("metric")
+            .collect()
+        ))
+        teams = sorted(
+            r["team"]
+            for r in result.select("team").distinct().collect()
+            if r["team"] is not None
+        )
+        stats = result.agg(
+            F.countDistinct("agent").alias("agents"),
+            F.min("metric_value").alias("mv_min"),
+            F.max("metric_value").alias("mv_max"),
+            F.avg("metric_value").alias("mv_mean"),
+        ).collect()[0]
+        print(f"Agents: {stats['agents']:,}   Teams: {', '.join(teams)}")
+        if stats["mv_min"] is not None:
             print(
-                result[result["date_granularity"] == "day"]
-                .head(10)
-                .to_string(index=False)
+                f"metric_value (%): min={stats['mv_min']:.1f}  "
+                f"max={stats['mv_max']:.1f}  mean={stats['mv_mean']:.1f}"
             )
-            return 0
+        print("\nHead (day grain):")
+        result.filter(F.col("date_granularity") == "day").show(10, truncate=False)
+        result.unpersist()
+        return 0
 
-        with _log_step(f"write {args.target}"):
-            run = publish(
-                conn,
-                result,
-                args.target,
-                IO_SHRINKAGE_METRIC_SCHEMA,
-                layer="metrics",
-                period_start=args.period_start,
-                period_end=args.period_end,
-                run_id=args.run_id,
-                snapshot=not args.no_snapshot,
-            )
-            LOGGER.info(
-                "  wrote %s rows to %s (run_id=%s)",
-                f"{run.row_count:,}", args.target, run.run_id,
-            )
-            if run.snapshot_table:
-                LOGGER.info("  snapshot -> %s", run.snapshot_table)
-    finally:
-        conn.close()
+    with _log_step(f"write {args.target}"):
+        run = publish(
+            spark,
+            result,
+            args.target,
+            IO_SHRINKAGE_METRIC_SCHEMA,
+            layer="metrics",
+            period_start=args.period_start,
+            period_end=args.period_end,
+            run_id=args.run_id,
+            snapshot=not args.no_snapshot,
+        )
+        LOGGER.info(
+            "  wrote %s rows to %s (run_id=%s)",
+            f"{run.row_count:,}", args.target, run.run_id,
+        )
+        if run.snapshot_table:
+            LOGGER.info("  snapshot -> %s", run.snapshot_table)
 
     return 0
 

@@ -1,4 +1,4 @@
-"""shrinkage — the Shrinkage performance metric (Core / Fraud / Social Media / Content).
+"""shrinkage — the Shrinkage performance metric (Core / Fraud, PySpark).
 
 Part of the **metrics layer**: consumes the raw ``io_shrinkage_slots_raw`` table
 (one row per DIME slot, already flagged for shrinkage) and produces a finished,
@@ -9,17 +9,32 @@ non-productive activities:
 
     shrinkage = SUM(shrinkage_flag) / SUM(required_slot)
 
-over the agent's required slots for the period. **Target ≤ 20%.** Same
+over the agent's required slots for the period. **Target <= 20%.** Same
 definition for all teams (see ``docs/metrics_definitions.md``).
 
 The numerator (``shrinkage_flag``) is computed by the raw layer (the pre/post-
 2026-03-01 slot-level rule). This module only applies the **denominator**
-("required slot") rule that the raw layer deferred.
+("required slot") rule that the raw layer deferred, then the manual adjustments.
+
+Adjustment order (matches legacy intent)
+----------------------------------------
+1. ``reclassify_dime_slots`` (``Inconsistencias DIME``): relabel a slot's
+   ``activity_type_required`` and (re)derive ``shrinkage_flag`` from the new
+   label BEFORE the required/numerator counting.
+2. ``drop_slot_windows`` (``Exclusiones Generales`` + ``Training`` +
+   ``Shadowing``): remove matched (agent, date, time-window) slots from BOTH the
+   numerator and denominator — legacy's ``manual_adjustments_shrinkage.exclude``
+   and the ``jose.velez`` et al. day carve-out.
+3. ``apply_no_shrinkage`` (``No Shrinkage``): keep the slot in the required base
+   but clear the shrinkage numerator flags — legacy's ``not_shrinkage`` /
+   vacation-keeps-required carve-out.
+4. Drop ``lunch_break`` (never counted on either side — legacy ``shrinkage_base``
+   line 248).
+5. Apply the era-gated required-slot denominator rule.
 
 Denominator rule (legacy ``required_slot``, applied here)
 ---------------------------------------------------------
-* ``lunch_break`` slots never count (numerator or denominator) — legacy
-  ``shrinkage_base`` drops them up front.
+* ``lunch_break`` slots never count (numerator or denominator).
 * A slot is a *required* slot unless, by era, its ``activity_type_required`` is:
     - **pre-cutover** (``date < 2026-03-01``): ``dime_invalid_notation``
     - **post-cutover** (``date >= 2026-03-01``): ``time_off``
@@ -32,16 +47,22 @@ Input
 -----
 The ``io_shrinkage_slots_raw`` table (one row per DIME slot), via
 ``metrics_data/shrinkage_slots.py`` / ``read_table``. Required columns:
-``agent, xforce, xplead, team, squad, district, shift, date,
+``agent, xforce, xplead, team, squad, district, shift, date, slot_time,
 activity_type_required, shrinkage_flag``.
 
-NOT applied here (future Adjustments layer — keeps this a clean baseline)
-------------------------------------------------------------------------
-* Per-agent maternity / vacation reclassifications (e.g. maria.reyes, the
-  hardcoded vacation dates) that legacy folds into ``shrinkage_slot``.
-* Training / shadowing slot exclusions and outage-date carve-outs.
-* Legacy DIME-squad business exclusions (``wfm`` / ``enablement`` / …); note
-  ``quality`` and ``planning`` are already excluded upstream by the extractors.
+Note on the fixed DIME filters
+------------------------------
+Legacy's DIME-squad business exclusion (``content`` / ``planning`` / ``quality``
+/ ``social`` / ``wfm`` / ``enablement``) is applied **upstream** as a fixed DIME
+filter in the raw layer (``metrics_data/shrinkage_slots.py`` → ``filter_dime``),
+so it already constrains BOTH the shrinkage numerator and the required
+denominator here — there is no separate roster-squad filter at this layer.
+
+NOT applied here (deferred — none currently)
+--------------------------------------------
+All the per-agent maternity / vacation / training / shadowing / outage carve-outs
+are wired through the adjustment helpers above; for pre-2026-07-01 byte-for-byte
+parity those ``adj_*`` tables must be populated to match legacy exactly.
 
 Output — one row per (agent, date_reference, granularity)
 ---------------------------------------------------------
@@ -57,15 +78,15 @@ Roll-ups (``compute_shrinkage_rollups``)
 SOT also reports Shrinkage at the **XForce** and **XPLead** levels, so the build
 script additionally emits ``shrinkage_xforce`` (per ``team, xforce, xplead``) and
 ``shrinkage_xplead`` (per ``team, xplead``; ``xforce`` NULL) into the same table.
-Both are **slot-weighted** (sum the agent numerator/denominator, then divide) —
-identical to legacy and to the shrinkage component of ``xforce_index``.
+Both are **slot-weighted** (sum the agent numerator/denominator, then divide).
 """
 
 from __future__ import annotations
 
 from datetime import date
 
-import pandas as pd
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
 from metric_utils import METRIC_COLUMNS, aggregate_long, empty_metric_frame
 from adjustments.manual import (
@@ -92,49 +113,48 @@ POST_CUTOVER_NON_REQUIRED_ACTIVITY = "time_off"
 
 
 def compute_shrinkage(
-    shrinkage_slots: pd.DataFrame,
+    shrinkage_slots: DataFrame,
     *,
-    general_exclusions: pd.DataFrame | None = None,
-    dime_inconsistencies: pd.DataFrame | None = None,
-    training: pd.DataFrame | None = None,
-    shadowing: pd.DataFrame | None = None,
-    no_shrinkage: pd.DataFrame | None = None,
-) -> pd.DataFrame:
+    general_exclusions: DataFrame | None = None,
+    dime_inconsistencies: DataFrame | None = None,
+    training: DataFrame | None = None,
+    shadowing: DataFrame | None = None,
+    no_shrinkage: DataFrame | None = None,
+) -> DataFrame:
     """Compute the Shrinkage metric at all granularities.
 
     Args:
         shrinkage_slots: the ``io_shrinkage_slots_raw`` table (one row per slot).
+        general_exclusions / training / shadowing: ``adj_*`` slot windows to drop
+            from both numerator and denominator (``None`` to skip).
+        dime_inconsistencies: ``adj_inconsistencias_dime`` slot relabels
+            (``None`` to skip).
+        no_shrinkage: ``adj_no_shrinkage`` windows that keep the required slot but
+            clear the shrinkage flags (``None`` to skip).
 
     Returns:
         Tidy long-format metric rows (see module docstring / schema).
     """
-    if shrinkage_slots.empty:
-        return empty_metric_frame()
+    spark = shrinkage_slots.sparkSession
 
     work = reclassify_dime_slots(shrinkage_slots, dime_inconsistencies)
     work = drop_slot_windows(work, general_exclusions, training, shadowing)
     work = apply_no_shrinkage(work, no_shrinkage)
-    act = work["activity_type_required"].astype("string").str.lower()
+
+    act = F.lower(F.col("activity_type_required"))
 
     # Drop lunch_break (never counted on either side).
-    work = work.loc[~act.isin(SHRINKAGE_EXCLUDED_ACTIVITY_TYPES)].copy()
-    if work.empty:
-        return empty_metric_frame()
+    work = work.filter(~act.isin(list(SHRINKAGE_EXCLUDED_ACTIVITY_TYPES)))
 
-    act = work["activity_type_required"].astype("string").str.lower()
+    cal = F.to_date(F.col("date"))
+    is_post_cutover = cal >= F.lit(SHRINKAGE_FORMULA_CUTOVER)
+    non_required = F.when(
+        is_post_cutover, F.lit(POST_CUTOVER_NON_REQUIRED_ACTIVITY)
+    ).otherwise(F.lit(PRE_CUTOVER_NON_REQUIRED_ACTIVITY))
 
-    if pd.api.types.is_datetime64_any_dtype(work["date"]):
-        slot_date = work["date"].dt.date
-    else:
-        slot_date = pd.to_datetime(work["date"]).dt.date
-    is_post_cutover = slot_date >= SHRINKAGE_FORMULA_CUTOVER
-
-    non_required = pd.Series(POST_CUTOVER_NON_REQUIRED_ACTIVITY, index=work.index)
-    non_required = non_required.where(
-        is_post_cutover, PRE_CUTOVER_NON_REQUIRED_ACTIVITY
-    )
-    work["required_slot_flag"] = (act != non_required).astype("int64")
-    work["shrinkage_flag"] = work["shrinkage_flag"].astype("int64")
+    work = work.withColumn(
+        "required_slot_flag", (act != non_required).cast("int")
+    ).withColumn("shrinkage_flag", F.col("shrinkage_flag").cast("int"))
 
     return aggregate_long(
         work,
@@ -144,7 +164,7 @@ def compute_shrinkage(
     )
 
 
-def _rollup(agent_metric: pd.DataFrame, *, level: str) -> pd.DataFrame:
+def _rollup(agent_metric: DataFrame, *, level: str) -> DataFrame:
     """Slot-weighted shrinkage roll-up of the agent metric to ``level``.
 
     The roll-up is **slot-weighted** (sum the agent numerator/denominator, then
@@ -161,31 +181,34 @@ def _rollup(agent_metric: pd.DataFrame, *, level: str) -> pd.DataFrame:
     else:  # pragma: no cover - guarded by caller
         raise ValueError(f"unknown level: {level!r}")
 
-    agg = (
-        agent_metric.groupby(keys, as_index=False, dropna=False)
-        .agg(numerator=("numerator", "sum"), denominator=("denominator", "sum"))
+    agg = agent_metric.groupBy(*keys).agg(
+        F.sum("numerator").alias("numerator"),
+        F.sum("denominator").alias("denominator"),
     )
 
-    out = pd.DataFrame(index=agg.index)
-    out["agent"] = None
-    out["xforce"] = agg["xforce"].values if level == "xforce" else None
-    out["xplead"] = agg["xplead"].values
-    out["team"] = agg["team"].values
-    out["squad"] = None
-    out["district"] = None
-    out["shift"] = None
-    out["date_reference"] = agg["date_reference"].values
-    out["date_granularity"] = agg["date_granularity"].values
-    out["metric"] = metric_name
-    num = pd.to_numeric(agg["numerator"], errors="coerce")
-    den = pd.to_numeric(agg["denominator"], errors="coerce")
-    out["numerator"] = num.values
-    out["denominator"] = den.values
-    out["metric_value"] = (num / den).where(den > 0).values * 100
-    return out[list(METRIC_COLUMNS)]
+    out = (
+        agg.withColumn("agent", F.lit(None).cast("string"))
+        .withColumn(
+            "xforce",
+            F.col("xforce") if level == "xforce" else F.lit(None).cast("string"),
+        )
+        .withColumn("squad", F.lit(None).cast("string"))
+        .withColumn("district", F.lit(None).cast("string"))
+        .withColumn("shift", F.lit(None).cast("string"))
+        .withColumn("metric", F.lit(metric_name))
+        .withColumn(
+            "metric_value",
+            F.when(
+                F.col("denominator") > 0,
+                F.col("numerator") / F.col("denominator") * F.lit(100.0),
+            ).otherwise(F.lit(None).cast("double")),
+        )
+        .select(*METRIC_COLUMNS)
+    )
+    return out
 
 
-def compute_shrinkage_rollups(agent_metric: pd.DataFrame) -> pd.DataFrame:
+def compute_shrinkage_rollups(agent_metric: DataFrame) -> DataFrame:
     """XForce + XPLead slot-weighted roll-ups of the agent shrinkage metric.
 
     Args:
@@ -196,19 +219,20 @@ def compute_shrinkage_rollups(agent_metric: pd.DataFrame) -> pd.DataFrame:
         ``shrinkage_xforce`` and ``shrinkage_xplead`` rows (``agent`` NULL;
         ``xforce`` NULL on the XPLead rows), all granularities.
     """
-    if agent_metric is None or agent_metric.empty:
-        return empty_metric_frame()
-    work = agent_metric[agent_metric["metric"] == METRIC_NAME].copy()
-    if work.empty:
-        return empty_metric_frame()
-    rolled = pd.concat(
-        [_rollup(work, level="xforce"), _rollup(work, level="xplead")],
-        ignore_index=True,
+    spark = agent_metric.sparkSession
+    work = agent_metric.filter(F.col("metric") == F.lit(METRIC_NAME))
+    rolled = _rollup(work, level="xforce").unionByName(
+        _rollup(work, level="xplead")
     )
-    return rolled.sort_values(
-        ["date_granularity", "date_reference", "team", "metric", "xplead"],
-        na_position="last",
-    ).reset_index(drop=True)
+    if rolled.rdd.isEmpty():
+        return empty_metric_frame(spark)
+    return rolled.orderBy(
+        "date_granularity",
+        "date_reference",
+        "team",
+        "metric",
+        F.col("xplead").asc_nulls_last(),
+    )
 
 
 IO_SHRINKAGE_METRIC_SCHEMA: tuple[tuple[str, str], ...] = (
