@@ -3,32 +3,36 @@
 Metrics-layer script. Thin orchestrator — the math lives in ``metrics/ntpj.py``
 and is covered by ``tests/metrics/test_ntpj.py``. Here we only:
 
-  1. Open a Databricks SQL connection (shared `db.open_connection`).
+  1. Get the ambient SparkSession (shared ``db.open_connection``).
   2. Read the raw input table ``io_jobs_raw`` for the period **plus a 4-month
      benchmark look-back** (NTPJ's monthly benchmark can use a trailing window;
-     see `metrics/ntpj.py`). The look-back rows are used only to build
+     see ``metrics/ntpj.py``). The look-back rows are used only to build
      benchmarks — they are not emitted.
-  3. Call ``compute_ntpj`` to get day/week/month metric rows for the period.
-  4. Either print a summary (`--dry-run`) or replace the target Delta table.
+  3. Call ``compute_ntpj`` to get the day/week/month/quarter/semester/year
+     metric rows for the period.
+  4. Either print a summary (``--dry-run``) or replace the target Delta table.
 
 Tables
 ------
-* Input:  ``usr.danielanzures.io_jobs_raw`` (override `--source`).
-* Output: ``usr.danielanzures.io_ntpj_metric`` (override `--target`).
+* Input:  ``usr.danielanzures.io_jobs_raw`` (override ``--source``).
+* Output: ``usr.danielanzures.io_ntpj_metric`` (override ``--target``).
 
 Manual adjustments
 ------------------
-None applied here (no adjustments layer yet) — see `metrics/ntpj.py` for the
-list of legacy cross-support / outage carve-outs deferred to that layer.
+``exclusiones_generales`` (slot/date windows to drop), ``cross_support`` (queue
+exclusions), and ``exclusiones_jobs`` (job exclusions) are read from their synced
+``adj_*`` Delta tables, if present, and applied inside ``compute_ntpj`` BEFORE the
+benchmark groupby (so an excluded job leaves both the benchmark and the
+contribution, matching legacy).
 
 Usage
 -----
-::
+Runs on a Databricks cluster (``spark-submit`` / a Databricks job task)::
 
-    uv run python scripts/metrics_scripts/build_ntpj.py \\
+    python scripts/metrics_scripts/build_ntpj.py \\
         --period-start 2026-05-01 --period-end 2026-05-24 --dry-run
 
-    uv run python scripts/metrics_scripts/build_ntpj.py \\
+    python scripts/metrics_scripts/build_ntpj.py \\
         --period-start 2026-01-01 --period-end 2026-05-24
 """
 
@@ -41,16 +45,35 @@ import time
 from datetime import date
 from pathlib import Path
 
-import pandas as pd
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# Locate the repo root (contains `db.py` + `extractors/`) so the sibling
+# top-level modules import. We can't rely on `__file__`: Databricks runs a
+# git-sourced `spark_python_task` via `exec()` with no `__file__` set, so we
+# search upward from every path we can discover (file, argv, cwd).
+def _repo_root() -> Path:
+    starts: list[Path] = []
+    try:
+        starts.append(Path(__file__).resolve())
+    except NameError:
+        pass
+    if sys.argv and sys.argv[0]:
+        starts.append(Path(sys.argv[0]).resolve())
+    starts.append(Path.cwd().resolve())
+    for start in starts:
+        for cand in (start, *start.parents):
+            if (cand / "db.py").is_file() and (cand / "extractors").is_dir():
+                return cand
+    return Path.cwd()
+
+
+REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics"))
 
 from db import open_connection, read_table, publish  # noqa: E402
 from metric_utils import GRANULARITIES  # noqa: E402
 from ntpj import IO_NTPJ_METRIC_SCHEMA, compute_ntpj  # noqa: E402
-from adjustments.manual import read_adjustment_csv  # noqa: E402
+from adjustments.manual import read_adjustment_table  # noqa: E402
 
 LOGGER = logging.getLogger("cx_metrics.ntpj")
 
@@ -58,14 +81,15 @@ DEFAULT_SOURCE = "usr.danielanzures.io_jobs_raw"
 DEFAULT_TARGET = "usr.danielanzures.io_ntpj_metric"
 
 # Extra months read before period_start so the trailing-window benchmark
-# (months ≤ 2026-03 use M-4 … M) has its source data.
+# (months <= 2026-03 use M-4 ... M) has its source data.
 BENCHMARK_LOOKBACK_MONTHS = 4
 
 
 def _lookback_start(period_start: date) -> date:
     """First day of the month that is BENCHMARK_LOOKBACK_MONTHS before period_start."""
-    p = pd.Period(period_start, freq="M") - BENCHMARK_LOOKBACK_MONTHS
-    return p.to_timestamp().date()
+    total = period_start.year * 12 + (period_start.month - 1) - BENCHMARK_LOOKBACK_MONTHS
+    year, month = divmod(total, 12)
+    return date(year, month + 1, 1)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -129,66 +153,79 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     lookback_start = _lookback_start(args.period_start)
-    conn = open_connection()
-    try:
-        with _log_step(f"read {args.source} (look-back from {lookback_start})"):
-            jobs = read_table(conn, args.source, lookback_start, args.period_end)
-            LOGGER.info("  %s raw job rows (incl. look-back)", f"{len(jobs):,}")
+    spark = open_connection()
 
-        with _log_step("compute_ntpj"):
-            result = compute_ntpj(
-                jobs,
-                args.period_start,
-                args.period_end,
-                general_exclusions=read_adjustment_csv("exclusiones_generales"),
-                cross_support=read_adjustment_csv("cross_support"),
-                job_exclusions=read_adjustment_csv("exclusiones_jobs"),
+    with _log_step(f"read {args.source} (look-back from {lookback_start})"):
+        jobs = read_table(spark, args.source, lookback_start, args.period_end)
+
+    with _log_step("compute_ntpj"):
+        result = compute_ntpj(
+            jobs,
+            args.period_start,
+            args.period_end,
+            general_exclusions=read_adjustment_table(spark, "exclusiones_generales"),
+            cross_support=read_adjustment_table(spark, "cross_support"),
+            job_exclusions=read_adjustment_table(spark, "exclusiones_jobs"),
+        )
+
+    if args.dry_run:
+        from pyspark.sql import functions as F
+
+        result = result.persist()
+        LOGGER.info("Dry run — not writing. Summary:")
+        print()
+        by_gran = {
+            r["date_granularity"]: (r["rows"], r["agents"])
+            for r in result.groupBy("date_granularity")
+            .agg(
+                F.count(F.lit(1)).alias("rows"),
+                F.countDistinct("agent").alias("agents"),
             )
-            LOGGER.info("  %s metric rows", f"{len(result):,}")
-
-        expected_cols = [c for c, _ in IO_NTPJ_METRIC_SCHEMA]
-        result = result[expected_cols]
-
-        if args.dry_run:
-            LOGGER.info("Dry run — not writing. Summary:")
-            print()
-            for g in GRANULARITIES:
-                sub = result[result["date_granularity"] == g]
-                print(f"{g:>9}: {len(sub):,} rows, {sub['agent'].nunique():,} agents")
-            print(f"\nAgents: {result['agent'].nunique():,}   "
-                  f"Teams: {', '.join(sorted(result['team'].dropna().unique()))}")
-            if not result.empty:
-                mv = result["metric_value"].dropna()
-                print(f"metric_value (%): min={mv.min():.1f}  "
-                      f"max={mv.max():.1f}  mean={mv.mean():.1f}")
-            print("\nHead (day grain):")
+            .collect()
+        }
+        for g in GRANULARITIES:
+            rows, agents = by_gran.get(g, (0, 0))
+            print(f"{g:>9}: {rows:,} rows, {agents:,} agents")
+        teams = sorted(
+            r["team"]
+            for r in result.select("team").distinct().collect()
+            if r["team"] is not None
+        )
+        stats = result.agg(
+            F.countDistinct("agent").alias("agents"),
+            F.min("metric_value").alias("mv_min"),
+            F.max("metric_value").alias("mv_max"),
+            F.avg("metric_value").alias("mv_mean"),
+        ).collect()[0]
+        print(f"\nAgents: {stats['agents']:,}   Teams: {', '.join(teams)}")
+        if stats["mv_min"] is not None:
             print(
-                result[result["date_granularity"] == "day"]
-                .head(10)
-                .to_string(index=False)
+                f"NTPJ metric_value (%): min={stats['mv_min']:.1f}  "
+                f"max={stats['mv_max']:.1f}  mean={stats['mv_mean']:.1f}"
             )
-            return 0
+        print("\nHead (day grain):")
+        result.filter(F.col("date_granularity") == "day").show(10, truncate=False)
+        result.unpersist()
+        return 0
 
-        with _log_step(f"write {args.target}"):
-            run = publish(
-                conn,
-                result,
-                args.target,
-                IO_NTPJ_METRIC_SCHEMA,
-                layer="metrics",
-                period_start=args.period_start,
-                period_end=args.period_end,
-                run_id=args.run_id,
-                snapshot=not args.no_snapshot,
-            )
-            LOGGER.info(
-                "  wrote %s rows to %s (run_id=%s)",
-                f"{run.row_count:,}", args.target, run.run_id,
-            )
-            if run.snapshot_table:
-                LOGGER.info("  snapshot -> %s", run.snapshot_table)
-    finally:
-        conn.close()
+    with _log_step(f"write {args.target}"):
+        run = publish(
+            spark,
+            result,
+            args.target,
+            IO_NTPJ_METRIC_SCHEMA,
+            layer="metrics",
+            period_start=args.period_start,
+            period_end=args.period_end,
+            run_id=args.run_id,
+            snapshot=not args.no_snapshot,
+        )
+        LOGGER.info(
+            "  wrote %s rows to %s (run_id=%s)",
+            f"{run.row_count:,}", args.target, run.run_id,
+        )
+        if run.snapshot_table:
+            LOGGER.info("  snapshot -> %s", run.snapshot_table)
 
     return 0
 

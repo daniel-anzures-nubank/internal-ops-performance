@@ -292,8 +292,13 @@ def _append_snapshot(
             f"DELETE FROM {snapshot_table} WHERE run_id = '{run_id}'"
         )
 
+    # ``mergeSchema`` lets the append tolerate additive schema evolution (a new
+    # column appearing in a metric, e.g. ``roster_status`` in ``io_jobs_raw``)
+    # without a destructive drop+recreate of the history table — old rows simply
+    # get NULL for the new column.
     (
         snap.write.mode("append")
+        .option("mergeSchema", "true")
         .partitionBy("run_id")
         .format("delta")
         .saveAsTable(snapshot_table)

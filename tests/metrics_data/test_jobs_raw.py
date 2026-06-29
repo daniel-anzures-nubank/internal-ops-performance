@@ -1,28 +1,28 @@
-"""Unit tests for ``metrics_data/jobs_raw.py``.
+"""Unit tests for ``metrics_data/jobs_raw.py`` (PySpark).
 
-Small synthetic pandas frames, no warehouse, sub-second runs.
+Small hand-crafted Spark DataFrames via the session-scoped ``spark`` fixture
+(see ``tests/conftest.py``). No warehouse.
 
 jobs_raw is a RAW per-job feed: one row per individual job (shuffle + OOS),
-ALL shuffle statuses kept, with raw start/end times, the derived job_id, and a
-``required_activity_on_day_flag`` computed from the NTPJ DIME definition of
-"scheduled". No aggregation, no expected-duration benchmark (those move to the
-metrics layer).
+ALL shuffle statuses kept, with raw start/end times, the derived job_id, the
+roster attribution (LEFT-joined — every job survives so the benchmark pool is
+complete), and a ``required_activity_on_day_flag`` computed from the NTPJ DIME
+definition of "scheduled". No aggregation, no expected-duration benchmark
+(those move to the metrics layer).
 """
 
 from __future__ import annotations
 
 import datetime as dt
 
-import pandas as pd
 import pytest
+from pyspark.sql import types as T
 
 from jobs_raw import (
     DIME_ACTIVITY_TYPE_EXCLUSIONS,
     DIME_SQUAD_EXCLUSIONS,
     IO_JOBS_RAW_SCHEMA,
     NTPJ_OUT_OF_SCOPE_SQUADS,
-    _clean_oos_job_classification,
-    _shuffle_job_id,
     build_jobs_union,
     build_oos_jobs_raw,
     build_shuffle_jobs_raw,
@@ -31,16 +31,87 @@ from jobs_raw import (
     filter_dime,
 )
 
-
-# ---------------------------------------------------------------------------
-# Builders
-# ---------------------------------------------------------------------------
-
 D = dt.date(2026, 5, 18)
 
 
-def make_shuffle_row(**overrides) -> dict:
-    base = {
+# ---------------------------------------------------------------------------
+# Builders for synthetic input frames
+# ---------------------------------------------------------------------------
+
+_SHUFFLE_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("actor_affiliation", T.StringType()),
+        T.StructField("date", T.DateType()),
+        T.StructField("job_type", T.StringType()),
+        T.StructField("activity_type", T.StringType()),
+        T.StructField("status", T.StringType()),
+        T.StructField("net_time_spent_seconds", T.LongType()),
+        T.StructField("local_start_time", T.TimestampType()),
+        T.StructField("local_stop_time", T.TimestampType()),
+        T.StructField("activity_start_unix", T.LongType()),
+        T.StructField("activity_end_unix", T.LongType()),
+    ]
+)
+
+_OOS_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("date", T.DateType()),
+        T.StructField("job_classification", T.StringType()),
+        T.StructField("net_time_spent_seconds", T.LongType()),
+        T.StructField("local_start_date", T.TimestampType()),
+        T.StructField("local_stop_date", T.TimestampType()),
+        T.StructField("activity_start_unix", T.LongType()),
+        T.StructField("activity_end_unix", T.LongType()),
+        T.StructField("squad", T.StringType()),
+        T.StructField("comment", T.StringType()),
+    ]
+)
+
+_DIME_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("date", T.DateType()),
+        T.StructField("squad", T.StringType()),
+        T.StructField("affiliation", T.StringType()),
+        T.StructField("activity_type_required", T.StringType()),
+        T.StructField("shuffle_status_required", T.StringType()),
+        T.StructField("dimensioned_activity", T.StringType()),
+        T.StructField("local_timestamp_dime_slot_starts_at", T.TimestampType()),
+        T.StructField("slot_start_local_unix", T.LongType()),
+        T.StructField("slot_end_local_unix", T.LongType()),
+    ]
+)
+
+_ROSTER_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("actor_id", T.StringType()),
+        T.StructField("xforce", T.StringType()),
+        T.StructField("xplead", T.StringType()),
+        T.StructField("team", T.StringType()),
+        T.StructField("squad", T.StringType()),
+        T.StructField("squad_district", T.StringType()),
+        T.StructField("status", T.StringType()),
+        T.StructField("shift", T.StringType()),
+        T.StructField("snapshot_date", T.DateType()),
+        T.StructField("snapshot_month", T.DateType()),
+        T.StructField("hire_start_date", T.DateType()),
+        T.StructField("last_change_date", T.DateType()),
+    ]
+)
+
+
+def _rows_to_df(spark, schema, rows, defaults):
+    data = [{**defaults, **r} for r in rows]
+    return spark.createDataFrame(
+        [tuple(r[f.name] for f in schema.fields) for r in data], schema
+    )
+
+
+def make_shuffle(spark, rows):
+    defaults = {
         "agent": "jane.doe",
         "actor_affiliation": "nubank",
         "date": D,
@@ -53,16 +124,11 @@ def make_shuffle_row(**overrides) -> dict:
         "activity_start_unix": 0,
         "activity_end_unix": 600,
     }
-    base.update(overrides)
-    return base
+    return _rows_to_df(spark, _SHUFFLE_SCHEMA, rows, defaults)
 
 
-def make_shuffle(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame([make_shuffle_row(**r) for r in rows])
-
-
-def make_oos_row(**overrides) -> dict:
-    base = {
+def make_oos(spark, rows):
+    defaults = {
         "agent": "jane.doe",
         "date": D,
         "job_classification": "support_ticket",
@@ -74,16 +140,19 @@ def make_oos_row(**overrides) -> dict:
         "squad": "core",
         "comment": "",
     }
-    base.update(overrides)
-    return base
+    return _rows_to_df(spark, _OOS_SCHEMA, rows, defaults)
 
 
-def make_oos(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame([make_oos_row(**r) for r in rows])
+def empty_oos(spark):
+    return spark.createDataFrame([], _OOS_SCHEMA)
 
 
-def make_dime_row(**overrides) -> dict:
-    base = {
+def empty_shuffle(spark):
+    return spark.createDataFrame([], _SHUFFLE_SCHEMA)
+
+
+def make_dime(spark, rows):
+    defaults = {
         "agent": "jane.doe",
         "date": D,
         "squad": "core",
@@ -95,15 +164,14 @@ def make_dime_row(**overrides) -> dict:
         "slot_start_local_unix": 0,
         "slot_end_local_unix": 1800,
     }
-    base.update(overrides)
-    return base
+    return _rows_to_df(spark, _DIME_SCHEMA, rows, defaults)
 
 
-def make_dime(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame([make_dime_row(**r) for r in rows])
+def empty_dime(spark):
+    return spark.createDataFrame([], _DIME_SCHEMA)
 
 
-def make_roster(rows: list[dict]) -> pd.DataFrame:
+def make_roster(spark, rows):
     defaults = {
         "agent": "jane.doe",
         "actor_id": "actor-1",
@@ -119,49 +187,7 @@ def make_roster(rows: list[dict]) -> pd.DataFrame:
         "hire_start_date": dt.date(2025, 1, 15),
         "last_change_date": dt.date(2025, 1, 15),
     }
-    return pd.DataFrame([{**defaults, **r} for r in rows])
-
-
-# ---------------------------------------------------------------------------
-# job_id construction
-# ---------------------------------------------------------------------------
-
-
-class TestShuffleJobId:
-    def test_email_includes_job_type(self):
-        out = _shuffle_job_id(
-            pd.Series(["email"]), pd.Series(["voice"]), pd.Series(["finished"])
-        )
-        assert out.tolist() == ["email - voice - finished"]
-
-    def test_backoffice_uses_bko_prefix_and_job_type(self):
-        out = _shuffle_job_id(
-            pd.Series(["backoffice"]), pd.Series(["manual"]), pd.Series(["finished"])
-        )
-        assert out.tolist() == ["bko - manual - finished"]
-
-    def test_other_activity_types_omit_job_type(self):
-        out = _shuffle_job_id(
-            pd.Series(["chat", "voice"]),
-            pd.Series(["something", "ignored"]),
-            pd.Series(["finished", "transferred"]),
-        )
-        assert out.tolist() == ["chat - finished", "voice - transferred"]
-
-
-class TestCleanOosJobClassification:
-    def test_passes_through_non_content_squad_unchanged(self):
-        out = _clean_oos_job_classification(
-            pd.Series(["Some Classification (OOS_CONT)"]), pd.Series(["core"])
-        )
-        assert out.tolist() == ["Some Classification (OOS_CONT)"]
-
-    def test_strips_oos_cont_and_lowercases_for_content_squad(self):
-        out = _clean_oos_job_classification(
-            pd.Series(["Publish Bug (OOS_CONT)"]),
-            pd.Series(["mx_content"]),
-        )
-        assert out.tolist() == ["publish_bug"]
+    return _rows_to_df(spark, _ROSTER_SCHEMA, rows, defaults)
 
 
 # ---------------------------------------------------------------------------
@@ -170,54 +196,81 @@ class TestCleanOosJobClassification:
 
 
 class TestBuildShuffleJobsRaw:
-    def test_one_row_per_job_all_statuses_kept(self):
+    def test_one_row_per_job_all_statuses_kept(self, spark):
         out = build_shuffle_jobs_raw(
             make_shuffle(
+                spark,
                 [
                     {"status": "finished"},
                     {"status": "transferred"},
                     {"status": "skipped"},
                     {"status": "cancelled"},
-                ]
+                ],
             )
         )
-        assert len(out) == 4
+        assert out.count() == 4
 
-    def test_maps_start_end_and_duration(self):
-        out = build_shuffle_jobs_raw(make_shuffle([{}]))
-        row = out.iloc[0]
+    def test_maps_start_end_and_duration_and_job_id(self, spark):
+        row = build_shuffle_jobs_raw(make_shuffle(spark, [{}])).collect()[0]
         assert row["start_time"] == dt.datetime(2026, 5, 18, 6, 0, 0)
         assert row["end_time"] == dt.datetime(2026, 5, 18, 6, 10, 0)
         assert row["duration_seconds"] == 600
         assert row["job_id"] == "chat - finished"
 
-    def test_empty_returns_shaped_frame(self):
-        out = build_shuffle_jobs_raw(make_shuffle([]))
-        assert out.empty
+    @pytest.mark.parametrize(
+        "activity_type,job_type,status,expected",
+        [
+            ("email", "voice", "finished", "email - voice - finished"),
+            ("backoffice", "manual", "finished", "bko - manual - finished"),
+            ("chat", "ignored", "finished", "chat - finished"),
+            ("voice", "ignored", "transferred", "voice - transferred"),
+        ],
+    )
+    def test_job_id_construction(self, spark, activity_type, job_type, status, expected):
+        out = build_shuffle_jobs_raw(
+            make_shuffle(
+                spark,
+                [{"activity_type": activity_type, "job_type": job_type, "status": status}],
+            )
+        ).collect()
+        assert out[0]["job_id"] == expected
+
+    def test_empty_returns_empty(self, spark):
+        assert build_shuffle_jobs_raw(empty_shuffle(spark)).count() == 0
 
 
 class TestBuildOosJobsRaw:
-    def test_synthesizes_activity_type_and_status(self):
-        out = build_oos_jobs_raw(make_oos([{}]))
-        row = out.iloc[0]
+    def test_synthesizes_activity_type_and_status(self, spark):
+        row = build_oos_jobs_raw(make_oos(spark, [{}])).collect()[0]
         assert row["activity_type"] == "oos"
         assert row["status"] == "finished"
         assert row["job_id"] == "oos - support_ticket"
         assert row["start_time"] == dt.datetime(2026, 5, 18, 7, 0, 0)
         assert row["duration_seconds"] == 900
 
-    def test_content_squad_classification_cleaned(self):
+    def test_passes_through_non_content_squad_unchanged(self, spark):
         out = build_oos_jobs_raw(
-            make_oos([{"squad": "mx_content", "job_classification": "Publish Bug (OOS_CONT)"}])
-        )
-        assert out.iloc[0]["job_id"] == "oos - publish_bug"
+            make_oos(
+                spark,
+                [{"squad": "core", "job_classification": "Some Classification (OOS_CONT)"}],
+            )
+        ).collect()
+        assert out[0]["job_id"] == "oos - Some Classification (OOS_CONT)"
+
+    def test_content_squad_classification_cleaned(self, spark):
+        out = build_oos_jobs_raw(
+            make_oos(
+                spark,
+                [{"squad": "mx_content", "job_classification": "Publish Bug (OOS_CONT)"}],
+            )
+        ).collect()
+        assert out[0]["job_id"] == "oos - publish_bug"
 
 
 class TestBuildJobsUnion:
-    def test_concats_shuffle_and_oos(self):
-        out = build_jobs_union(make_shuffle([{}]), make_oos([{}]))
-        assert len(out) == 2
-        assert set(out["activity_type"]) == {"chat", "oos"}
+    def test_concats_shuffle_and_oos(self, spark):
+        out = build_jobs_union(make_shuffle(spark, [{}]), make_oos(spark, [{}]))
+        assert sorted(r["activity_type"] for r in out.collect()) == ["chat", "oos"]
 
 
 # ---------------------------------------------------------------------------
@@ -226,41 +279,35 @@ class TestBuildJobsUnion:
 
 
 class TestFilterDime:
-    def test_keeps_well_formed_row(self):
-        out = filter_dime(make_dime([{}]))
-        assert len(out) == 1
+    def test_keeps_well_formed_row(self, spark):
+        assert filter_dime(make_dime(spark, [{}])).count() == 1
 
     @pytest.mark.parametrize("bad", list(DIME_ACTIVITY_TYPE_EXCLUSIONS))
-    def test_drops_excluded_activity_types(self, bad):
-        out = filter_dime(make_dime([{"activity_type_required": bad}]))
-        assert out.empty
+    def test_drops_excluded_activity_types(self, spark, bad):
+        assert filter_dime(make_dime(spark, [{"activity_type_required": bad}])).count() == 0
 
     @pytest.mark.parametrize("bad", list(DIME_SQUAD_EXCLUSIONS))
-    def test_drops_excluded_squads(self, bad):
-        out = filter_dime(make_dime([{"squad": bad}]))
-        assert out.empty
+    def test_drops_excluded_squads(self, spark, bad):
+        assert filter_dime(make_dime(spark, [{"squad": bad}])).count() == 0
 
-    def test_drops_null_activity_type(self):
-        out = filter_dime(make_dime([{"activity_type_required": None}]))
-        assert out.empty
+    def test_drops_null_activity_type(self, spark):
+        assert filter_dime(make_dime(spark, [{"activity_type_required": None}])).count() == 0
 
-    def test_drops_null_squad(self):
-        out = filter_dime(make_dime([{"squad": None}]))
-        assert out.empty
+    def test_drops_null_squad(self, spark):
+        assert filter_dime(make_dime(spark, [{"squad": None}])).count() == 0
 
     @pytest.mark.parametrize("bad", ["pause", "training", "lunch", None])
-    def test_drops_invalid_shuffle_status(self, bad):
-        out = filter_dime(make_dime([{"shuffle_status_required": bad}]))
-        assert out.empty
+    def test_drops_invalid_shuffle_status(self, spark, bad):
+        assert filter_dime(make_dime(spark, [{"shuffle_status_required": bad}])).count() == 0
 
     @pytest.mark.parametrize("good", ["available", "oos"])
-    def test_keeps_available_and_oos_shuffle_status(self, good):
-        out = filter_dime(make_dime([{"shuffle_status_required": good}]))
-        assert len(out) == 1
+    def test_keeps_available_and_oos_shuffle_status(self, spark, good):
+        assert filter_dime(make_dime(spark, [{"shuffle_status_required": good}])).count() == 1
 
-    def test_keeps_meeting_dimensioned_activity(self):
-        out = filter_dime(make_dime([{"dimensioned_activity": "Mouring"}]))
-        assert len(out) == 1
+    def test_keeps_meeting_dimensioned_activity(self, spark):
+        # NTPJ does NOT apply the meeting/leave dimensioned_activity filter
+        # (legacy dime_ntpj has no such filter); meeting slots stay.
+        assert filter_dime(make_dime(spark, [{"dimensioned_activity": "Mouring"}])).count() == 1
 
 
 # ---------------------------------------------------------------------------
@@ -269,28 +316,29 @@ class TestFilterDime:
 
 
 class TestComputeRequiredActivities:
-    def test_distinct_agent_date_activity(self):
+    def test_distinct_agent_date_activity(self, spark):
         out = compute_required_activities(
             filter_dime(
-                pd.DataFrame(
+                make_dime(
+                    spark,
                     [
-                        make_dime_row(activity_type_required="chat"),
-                        make_dime_row(
-                            activity_type_required="chat",
-                            slot_start_local_unix=1800,
-                            slot_end_local_unix=3600,
-                        ),
-                        make_dime_row(
-                            activity_type_required="email",
-                            slot_start_local_unix=3600,
-                            slot_end_local_unix=5400,
-                        ),
-                    ]
+                        {"activity_type_required": "chat"},
+                        {
+                            "activity_type_required": "chat",
+                            "slot_start_local_unix": 1800,
+                            "slot_end_local_unix": 3600,
+                        },
+                        {
+                            "activity_type_required": "email",
+                            "slot_start_local_unix": 3600,
+                            "slot_end_local_unix": 5400,
+                        },
+                    ],
                 )
             )
-        )
-        assert set(out["activity_type"]) == {"chat", "email"}
-        assert (out["required_flag"] == 1).all()
+        ).collect()
+        assert sorted(r["activity_type"] for r in out) == ["chat", "email"]
+        assert all(r["required_flag"] == 1 for r in out)
 
 
 # ---------------------------------------------------------------------------
@@ -299,13 +347,15 @@ class TestComputeRequiredActivities:
 
 
 class TestComputeJobsRaw:
-    def test_basic_end_to_end_chat_path(self):
-        roster = make_roster([{}])
-        dime = make_dime([{}])  # chat slot scheduled
-        shuffle = make_shuffle([{"net_time_spent_seconds": 100}])
-        out = compute_jobs_raw(roster, dime, shuffle, make_oos([]))
+    def test_basic_end_to_end_chat_path(self, spark):
+        out = compute_jobs_raw(
+            make_roster(spark, [{}]),
+            make_dime(spark, [{}]),
+            make_shuffle(spark, [{"net_time_spent_seconds": 100}]),
+            empty_oos(spark),
+        ).collect()
         assert len(out) == 1
-        row = out.iloc[0]
+        row = out[0]
         assert row["agent"] == "jane.doe"
         assert row["job_id"] == "chat - finished"
         assert row["activity_type"] == "chat"
@@ -314,113 +364,213 @@ class TestComputeJobsRaw:
         assert row["required_activity_on_day_flag"] == 1
         assert row["district"] == "northeast"
         assert row["shift"] == "morning"
+        assert row["roster_status"] == "active"
 
-    def test_two_jobs_two_rows(self):
-        roster = make_roster([{}])
-        dime = make_dime([{}])
-        shuffle = make_shuffle(
-            [{"net_time_spent_seconds": 100}, {"net_time_spent_seconds": 200}]
-        )
-        out = compute_jobs_raw(roster, dime, shuffle, make_oos([]))
-        assert len(out) == 2
-
-    def test_job_without_required_activity_kept_with_flag_zero(self):
-        # OOS job on a day the agent only had chat scheduled. Unlike legacy
-        # NTPJ (which dropped it), jobs_raw keeps it with flag 0.
-        roster = make_roster([{}])
-        dime = make_dime([{"activity_type_required": "chat"}])
+    def test_two_jobs_two_rows(self, spark):
         out = compute_jobs_raw(
-            roster, dime, make_shuffle([]), make_oos([{"job_classification": "ad_hoc"}])
+            make_roster(spark, [{}]),
+            make_dime(spark, [{}]),
+            make_shuffle(
+                spark,
+                [{"net_time_spent_seconds": 100}, {"net_time_spent_seconds": 200}],
+            ),
+            empty_oos(spark),
         )
+        assert out.count() == 2
+
+    def test_job_without_required_activity_kept_with_flag_zero(self, spark):
+        # OOS job on a day the agent only had chat scheduled → flag 0, kept.
+        out = compute_jobs_raw(
+            make_roster(spark, [{}]),
+            make_dime(spark, [{"activity_type_required": "chat"}]),
+            empty_shuffle(spark),
+            make_oos(spark, [{"job_classification": "ad_hoc"}]),
+        ).collect()
         assert len(out) == 1
-        assert out.iloc[0]["activity_type"] == "oos"
-        assert out.iloc[0]["required_activity_on_day_flag"] == 0
+        assert out[0]["activity_type"] == "oos"
+        assert out[0]["required_activity_on_day_flag"] == 0
 
     @pytest.mark.parametrize("status", ["finished", "transferred", "skipped", "cancelled"])
-    def test_all_shuffle_statuses_kept(self, status):
-        roster = make_roster([{}])
-        dime = make_dime([{}])
+    def test_all_shuffle_statuses_kept(self, spark, status):
         out = compute_jobs_raw(
-            roster, dime, make_shuffle([{"status": status}]), make_oos([])
-        )
+            make_roster(spark, [{}]),
+            make_dime(spark, [{}]),
+            make_shuffle(spark, [{"status": status}]),
+            empty_oos(spark),
+        ).collect()
         assert len(out) == 1
-        assert out.iloc[0]["status"] == status
+        assert out[0]["status"] == status
 
-    def test_drops_inactive_agents(self):
-        roster = make_roster([{"status": "inactive"}])
-        out = compute_jobs_raw(roster, make_dime([{}]), make_shuffle([{}]), make_oos([]))
-        assert out.empty
+    def test_inactive_agent_kept_with_roster_status(self, spark):
+        # Legacy builds the benchmark from the un-roster-filtered pool, so jobs
+        # raw keeps inactive-roster jobs (with roster_status carried) and the
+        # metric layer scopes the contribution to active. So they are NOT dropped
+        # here (unlike the old inner-join behaviour).
+        out = compute_jobs_raw(
+            make_roster(spark, [{"status": "inactive"}]),
+            make_dime(spark, [{}]),
+            make_shuffle(spark, [{}]),
+            empty_oos(spark),
+        ).collect()
+        assert len(out) == 1
+        assert out[0]["roster_status"] == "inactive"
+
+    def test_job_without_roster_row_kept_with_null_dims(self, spark):
+        # A job whose agent has no roster row that month still survives (it can
+        # feed the benchmark); its roster dims/status are NULL.
+        out = compute_jobs_raw(
+            make_roster(spark, [{"agent": "someone.else"}]),
+            make_dime(spark, [{}]),
+            make_shuffle(spark, [{}]),
+            empty_oos(spark),
+        ).collect()
+        assert len(out) == 1
+        assert out[0]["agent"] == "jane.doe"
+        assert out[0]["roster_status"] is None
+        assert out[0]["squad"] is None
 
     def test_out_of_scope_squads_constant_is_empty(self):
         assert NTPJ_OUT_OF_SCOPE_SQUADS == ()
 
     @pytest.mark.parametrize("squad", ["social", "content"])
-    def test_social_and_content_squads_kept(self, squad):
-        roster = make_roster([{"squad": squad}])
-        out = compute_jobs_raw(roster, make_dime([{}]), make_shuffle([{}]), make_oos([]))
+    def test_social_and_content_squads_kept(self, spark, squad):
+        out = compute_jobs_raw(
+            make_roster(spark, [{"squad": squad}]),
+            make_dime(spark, [{}]),
+            make_shuffle(spark, [{}]),
+            empty_oos(spark),
+        ).collect()
         assert len(out) == 1
-        assert out.iloc[0]["squad"] == squad
+        assert out[0]["squad"] == squad
 
-    def test_output_columns_match_schema(self):
-        roster = make_roster([{}])
-        out = compute_jobs_raw(roster, make_dime([{}]), make_shuffle([{}]), make_oos([]))
-        assert list(out.columns) == [c for c, _ in IO_JOBS_RAW_SCHEMA]
+    def test_output_columns_match_schema(self, spark):
+        out = compute_jobs_raw(
+            make_roster(spark, [{}]),
+            make_dime(spark, [{}]),
+            make_shuffle(spark, [{}]),
+            empty_oos(spark),
+        )
+        assert out.columns == [c for c, _ in IO_JOBS_RAW_SCHEMA]
 
-    def test_joins_correct_month_of_roster(self):
-        roster = pd.concat(
+    def test_joins_correct_month_of_roster(self, spark):
+        roster = make_roster(
+            spark,
             [
-                make_roster(
-                    [
-                        {
-                            "snapshot_date": dt.date(2026, 4, 30),
-                            "snapshot_month": dt.date(2026, 4, 1),
-                            "squad": "credit",
-                            "squad_district": "old_district",
-                        }
-                    ]
-                ),
-                make_roster(
-                    [
-                        {
-                            "snapshot_date": dt.date(2026, 5, 31),
-                            "snapshot_month": dt.date(2026, 5, 1),
-                            "squad": "core",
-                            "squad_district": "new_district",
-                        }
-                    ]
-                ),
+                {
+                    "snapshot_date": dt.date(2026, 4, 30),
+                    "snapshot_month": dt.date(2026, 4, 1),
+                    "squad": "credit",
+                    "squad_district": "old_district",
+                },
+                {
+                    "snapshot_date": dt.date(2026, 5, 31),
+                    "snapshot_month": dt.date(2026, 5, 1),
+                    "squad": "core",
+                    "squad_district": "new_district",
+                },
             ],
-            ignore_index=True,
         )
         april_day = dt.date(2026, 4, 15)
         dime = make_dime(
+            spark,
             [
                 {
                     "date": april_day,
-                    "local_timestamp_dime_slot_starts_at": dt.datetime(
-                        2026, 4, 15, 6, 0, 0
-                    ),
+                    "local_timestamp_dime_slot_starts_at": dt.datetime(2026, 4, 15, 6, 0, 0),
                 }
-            ]
+            ],
         )
         shuffle = make_shuffle(
+            spark,
             [
                 {
                     "date": april_day,
                     "local_start_time": dt.datetime(2026, 4, 15, 6, 0, 0),
                     "local_stop_time": dt.datetime(2026, 4, 15, 6, 10, 0),
                 }
-            ]
+            ],
         )
-        out = compute_jobs_raw(roster, dime, shuffle, make_oos([]))
+        out = compute_jobs_raw(roster, dime, shuffle, empty_oos(spark)).collect()
         assert len(out) == 1
-        assert out.iloc[0]["squad"] == "credit"
-        assert out.iloc[0]["district"] == "old_district"
+        assert out[0]["squad"] == "credit"
+        assert out[0]["district"] == "old_district"
 
-    def test_handles_tz_aware_roster_snapshot_month(self):
-        roster = make_roster([{"snapshot_month": pd.Timestamp("2026-05-01", tz="UTC")}])
-        out = compute_jobs_raw(roster, make_dime([{}]), make_shuffle([{}]), make_oos([]))
+    def test_2025_roster_pinned_to_december(self, spark):
+        # A 2025-06 job pins to the 2025-12-01 roster snapshot (legacy
+        # ntpj_all_info_2025), not its own month.
+        roster = make_roster(
+            spark,
+            [
+                {
+                    "snapshot_date": dt.date(2025, 6, 30),
+                    "snapshot_month": dt.date(2025, 6, 1),
+                    "squad": "june-squad",
+                },
+                {
+                    "snapshot_date": dt.date(2025, 12, 31),
+                    "snapshot_month": dt.date(2025, 12, 1),
+                    "squad": "december-squad",
+                },
+            ],
+        )
+        jun_day = dt.date(2025, 6, 10)
+        dime = make_dime(
+            spark,
+            [
+                {
+                    "date": jun_day,
+                    "local_timestamp_dime_slot_starts_at": dt.datetime(2025, 6, 10, 6, 0, 0),
+                }
+            ],
+        )
+        shuffle = make_shuffle(
+            spark,
+            [
+                {
+                    "date": jun_day,
+                    "local_start_time": dt.datetime(2025, 6, 10, 6, 0, 0),
+                    "local_stop_time": dt.datetime(2025, 6, 10, 6, 10, 0),
+                }
+            ],
+        )
+        out = compute_jobs_raw(roster, dime, shuffle, empty_oos(spark)).collect()
         assert len(out) == 1
+        assert out[0]["squad"] == "december-squad"
+
+    def test_duplicate_roster_rows_do_not_fan_out_jobs(self, spark):
+        # Content/enablement agents get >=2 rows per (agent, snapshot_month) from
+        # agent_information's content branch (differing only in target_squad). The
+        # LEFT join must NOT fan out: one job stays one row.
+        roster = make_roster(
+            spark,
+            [
+                {"agent": "omar.ramirez", "squad": "content", "team": "content"},
+                {"agent": "omar.ramirez", "squad": "content", "team": "content"},
+            ],
+        )
+        dime = make_dime(spark, [{"agent": "omar.ramirez"}])
+        shuffle = make_shuffle(spark, [{"agent": "omar.ramirez"}])
+        out = compute_jobs_raw(roster, dime, shuffle, empty_oos(spark)).collect()
+        assert len(out) == 1
+
+    def test_handles_tz_aware_roster_snapshot_month(self, spark):
+        # snapshot_month given as a DATE; trunc keeps it month-start.
+        out = compute_jobs_raw(
+            make_roster(spark, [{"snapshot_month": dt.date(2026, 5, 1)}]),
+            make_dime(spark, [{}]),
+            make_shuffle(spark, [{}]),
+            empty_oos(spark),
+        )
+        assert out.count() == 1
+
+    def test_handles_empty_inputs(self, spark):
+        out = compute_jobs_raw(
+            make_roster(spark, [{}]),
+            empty_dime(spark),
+            empty_shuffle(spark),
+            empty_oos(spark),
+        )
+        assert out.count() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -431,13 +581,13 @@ class TestComputeJobsRaw:
 
 
 def _local_unix(ts: str) -> int:
-    """Naive local wall-clock -> unix seconds (UTC-interpreted, as the modules treat slot_start_local_unix)."""
-    return int(pd.Timestamp(ts).value // 10**9)
+    return int(dt.datetime.fromisoformat(ts).replace(tzinfo=dt.timezone.utc).timestamp())
 
 
 class TestNightShiftAttribution:
-    def _night_roster(self, **over):
+    def _night_roster(self, spark, **over):
         return make_roster(
+            spark,
             [
                 {
                     "shift": "night",
@@ -445,61 +595,63 @@ class TestNightShiftAttribution:
                     "snapshot_date": dt.date(2026, 7, 31),
                     **over,
                 }
-            ]
+            ],
         )
 
-    def _tail_dime(self, day: dt.date, ts: str):
+    def _tail_dime(self, spark, day, ts):
+        u = _local_unix(ts)
         return make_dime(
+            spark,
             [
                 {
                     "date": day,
                     "activity_type_required": "chat",
-                    "local_timestamp_dime_slot_starts_at": pd.Timestamp(ts),
-                    "slot_start_local_unix": _local_unix(ts),
-                    "slot_end_local_unix": _local_unix(ts) + 1800,
+                    "local_timestamp_dime_slot_starts_at": dt.datetime.fromisoformat(ts),
+                    "slot_start_local_unix": u,
+                    "slot_end_local_unix": u + 1800,
                 }
-            ]
+            ],
         )
 
-    def _tail_shuffle(self, day: dt.date, ts: str):
-        start = pd.Timestamp(ts)
+    def _tail_shuffle(self, spark, day, ts):
+        start = dt.datetime.fromisoformat(ts)
         return make_shuffle(
+            spark,
             [
                 {
                     "date": day,
                     "activity_type": "chat",
                     "local_start_time": start,
-                    "local_stop_time": start + pd.Timedelta(minutes=10),
+                    "local_stop_time": start + dt.timedelta(minutes=10),
                 }
-            ]
+            ],
         )
 
-    def test_tail_rolls_back_to_shift_start_day_and_flag_stays_one(self):
-        # Night agent, early-morning tail on Jul 6 03:00 -> attributed to Jul 5.
-        # DIME required slot (also at Jul 6 03:00) rolls back identically, so the
-        # required-flag join still matches.
-        roster = self._night_roster()
-        dime = self._tail_dime(dt.date(2026, 7, 6), "2026-07-06 03:00:00")
-        shuffle = self._tail_shuffle(dt.date(2026, 7, 6), "2026-07-06 03:00:00")
-        out = compute_jobs_raw(roster, dime, shuffle, make_oos([]))
+    def test_tail_rolls_back_to_shift_start_day_and_flag_stays_one(self, spark):
+        roster = self._night_roster(spark)
+        dime = self._tail_dime(spark, dt.date(2026, 7, 6), "2026-07-06 03:00:00")
+        shuffle = self._tail_shuffle(spark, dt.date(2026, 7, 6), "2026-07-06 03:00:00")
+        out = compute_jobs_raw(roster, dime, shuffle, empty_oos(spark)).collect()
         assert len(out) == 1
-        assert out.iloc[0]["date"] == dt.date(2026, 7, 5)
-        assert out.iloc[0]["required_activity_on_day_flag"] == 1
+        assert out[0]["date"] == dt.date(2026, 7, 5)
+        assert out[0]["required_activity_on_day_flag"] == 1
 
-    def test_morning_agent_tail_not_re_attributed(self):
-        roster = self._night_roster(shift="morning")
-        dime = self._tail_dime(dt.date(2026, 7, 6), "2026-07-06 03:00:00")
-        shuffle = self._tail_shuffle(dt.date(2026, 7, 6), "2026-07-06 03:00:00")
-        out = compute_jobs_raw(roster, dime, shuffle, make_oos([]))
+    def test_morning_agent_tail_not_re_attributed(self, spark):
+        roster = self._night_roster(spark, shift="morning")
+        dime = self._tail_dime(spark, dt.date(2026, 7, 6), "2026-07-06 03:00:00")
+        shuffle = self._tail_shuffle(spark, dt.date(2026, 7, 6), "2026-07-06 03:00:00")
+        out = compute_jobs_raw(roster, dime, shuffle, empty_oos(spark)).collect()
         assert len(out) == 1
-        assert out.iloc[0]["date"] == dt.date(2026, 7, 6)
+        assert out[0]["date"] == dt.date(2026, 7, 6)
 
-    def test_before_cutover_keeps_legacy_calendar_day(self):
+    def test_before_cutover_keeps_legacy_calendar_day(self, spark):
         roster = self._night_roster(
-            snapshot_month=dt.date(2026, 6, 1), snapshot_date=dt.date(2026, 6, 30)
+            spark,
+            snapshot_month=dt.date(2026, 6, 1),
+            snapshot_date=dt.date(2026, 6, 30),
         )
-        dime = self._tail_dime(dt.date(2026, 6, 30), "2026-06-30 03:00:00")
-        shuffle = self._tail_shuffle(dt.date(2026, 6, 30), "2026-06-30 03:00:00")
-        out = compute_jobs_raw(roster, dime, shuffle, make_oos([]))
+        dime = self._tail_dime(spark, dt.date(2026, 6, 30), "2026-06-30 03:00:00")
+        shuffle = self._tail_shuffle(spark, dt.date(2026, 6, 30), "2026-06-30 03:00:00")
+        out = compute_jobs_raw(roster, dime, shuffle, empty_oos(spark)).collect()
         assert len(out) == 1
-        assert out.iloc[0]["date"] == dt.date(2026, 6, 30)
+        assert out[0]["date"] == dt.date(2026, 6, 30)
