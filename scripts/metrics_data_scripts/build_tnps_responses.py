@@ -1,9 +1,9 @@
 """Build the tnps_responses dataset and (optionally) write it to Databricks.
 
 Thin orchestrator. The math lives in ``metrics_data/tnps_responses.py`` and is
-covered by ``tests/test_tnps_responses.py``. Here we only:
+covered by ``tests/metrics_data/test_tnps_responses.py``. Here we only:
 
-  1. Open a Databricks SQL connection (shared `db.open_connection`).
+  1. Get the ambient SparkSession (shared `db.open_connection`).
   2. Run the two extractors needed:
        * ``agent_information``  (roster)
        * ``tnps_responses``     (Sprinklr Social-Media tNPS survey responses)
@@ -24,12 +24,12 @@ follow-up; this script intentionally produces the "clean" baseline.
 
 Usage
 -----
-::
+Runs on a Databricks cluster (``spark-submit`` / a Databricks job task)::
 
-    uv run python scripts/metrics_data_scripts/build_tnps_responses.py \\
+    python scripts/metrics_data_scripts/build_tnps_responses.py \\
         --period-start 2026-05-01 --period-end 2026-05-17 --dry-run
 
-    uv run python scripts/metrics_data_scripts/build_tnps_responses.py \\
+    python scripts/metrics_data_scripts/build_tnps_responses.py \\
         --period-start 2026-01-01 --period-end 2026-05-24
 """
 
@@ -42,9 +42,28 @@ import time
 from datetime import date
 from pathlib import Path
 
-import pandas as pd
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# Locate the repo root (contains `db.py` + `extractors/`) so the sibling
+# top-level modules import. We can't rely on `__file__`: Databricks runs a
+# git-sourced `spark_python_task` via `exec()` with no `__file__` set, so we
+# search upward from every path we can discover (file, argv, cwd).
+def _repo_root() -> Path:
+    starts: list[Path] = []
+    try:
+        starts.append(Path(__file__).resolve())
+    except NameError:
+        pass
+    if sys.argv and sys.argv[0]:
+        starts.append(Path(sys.argv[0]).resolve())
+    starts.append(Path.cwd().resolve())
+    for start in starts:
+        for cand in (start, *start.parents):
+            if (cand / "db.py").is_file() and (cand / "extractors").is_dir():
+                return cand
+    return Path.cwd()
+
+
+REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics_data"))
 
@@ -114,72 +133,76 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
-    conn = open_connection()
-    try:
-        with _log_step("agent_information"):
-            roster = run_extractor(
-                conn, "agent_information", args.period_start, args.period_end
-            )
-            LOGGER.info("  %s roster rows", f"{len(roster):,}")
+    spark = open_connection()
 
-        with _log_step("tnps_responses"):
-            tnps = run_extractor(
-                conn, "tnps_responses", args.period_start, args.period_end
-            )
-            LOGGER.info("  %s tNPS survey rows", f"{len(tnps):,}")
+    with _log_step("agent_information"):
+        roster = run_extractor(
+            spark, "agent_information", args.period_start, args.period_end
+        )
 
-        with _log_step("compute_tnps_responses"):
-            result = compute_tnps_responses(roster, tnps)
-            LOGGER.info("  %s rows in final tnps_responses frame", f"{len(result):,}")
+    with _log_step("tnps_responses"):
+        tnps = run_extractor(
+            spark, "tnps_responses", args.period_start, args.period_end
+        )
 
-        expected_cols = [c for c, _ in IO_TNPS_RESPONSES_SCHEMA]
-        result = result[expected_cols]
+    with _log_step("compute_tnps_responses"):
+        result = compute_tnps_responses(roster, tnps)
 
-        if args.dry_run:
-            LOGGER.info("Dry run — not writing. Summary:")
-            print()
-            print(f"Rows (responses): {len(result):,}")
-            print(f"Agents:      {result['agent'].nunique():,}")
-            print(f"Dates:       {result['date'].nunique():,}")
+    if args.dry_run:
+        from pyspark.sql import functions as F
+
+        result = result.persist()
+        LOGGER.info("Dry run — not writing. Summary:")
+        print()
+        agg = result.agg(
+            F.count(F.lit(1)).alias("rows"),
+            F.countDistinct("agent").alias("agents"),
+            F.countDistinct("date").alias("dates"),
+            F.sum(F.col("survey_score").isNotNull().cast("int")).alias("valid"),
+            F.sum((F.col("survey_score") >= 9).cast("int")).alias("promoters"),
+            F.sum((F.col("survey_score") <= 6).cast("int")).alias("detractors"),
+            F.avg("survey_score").alias("score_mean"),
+        ).collect()[0]
+        print(f"Rows (responses): {agg['rows']:,}")
+        print(f"Agents:      {agg['agents']:,}")
+        print(f"Dates:       {agg['dates']:,}")
+        squads = sorted(
+            r["squad"]
+            for r in result.select("squad").distinct().collect()
+            if r["squad"] is not None
+        )
+        print(f"Squads:      {len(squads):,} ({', '.join(squads)})")
+        if agg["valid"]:
             print(
-                f"Squads:      {result['squad'].nunique():,} "
-                f"({', '.join(sorted(result['squad'].dropna().unique()))})"
+                f"survey_score: valid={agg['valid']:,}  "
+                f"promoters(>=9)={agg['promoters']:,}  "
+                f"detractors(<=6)={agg['detractors']:,}  "
+                f"mean={agg['score_mean']:.2f}"
             )
-            if not result.empty:
-                score = pd.to_numeric(result["survey_score"], errors="coerce")
-                valid = int(score.notna().sum())
-                promoters = int((score >= 9).sum())
-                detractors = int((score <= 6).sum())
-                print(
-                    f"survey_score: valid={valid:,}  "
-                    f"promoters(>=9)={promoters:,}  detractors(<=6)={detractors:,}  "
-                    f"mean={score.mean():.2f}"
-                )
-            print()
-            print("Head:")
-            print(result.head(10).to_string(index=False))
-            return 0
+        print()
+        print("Head:")
+        result.show(10, truncate=False)
+        result.unpersist()
+        return 0
 
-        with _log_step(f"write {args.target}"):
-            run = publish(
-                conn,
-                result,
-                args.target,
-                IO_TNPS_RESPONSES_SCHEMA,
-                layer="metrics_data",
-                period_start=args.period_start,
-                period_end=args.period_end,
-                run_id=args.run_id,
-                snapshot=not args.no_snapshot,
-            )
-            LOGGER.info(
-                "  wrote %s rows to %s (run_id=%s)",
-                f"{run.row_count:,}", args.target, run.run_id,
-            )
-            if run.snapshot_table:
-                LOGGER.info("  snapshot -> %s", run.snapshot_table)
-    finally:
-        conn.close()
+    with _log_step(f"write {args.target}"):
+        run = publish(
+            spark,
+            result,
+            args.target,
+            IO_TNPS_RESPONSES_SCHEMA,
+            layer="metrics_data",
+            period_start=args.period_start,
+            period_end=args.period_end,
+            run_id=args.run_id,
+            snapshot=not args.no_snapshot,
+        )
+        LOGGER.info(
+            "  wrote %s rows to %s (run_id=%s)",
+            f"{run.row_count:,}", args.target, run.run_id,
+        )
+        if run.snapshot_table:
+            LOGGER.info("  snapshot -> %s", run.snapshot_table)
 
     return 0
 
