@@ -111,7 +111,7 @@ def make_sprinklr(spark, rows):
         "qa_score": 90.0,
         "team_name": "SM",
         "scorecard_id": SPRINKLR_SCORECARD_ID,
-        "created_at": dt.datetime(2026, 7, 15, 9, 0),  # >= cutover
+        "created_at": dt.datetime(2026, 5, 15, 9, 0),  # >= cutover (2026-05-01)
     }
     return _rows_to_df(spark, _SPRINKLR_SCHEMA, rows, defaults)
 
@@ -356,42 +356,113 @@ class TestComputeQualityEvaluations:
 
 
 # ---------------------------------------------------------------------------
-# Sprinklr SM union — cutover (2026-07-01) + source provenance
+# Social-Media source SWITCH at 2026-05-01 (Playvox -> Sprinklr) + provenance
 # ---------------------------------------------------------------------------
+#
+# SM quality switches source at 2026-05-01: Playvox before, Sprinklr on/after.
+# This is a clean switch, not a union — Playvox SM rows on/after the cutover are
+# dropped so the two sources never coexist. The switch is scoped to the
+# Social-Media team (roster team='social media'); Core/Fraud are always Playvox.
 
 
-class TestSprinklrSmUnion:
-    def test_union_adds_rows_tagged_source(self, spark):
+def _sm_roster(spark, months):
+    """Social-Media roster rows for the given (snapshot_month, snapshot_date) pairs."""
+    return make_roster(
+        spark,
+        [
+            {"snapshot_month": m, "snapshot_date": d, "squad": "social",
+             "team": "social media"}
+            for m, d in months
+        ],
+    )
+
+
+_MAY = (dt.date(2026, 5, 1), dt.date(2026, 5, 31))
+_APR = (dt.date(2026, 4, 1), dt.date(2026, 4, 30))
+
+
+class TestSocialMediaSourceSwitch:
+    def test_sprinklr_used_on_or_after_cutover(self, spark):
         out = _collect(
             compute_quality_evaluations(
-                make_roster(
+                _sm_roster(spark, [_MAY]),
+                make_playvox(spark, []),
+                make_sprinklr(
                     spark,
-                    [{"snapshot_month": dt.date(2026, 7, 1),
-                      "snapshot_date": dt.date(2026, 7, 31), "squad": "social",
-                      "team": "social media"}],
+                    [{"evaluation_id": "sm-1", "created_at": dt.datetime(2026, 5, 15)}],
                 ),
+            )
+        )
+        assert [r["evaluation_id"] for r in out] == ["sm-1"]
+        assert out[0]["source"] == SOURCE_SPRINKLR_SM
+
+    def test_clean_switch_drops_playvox_sm_on_or_after_cutover(self, spark):
+        # An SM agent with BOTH a Playvox eval and a Sprinklr eval on the SAME May
+        # date -> only the Sprinklr one survives (no union, no double-count).
+        out = _collect(
+            compute_quality_evaluations(
+                _sm_roster(spark, [_MAY]),
                 make_playvox(
                     spark,
-                    [{"evaluation_id": "p-1", "created_at": dt.datetime(2026, 7, 10)}],
+                    [{"evaluation_id": "pv-may", "qa_score": 60.0,
+                      "created_at": dt.datetime(2026, 5, 15, 10, 0)}],
                 ),
                 make_sprinklr(
                     spark,
-                    [{"evaluation_id": "sm-1", "created_at": dt.datetime(2026, 7, 15)}],
+                    [{"evaluation_id": "spr-may", "qa_score": 95.0,
+                      "created_at": dt.datetime(2026, 5, 15, 11, 0)}],
                 ),
             )
         )
         by_id = {r["evaluation_id"]: r["source"] for r in out}
-        assert by_id == {"p-1": SOURCE_PLAYVOX, "sm-1": SOURCE_SPRINKLR_SM}
+        assert by_id == {"spr-may": SOURCE_SPRINKLR_SM}
+        assert "pv-may" not in by_id  # Playvox SM on/after cutover is dropped
 
-    def test_sprinklr_qa_score_and_scorecard_preserved(self, spark):
+    def test_playvox_sm_kept_before_cutover(self, spark):
+        # Before the cutover SM stays Playvox (and Sprinklr is floored out).
+        out = _collect(
+            compute_quality_evaluations(
+                _sm_roster(spark, [_APR]),
+                make_playvox(
+                    spark,
+                    [{"evaluation_id": "pv-apr", "qa_score": 80.0,
+                      "created_at": dt.datetime(2026, 4, 20, 10, 0)}],
+                ),
+                make_sprinklr(
+                    spark,
+                    [{"evaluation_id": "spr-apr", "qa_score": 95.0,
+                      "created_at": dt.datetime(2026, 4, 20, 11, 0)}],
+                ),
+            )
+        )
+        by_id = {r["evaluation_id"]: r["source"] for r in out}
+        assert by_id == {"pv-apr": SOURCE_PLAYVOX}  # Sprinklr Apr floored out
+
+    def test_core_fraud_always_playvox_even_after_cutover(self, spark):
+        # The switch is SM-only: a Core agent keeps Playvox on/after 2026-05-01.
         out = _collect(
             compute_quality_evaluations(
                 make_roster(
                     spark,
-                    [{"snapshot_month": dt.date(2026, 7, 1),
-                      "snapshot_date": dt.date(2026, 7, 31), "squad": "social",
-                      "team": "social media"}],
+                    [{"team": "core", "squad": "core",
+                      "snapshot_month": dt.date(2026, 5, 1),
+                      "snapshot_date": dt.date(2026, 5, 31)}],
                 ),
+                make_playvox(
+                    spark,
+                    [{"evaluation_id": "pv-core", "qa_score": 90.0,
+                      "created_at": dt.datetime(2026, 5, 15, 10, 0)}],
+                ),
+                make_sprinklr(spark, []),
+            )
+        )
+        by_id = {r["evaluation_id"]: r["source"] for r in out}
+        assert by_id == {"pv-core": SOURCE_PLAYVOX}
+
+    def test_sprinklr_qa_score_and_scorecard_preserved(self, spark):
+        out = _collect(
+            compute_quality_evaluations(
+                _sm_roster(spark, [_MAY]),
                 make_playvox(spark, []),
                 make_sprinklr(spark, [{"qa_score": 87.5}]),
             )
@@ -401,51 +472,36 @@ class TestSprinklrSmUnion:
         assert out[0]["source"] == SOURCE_SPRINKLR_SM
         assert out[0]["scorecard_id"] == SPRINKLR_SCORECARD_ID
 
-    def test_before_cutover_dropped(self, spark):
-        # A May/June Sprinklr row is dropped: SM stays Playvox-only pre-2026-07-01.
+    def test_sprinklr_before_cutover_dropped(self, spark):
+        # An April Sprinklr row is floored out; a May one is kept.
         out = _collect(
             compute_quality_evaluations(
-                make_roster(
-                    spark,
-                    [
-                        {"snapshot_month": dt.date(2026, 6, 1),
-                         "snapshot_date": dt.date(2026, 6, 30), "squad": "social",
-                         "team": "social media"},
-                        {"snapshot_month": dt.date(2026, 7, 1),
-                         "snapshot_date": dt.date(2026, 7, 31), "squad": "social",
-                         "team": "social media"},
-                    ],
-                ),
+                _sm_roster(spark, [_APR, _MAY]),
                 make_playvox(spark, []),
                 make_sprinklr(
                     spark,
                     [
-                        {"evaluation_id": "sm-jun", "created_at": dt.datetime(2026, 6, 20)},
-                        {"evaluation_id": "sm-jul", "created_at": dt.datetime(2026, 7, 2)},
+                        {"evaluation_id": "sm-apr", "created_at": dt.datetime(2026, 4, 20)},
+                        {"evaluation_id": "sm-may", "created_at": dt.datetime(2026, 5, 2)},
                     ],
                 ),
             )
         )
-        assert [r["evaluation_id"] for r in out] == ["sm-jul"]
+        assert [r["evaluation_id"] for r in out] == ["sm-may"]
 
     def test_cutover_boundary_is_inclusive(self, spark):
         out = _collect(
             compute_quality_evaluations(
-                make_roster(
-                    spark,
-                    [{"snapshot_month": dt.date(2026, 7, 1),
-                      "snapshot_date": dt.date(2026, 7, 31), "squad": "social",
-                      "team": "social media"}],
-                ),
+                _sm_roster(spark, [_MAY]),
                 make_playvox(spark, []),
                 make_sprinklr(
                     spark,
-                    [{"evaluation_id": "sm-edge", "created_at": dt.datetime(2026, 7, 1)}],
+                    [{"evaluation_id": "sm-edge", "created_at": dt.datetime(2026, 5, 1)}],
                 ),
             )
         )
         assert [r["evaluation_id"] for r in out] == ["sm-edge"]
-        assert SPRINKLR_SM_CUTOVER == dt.date(2026, 7, 1)
+        assert SPRINKLR_SM_CUTOVER == dt.date(2026, 5, 1)
 
     def test_empty_sprinklr_is_noop(self, spark):
         out = compute_quality_evaluations(
@@ -458,8 +514,8 @@ class TestSprinklrSmUnion:
         out = compute_quality_evaluations(
             make_roster(
                 spark,
-                [{"agent": "someone.else", "snapshot_month": dt.date(2026, 7, 1),
-                  "snapshot_date": dt.date(2026, 7, 31)}],
+                [{"agent": "someone.else", "snapshot_month": dt.date(2026, 5, 1),
+                  "snapshot_date": dt.date(2026, 5, 31)}],
             ),
             make_playvox(spark, []),
             make_sprinklr(spark, [{"agent": "jane.doe"}]),

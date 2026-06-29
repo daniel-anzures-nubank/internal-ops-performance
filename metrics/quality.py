@@ -17,13 +17,17 @@ the social team string is ``'social media'`` (with a space).
 
 Sources (Playvox + Sprinklr SM)
 -------------------------------
-Quality is scored from two feeds, unioned in the raw layer
-(``io_quality_evaluations_raw``): Playvox (Core / Fraud / Content / historically
-SM) and Sprinklr SM (Social-Media case QA, from the 2026-07-01 cutover onward).
-The raw table carries a ``source`` column ('playvox' / 'sprinklr_sm'). Dedup is
-**per (source, evaluation_id)** so a Playvox ``evaluation__id`` and a Sprinklr
-``case_number`` can never collide and silently drop a row (legacy dedups within
-each single-source notebook).
+Quality is scored from two feeds prepared by the raw layer
+(``io_quality_evaluations_raw``): Playvox (Core / Fraud, and Social Media before
+2026-05-01) and Sprinklr SM (Social-Media case QA on/after 2026-05-01). SM quality
+SWITCHES source Playvox->Sprinklr at 2026-05-01 (the raw layer drops Playvox SM
+rows on/after that date); Core/Fraud are always Playvox. The raw table carries a
+``source`` column ('playvox' / 'sprinklr_sm'). Dedup here is **per (source,
+evaluation_id)** so a Playvox ``evaluation__id`` and a Sprinklr ``case_number``
+can never collide and silently drop a row (legacy dedups within each single-source
+notebook). NOTE: the SM-source switch (2026-05-01) is an enhancement beyond legacy
+and is independent of ``QUALITY_CUTOVER`` (2026-07-01), which gates only the
+legacy blacklist / outage quirks below.
 
 Input
 -----

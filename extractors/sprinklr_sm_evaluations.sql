@@ -25,14 +25,15 @@
 --     revision (latest `checklist_modified_date`), analogous to the Playvox
 --     `ROW_NUMBER()` dedup.
 --
--- Cutover (>= 2026-07-01)
---   Legacy SM quality (`[IO] Performance 2026 - Social Media.sql` qa_base) is
---   Playvox-ONLY — there is no Sprinklr union in the SM notebook. So for
---   byte-for-byte parity, Social-Media quality stays Playvox-only before the
---   2026-07-01 cutover; scoring SM from Sprinklr is a deliberate post-cutover
---   change. This feed is hard-floored at 2026-07-01 regardless of
---   `:period_start`. The floor is also enforced defensively in
---   `metrics_data/quality_evaluations.py` via `SPRINKLR_SM_CUTOVER`.
+-- Cutover (>= 2026-05-01)
+--   SM QA evaluations migrated Playvox -> Sprinklr in May 2026, so SM quality
+--   SWITCHES source at 2026-05-01: Playvox before, Sprinklr on/after. This feed
+--   is hard-floored at 2026-05-01 regardless of `:period_start`; below that date
+--   SM stays Playvox. The metrics_data layer drops Playvox SM rows on/after the
+--   cutover so the switch is clean (not a union) and enforces the same floor via
+--   `SPRINKLR_SM_CUTOVER`. NOTE: this is a deliberate enhancement beyond legacy,
+--   whose SM-quality block (`[IO] Performance 2026 - Social Media.sql` qa_base)
+--   is Playvox-ONLY and goes dark when SM Playvox evals stop mid-May.
 --
 -- Out of scope (handled by the metrics_data / metrics layers)
 --   * Roster join, `status = 'active'` filter, squad/team derivation.
@@ -70,7 +71,7 @@ WITH sm_filtered AS (
   LEFT JOIN usr.mx__enablement.sprinklr_sm_users mon ON sm.auditor    = mon.user_name
   WHERE sm.report_date >= :period_start
     AND sm.report_date <  DATE_ADD(:period_end, 1)
-    AND sm.report_date >= DATE '2026-07-01'
+    AND sm.report_date >= DATE '2026-05-01'
     AND COALESCE(mon.user_email, '') NOT IN (CONCAT('testuser', '@', 'nu.com.mx'))
 )
 SELECT
