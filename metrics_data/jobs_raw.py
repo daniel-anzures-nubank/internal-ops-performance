@@ -58,21 +58,6 @@ DIME definition: slots with non-null ``activity_type_required`` not in
 ('available', 'oos')``. Jobs done for an activity the agent wasn't scheduled
 for that day (e.g. cross-support) get flag 0.
 
-``dimensioned_activity`` (the second derived field)
----------------------------------------------------
-The DIME ``dimensioned_activity`` of the 30-minute slot the job's ``start_time``
-falls into, or NULL if the job doesn't start inside any DIME slot. This mirrors
-legacy ``manual_adjustments_ntpj`` (``[IO] NTPJ Dataset.sql`` lines 148-240),
-which marks a ``(agent, dime_date, slot_start, dimensioned_activity)`` slot as
-excluded and then drops any job whose ``start_date`` lands in that slot. Legacy
-reads the **RAW** DIME feed for this (``agent_dimensioned_activities ∪
-h1_missing_dime_slots`` with only ``affiliation='nubank' AND dime_date >=
-2025-01-01`` — see lines 226-239), NOT the NTPJ-filtered ``dime_ntpj``, so we
-join against the **unfiltered** dime extractor here. The downstream
-``Reasignaciones DIME`` adjustment matcher (``adjustments.manual
-.drop_reassignment_jobs``) uses this column to drop reassigned jobs from BOTH the
-benchmark pool and the contribution.
-
 Deferred to the metrics layer (NOT done here)
 ---------------------------------------------
 * Aggregation to (agent, date, job_id) with count / duration.
@@ -100,7 +85,6 @@ Output schema (one row per job)
     status                         STRING
     job_id                         STRING   legacy job_id naming (used for benchmark joins)
     duration_seconds               BIGINT   net time spent on the job
-    dimensioned_activity           STRING   DIME dimensioned_activity of the slot the job starts in (NULL if none)
     required_activity_on_day_flag  INT      1 if scheduled for that activity that day, else 0
 """
 
@@ -305,84 +289,6 @@ def compute_required_activities(dime_filtered: DataFrame) -> DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Step 2b: per-job dimensioned_activity (RAW dime slot-time join)
-# ---------------------------------------------------------------------------
-
-
-def attach_dimensioned_activity(jobs: DataFrame, dime_raw: DataFrame) -> DataFrame:
-    """Attach each job's DIME ``dimensioned_activity`` via a slot-time join.
-
-    For every job, find the 30-minute DIME slot its ``start_time`` falls into and
-    take that slot's ``dimensioned_activity`` (NULL when no slot covers the job
-    start). Legacy ``manual_adjustments_ntpj`` reads the **RAW** DIME feed for
-    this (``agent_dimensioned_activities ∪ h1_missing_dime_slots``, only
-    ``affiliation='nubank' AND dime_date >= 2025-01-01`` — no NTPJ DIME filter),
-    so ``dime_raw`` here is the **unfiltered** dime extractor output (NOT
-    :func:`filter_dime`). The join keys mirror ``occupancy_time``'s slot/job
-    overlap join: ``agent`` + ``date`` + the job start within
-    ``[slot_start_local_unix, slot_end_local_unix)``.
-
-    ``slot_start_local_unix`` is a "local-time unix" (legacy reads the local
-    timestamp via ``UNIX_TIMESTAMP`` as if UTC). The session timezone is UTC, so
-    ``F.unix_timestamp(start_time)`` of a local-wall-clock timestamp produces the
-    matching local-time unix — exactly the convention :mod:`occupancy_time` uses.
-
-    A job should land in at most one slot, but DIME can carry overlapping /
-    duplicate slot rows (e.g. ``h1_missing_dime_slots`` re-adds a slot under a
-    different ``agent_dime_squad``). To keep exactly one row per job we pick
-    deterministically the slot with the latest ``slot_start_local_unix`` that is
-    ``<=`` the job start (the slot the job start actually lands in), tie-broken by
-    ``dimensioned_activity``, via a per-job ``row_number`` so the join can never
-    fan out the job rows.
-    """
-    job_start_unix = F.unix_timestamp(F.col("start_time"))
-
-    slots = dime_raw.select(
-        F.col("agent").alias("_d_agent"),
-        F.to_date(F.col("date")).alias("_d_date"),
-        F.col("slot_start_local_unix").alias("_slot_start"),
-        F.col("slot_end_local_unix").alias("_slot_end"),
-        F.col("dimensioned_activity").alias("_dimensioned_activity"),
-    )
-
-    # Tag every job row so we can re-key after the (potentially fan-out) join and
-    # collapse back to one row per job.
-    jobs_tagged = jobs.withColumn("_job_rn", F.monotonically_increasing_id())
-
-    joined = jobs_tagged.join(
-        slots,
-        (F.col("agent") == F.col("_d_agent"))
-        & (F.to_date(F.col("date")) == F.col("_d_date"))
-        & (job_start_unix >= F.col("_slot_start"))
-        & (job_start_unix < F.col("_slot_end")),
-        how="left",
-    )
-
-    # Deterministically keep the single covering slot per job (latest slot_start
-    # <= job start; ties broken by dimensioned_activity). NULL-covering jobs have
-    # one all-NULL match row from the LEFT join and survive with rn == 1.
-    pick = Window.partitionBy("_job_rn").orderBy(
-        F.col("_slot_start").desc_nulls_last(),
-        F.col("_dimensioned_activity").asc_nulls_last(),
-    )
-    deduped = (
-        joined.withColumn("_pick_rn", F.row_number().over(pick))
-        .filter(F.col("_pick_rn") == 1)
-        .withColumn("dimensioned_activity", F.col("_dimensioned_activity"))
-        .drop(
-            "_d_agent",
-            "_d_date",
-            "_slot_start",
-            "_slot_end",
-            "_dimensioned_activity",
-            "_pick_rn",
-            "_job_rn",
-        )
-    )
-    return deduped
-
-
-# ---------------------------------------------------------------------------
 # Step 3: orchestrator — union jobs + flag + roster join
 # ---------------------------------------------------------------------------
 
@@ -429,24 +335,6 @@ def compute_jobs_raw(
         "required_activity_on_day_flag",
         (F.coalesce(F.col("required_flag"), F.lit(0)) > 0).cast("int"),
     ).drop("required_flag")
-
-    # --- dimensioned_activity (RAW dime slot-time join) ---------------------
-    # Legacy ``manual_adjustments_ntpj`` reads the UNFILTERED dime feed (no NTPJ
-    # DIME filter — see module docstring), so we join the raw ``dime`` here. The
-    # raw dime is re-attributed with the SAME night-shift rule as the jobs (keyed
-    # off ``slot_start_local_unix``) so the slot-time join's ``date`` alignment
-    # matches the re-attributed jobs.
-    dime_raw = dime.withColumn(
-        "_local_ts", F.timestamp_seconds(F.col("slot_start_local_unix"))
-    )
-    dime_raw = shift_start_date(
-        dime_raw,
-        agent_col="agent",
-        local_ts_col="_local_ts",
-        calendar_date_col="date",
-        night_months=night_months,
-    ).drop("_local_ts")
-    jobs = attach_dimensioned_activity(jobs, dime_raw)
 
     # --- roster join (LEFT, with legacy 2025 pinning) -----------------------
     # Legacy builds the benchmark from the un-roster-filtered pool and applies
@@ -516,7 +404,6 @@ def compute_jobs_raw(
         "end_time",
         "job_type",
         "activity_type",
-        "dimensioned_activity",
         "status",
         "job_id",
         F.col("duration_seconds").cast("long").alias("duration_seconds"),
@@ -546,7 +433,6 @@ IO_JOBS_RAW_SCHEMA: tuple[tuple[str, str], ...] = (
     ("end_time", "TIMESTAMP"),
     ("job_type", "STRING"),
     ("activity_type", "STRING"),
-    ("dimensioned_activity", "STRING"),
     ("status", "STRING"),
     ("job_id", "STRING"),
     ("duration_seconds", "BIGINT"),
