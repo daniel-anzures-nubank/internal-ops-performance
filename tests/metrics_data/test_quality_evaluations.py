@@ -1,21 +1,20 @@
-"""Unit tests for ``metrics_data/quality_evaluations.py``.
+"""Unit tests for ``metrics_data/quality_evaluations.py`` (PySpark).
 
-Small synthetic pandas frames, no warehouse, sub-second runs.
+Small synthetic Spark frames, no warehouse.
 
-quality_evaluations is a RAW dataset: one row per individual QA evaluation
-(no per-day aggregation). Two sources unioned: Playvox (all teams) and Sprinklr
-SM (Social Media, >= 2026-05-01). We verify the source filters, the
-per-evaluation shaping, the Sprinklr cutover + ``source`` tagging, and the
-roster join that attaches the standardized dimensions (agent, xforce, xplead,
-squad, district, shift).
+quality_evaluations is a RAW dataset: one row per individual QA evaluation (no
+per-day aggregation). Two sources unioned: Playvox (all teams) and Sprinklr SM
+(Social Media, >= 2026-07-01). We verify the Playvox source gate, the
+per-evaluation shaping, the Sprinklr cutover + ``source`` tagging, the
+``scorecard_id`` / ``created_at`` carry-through, and the roster join that
+attaches the standardized dimensions.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 
-import pandas as pd
-import pytest
+from pyspark.sql import types as T
 
 from quality_evaluations import (
     IO_QUALITY_EVALUATIONS_SCHEMA,
@@ -23,9 +22,8 @@ from quality_evaluations import (
     QUALITY_OUT_OF_SCOPE_SQUADS,
     SOURCE_PLAYVOX,
     SOURCE_SPRINKLR_SM,
+    SPRINKLR_SCORECARD_ID,
     SPRINKLR_SM_CUTOVER,
-    _is_nubank_email,
-    build_evaluations,
     compute_quality_evaluations,
     filter_playvox,
 )
@@ -39,48 +37,86 @@ def _mock_email(local: str, domain: str = _NUBANK_DOMAIN) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Builders
+# Schemas + builders (mirror the extractor outputs)
 # ---------------------------------------------------------------------------
 
+_PLAYVOX_SCHEMA = T.StructType(
+    [
+        T.StructField("evaluation_id", T.StringType()),
+        T.StructField("agent", T.StringType()),
+        T.StructField("agent_email", T.StringType()),
+        T.StructField("team_name", T.StringType()),
+        T.StructField("scorecard_id", T.StringType()),
+        T.StructField("qa_score", T.DoubleType()),
+        T.StructField("created_at", T.TimestampType()),
+        T.StructField("updated_at", T.TimestampType()),
+    ]
+)
 
-def make_playvox_row(**overrides) -> dict:
-    base = {
+_SPRINKLR_SCHEMA = T.StructType(
+    [
+        T.StructField("evaluation_id", T.StringType()),
+        T.StructField("agent", T.StringType()),
+        T.StructField("qa_score", T.DoubleType()),
+        T.StructField("team_name", T.StringType()),
+        T.StructField("scorecard_id", T.StringType()),
+        T.StructField("created_at", T.TimestampType()),
+    ]
+)
+
+_ROSTER_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("actor_id", T.StringType()),
+        T.StructField("xforce", T.StringType()),
+        T.StructField("xplead", T.StringType()),
+        T.StructField("team", T.StringType()),
+        T.StructField("squad", T.StringType()),
+        T.StructField("squad_district", T.StringType()),
+        T.StructField("status", T.StringType()),
+        T.StructField("shift", T.StringType()),
+        T.StructField("snapshot_date", T.DateType()),
+        T.StructField("snapshot_month", T.DateType()),
+        T.StructField("hire_start_date", T.DateType()),
+        T.StructField("last_change_date", T.DateType()),
+    ]
+)
+
+
+def _rows_to_df(spark, schema, rows, defaults):
+    data = [{**defaults, **r} for r in rows]
+    return spark.createDataFrame(
+        [tuple(r[f.name] for f in schema.fields) for r in data], schema
+    )
+
+
+def make_playvox(spark, rows):
+    defaults = {
         "evaluation_id": "p-1",
         "agent": "jane.doe",
         "agent_email": _mock_email("jane.doe"),
         "team_name": "CREDIT",
         "scorecard_id": "sc-abc",
-        "qa_score": 0.85,
+        "qa_score": 85.0,
         "created_at": dt.datetime(2026, 4, 15, 10, 30),
         "updated_at": dt.datetime(2026, 4, 15, 11, 0),
     }
-    base.update(overrides)
-    return base
+    return _rows_to_df(spark, _PLAYVOX_SCHEMA, rows, defaults)
 
 
-def make_playvox(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame([make_playvox_row(**r) for r in rows])
-
-
-def make_sprinklr_row(**overrides) -> dict:
-    # Shape mirrors extractors/sprinklr_sm_evaluations.sql output (the columns
-    # build_evaluations consumes). Default date is on/after the SM cutover.
-    base = {
+def make_sprinklr(spark, rows):
+    defaults = {
         "evaluation_id": "sm-1",
         "agent": "jane.doe",
         "qa_score": 90.0,
         "team_name": "SM",
-        "created_at": dt.datetime(2026, 5, 15, 9, 0),
+        "scorecard_id": SPRINKLR_SCORECARD_ID,
+        "created_at": dt.datetime(2026, 5, 15, 9, 0),  # >= cutover (2026-05-01)
     }
-    base.update(overrides)
-    return base
+    return _rows_to_df(spark, _SPRINKLR_SCHEMA, rows, defaults)
 
 
-def make_sprinklr(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame([make_sprinklr_row(**r) for r in rows])
-
-
-def make_roster(rows: list[dict]) -> pd.DataFrame:
+def make_roster(spark, rows):
     defaults = {
         "agent": "jane.doe",
         "actor_id": "actor-1",
@@ -96,117 +132,45 @@ def make_roster(rows: list[dict]) -> pd.DataFrame:
         "hire_start_date": dt.date(2025, 1, 15),
         "last_change_date": dt.date(2025, 1, 15),
     }
-    return pd.DataFrame([{**defaults, **r} for r in rows])
+    return _rows_to_df(spark, _ROSTER_SCHEMA, rows, defaults)
+
+
+def _collect(df):
+    return [r.asDict() for r in df.collect()]
 
 
 # ---------------------------------------------------------------------------
-# _is_nubank_email
-# ---------------------------------------------------------------------------
-
-
-class TestIsNubankEmail:
-    @pytest.mark.parametrize(
-        "email",
-        [
-            _mock_email("jane.doe"),
-            _mock_email("jose.luis"),
-            _mock_email("maria.elena2"),
-            _mock_email("j.d"),
-        ],
-    )
-    def test_matches_canonical_nubank_emails(self, email):
-        assert _is_nubank_email(email)
-
-    @pytest.mark.parametrize(
-        "email",
-        [
-            _mock_email("jane.doe", _EXTERNAL_DOMAIN),
-            _mock_email("jane.doe", "consorcio.example.com"),
-            _mock_email("jane"),
-            _mock_email("jane.doe.smith"),
-            _mock_email("jane.doe", "nu-mx.example.com"),
-        ],
-    )
-    def test_rejects_non_nubank(self, email):
-        assert not _is_nubank_email(email)
-
-    def test_uppercase_tolerated(self):
-        assert _is_nubank_email(_mock_email("JANE.DOE"))
-
-    @pytest.mark.parametrize("bad", [None, float("nan"), 0, 12, [], {}])
-    def test_null_and_non_string_safe(self, bad):
-        assert not _is_nubank_email(bad)
-
-
-# ---------------------------------------------------------------------------
-# filter_playvox
+# filter_playvox — source gate
 # ---------------------------------------------------------------------------
 
 
 class TestFilterPlayvox:
-    def test_keeps_a_well_formed_row(self):
-        out = filter_playvox(make_playvox([{}]))
-        assert len(out) == 1
+    def test_keeps_a_well_formed_row(self, spark):
+        assert filter_playvox(make_playvox(spark, [{}])).count() == 1
 
-    @pytest.mark.parametrize("team", list(PLAYVOX_TEAM_NAME_EXCLUSIONS))
-    def test_drops_excluded_teams(self, team):
-        out = filter_playvox(make_playvox([{"team_name": team}]))
-        assert out.empty
+    def test_drops_excluded_teams(self, spark):
+        for team in PLAYVOX_TEAM_NAME_EXCLUSIONS:
+            out = filter_playvox(make_playvox(spark, [{"team_name": team}]))
+            assert out.count() == 0
 
-    def test_drops_non_nubank_email(self):
+    def test_drops_non_nubank_email(self, spark):
         out = filter_playvox(
-            make_playvox([{"agent_email": _mock_email("jane.doe", _EXTERNAL_DOMAIN)}])
+            make_playvox(spark, [{"agent_email": _mock_email("jane.doe", _EXTERNAL_DOMAIN)}])
         )
-        assert out.empty
+        assert out.count() == 0
 
-    def test_does_not_apply_scorecard_blacklist(self):
-        legacy_blacklist = [
-            "68def79b3f83da8cc9cb5299",
-            "6812b3e46abeabb0653d197e",
-        ]
+    def test_keeps_email_with_numeric_suffix(self, spark):
         out = filter_playvox(
-            make_playvox(
-                [
-                    {"evaluation_id": f"e{i}", "scorecard_id": sc}
-                    for i, sc in enumerate(legacy_blacklist)
-                ]
-            )
+            make_playvox(spark, [{"agent_email": _mock_email("maria.elena2")}])
         )
-        assert len(out) == len(legacy_blacklist)
+        assert out.count() == 1
 
-    def test_empty_input_returns_empty(self):
-        out = filter_playvox(make_playvox([])[0:0])
-        assert out.empty
-
-
-# ---------------------------------------------------------------------------
-# build_evaluations
-# ---------------------------------------------------------------------------
-
-
-class TestBuildEvaluations:
-    def test_keeps_all_playvox_rows(self):
-        out = build_evaluations(
-            make_playvox([{"evaluation_id": "p-1"}, {"evaluation_id": "p-2"}]),
+    def test_does_not_apply_scorecard_blacklist(self, spark):
+        # The scorecard blacklist is a metrics-layer concern, not a source gate.
+        out = filter_playvox(
+            make_playvox(spark, [{"scorecard_id": "68def79b3f83da8cc9cb5299"}])
         )
-        assert sorted(out["evaluation_id"]) == ["p-1", "p-2"]
-
-    def test_derives_date_from_created_at(self):
-        out = build_evaluations(
-            make_playvox([{"created_at": dt.datetime(2026, 4, 15, 23, 59)}]),
-        )
-        assert out.iloc[0]["date"] == dt.date(2026, 4, 15)
-
-    def test_drops_empty_string_agent(self):
-        out = build_evaluations(
-            make_playvox([{"evaluation_id": "p-1", "agent": ""}]),
-        )
-        assert out.empty
-
-    def test_empty_input_returns_empty_with_columns(self):
-        out = build_evaluations(make_playvox([])[0:0])
-        assert out.empty
-        assert "date" in out.columns
+        assert out.count() == 1
 
 
 # ---------------------------------------------------------------------------
@@ -215,219 +179,345 @@ class TestBuildEvaluations:
 
 
 class TestComputeQualityEvaluations:
-    def test_one_evaluation_one_row(self):
-        out = compute_quality_evaluations(
-            agent_info=make_roster([{}]),
-            playvox=make_playvox([{"qa_score": 0.8}]),
+    def test_one_evaluation_one_row(self, spark):
+        out = _collect(
+            compute_quality_evaluations(
+                make_roster(spark, [{}]), make_playvox(spark, [{"qa_score": 80.0}])
+            )
         )
         assert len(out) == 1
-        row = out.iloc[0]
+        row = out[0]
         assert row["agent"] == "jane.doe"
         assert row["date"] == dt.date(2026, 4, 15)
-        assert pytest.approx(float(row["qa_score"])) == 0.8
+        assert abs(row["qa_score"] - 80.0) < 1e-9
         assert row["evaluation_id"] == "p-1"
         assert row["squad"] == "core"
         assert row["district"] == "northeast"
         assert row["shift"] == "morning"
+        assert row["source"] == SOURCE_PLAYVOX
 
-    def test_two_evaluations_same_day_two_rows(self):
-        out = compute_quality_evaluations(
-            agent_info=make_roster([{}]),
-            playvox=make_playvox(
-                [
-                    {"evaluation_id": "p-1", "qa_score": 0.6},
-                    {"evaluation_id": "p-2", "qa_score": 1.0},
-                ]
-            ),
+    def test_scorecard_id_carried_through(self, spark):
+        out = _collect(
+            compute_quality_evaluations(
+                make_roster(spark, [{}]),
+                make_playvox(spark, [{"scorecard_id": "sc-xyz"}]),
+            )
         )
-        assert len(out) == 2
-        assert sorted(out["evaluation_id"]) == ["p-1", "p-2"]
+        assert out[0]["scorecard_id"] == "sc-xyz"
 
-    def test_inactive_agent_dropped(self):
+    def test_created_at_carried_through(self, spark):
+        ts = dt.datetime(2026, 4, 15, 13, 45)
+        out = _collect(
+            compute_quality_evaluations(
+                make_roster(spark, [{}]),
+                make_playvox(spark, [{"created_at": ts}]),
+            )
+        )
+        assert out[0]["created_at"] == ts
+
+    def test_date_derived_from_created_at(self, spark):
+        # Mid-day timestamp: on Databricks `created_at` is UTC-naive MX-local and
+        # `to_date` == legacy `DATE_TRUNC('DAY', ...)`. A 23:59 boundary value would
+        # shift a day on the LOCAL test JVM (it ingests the naive datetime in the
+        # machine tz, not UTC) — a known session-tz fixture quirk, not a code bug.
+        out = _collect(
+            compute_quality_evaluations(
+                make_roster(spark, [{}]),
+                make_playvox(spark, [{"created_at": dt.datetime(2026, 4, 15, 12, 0)}]),
+            )
+        )
+        assert out[0]["date"] == dt.date(2026, 4, 15)
+
+    def test_two_evaluations_same_day_two_rows(self, spark):
+        out = _collect(
+            compute_quality_evaluations(
+                make_roster(spark, [{}]),
+                make_playvox(
+                    spark,
+                    [
+                        {"evaluation_id": "p-1", "qa_score": 60.0},
+                        {"evaluation_id": "p-2", "qa_score": 100.0},
+                    ],
+                ),
+            )
+        )
+        assert sorted(r["evaluation_id"] for r in out) == ["p-1", "p-2"]
+
+    def test_inactive_agent_dropped(self, spark):
         out = compute_quality_evaluations(
-            agent_info=make_roster([{"status": "inactive"}]),
-            playvox=make_playvox([{}]),        )
-        assert out.empty
+            make_roster(spark, [{"status": "inactive"}]), make_playvox(spark, [{}])
+        )
+        assert out.count() == 0
 
     def test_out_of_scope_squads_constant_is_empty(self):
         assert QUALITY_OUT_OF_SCOPE_SQUADS == ()
 
-    @pytest.mark.parametrize("squad", ["social", "content"])
-    def test_social_and_content_squads_kept(self, squad):
-        out = compute_quality_evaluations(
-            agent_info=make_roster([{"squad": squad}]),
-            playvox=make_playvox([{}]),        )
-        assert len(out) == 1
-        assert out.iloc[0]["squad"] == squad
+    def test_social_and_content_squads_kept(self, spark):
+        for squad, team in (("social", "social media"), ("content", "content")):
+            out = _collect(
+                compute_quality_evaluations(
+                    make_roster(spark, [{"squad": squad, "team": team}]),
+                    make_playvox(spark, [{}]),
+                )
+            )
+            assert len(out) == 1
+            assert out[0]["squad"] == squad
 
-    def test_null_squad_agent_dropped(self):
+    def test_null_squad_agent_dropped(self, spark):
         out = compute_quality_evaluations(
-            agent_info=make_roster([{"squad": None}]),
-            playvox=make_playvox([{}]),        )
-        assert out.empty
+            make_roster(spark, [{"squad": None}]), make_playvox(spark, [{}])
+        )
+        assert out.count() == 0
 
-    def test_team_name_blacklist_applied(self):
+    def test_team_name_blacklist_applied(self, spark):
         out = compute_quality_evaluations(
-            agent_info=make_roster([{}]),
-            playvox=make_playvox([{"team_name": "REGULATORY SOLUTIONS"}]),        )
-        assert out.empty
+            make_roster(spark, [{}]),
+            make_playvox(spark, [{"team_name": "REGULATORY SOLUTIONS"}]),
+        )
+        assert out.count() == 0
 
-    def test_non_nubank_email_dropped(self):
+    def test_non_nubank_email_dropped(self, spark):
         out = compute_quality_evaluations(
-            agent_info=make_roster([{}]),
-            playvox=make_playvox(
-                [{"agent_email": _mock_email("jane.doe", _EXTERNAL_DOMAIN)}]
-            ),        )
-        assert out.empty
+            make_roster(spark, [{}]),
+            make_playvox(spark, [{"agent_email": _mock_email("jane.doe", _EXTERNAL_DOMAIN)}]),
+        )
+        assert out.count() == 0
 
-    def test_no_roster_match_dropped(self):
+    def test_no_roster_match_dropped(self, spark):
         out = compute_quality_evaluations(
-            agent_info=make_roster([{"agent": "someone.else"}]),
-            playvox=make_playvox([{}]),        )
-        assert out.empty
+            make_roster(spark, [{"agent": "someone.else"}]), make_playvox(spark, [{}])
+        )
+        assert out.count() == 0
 
-    def test_uses_natural_snapshot_month(self):
-        out = compute_quality_evaluations(
-            agent_info=make_roster(
-                [
-                    {"snapshot_month": dt.date(2026, 3, 1), "squad": "core"},
-                    {"snapshot_month": dt.date(2026, 4, 1), "squad": "credit"},
-                ]
-            ),
-            playvox=make_playvox(
-                [
-                    {"evaluation_id": "p-mar", "created_at": dt.datetime(2026, 3, 15)},
-                    {"evaluation_id": "p-apr", "created_at": dt.datetime(2026, 4, 15)},
-                ]
-            ),        )
-        assert len(out) == 2
-        squads_by_date = dict(zip(out["date"], out["squad"]))
+    def test_uses_natural_snapshot_month(self, spark):
+        out = _collect(
+            compute_quality_evaluations(
+                make_roster(
+                    spark,
+                    [
+                        {"snapshot_month": dt.date(2026, 3, 1),
+                         "snapshot_date": dt.date(2026, 3, 31), "squad": "core"},
+                        {"snapshot_month": dt.date(2026, 4, 1),
+                         "snapshot_date": dt.date(2026, 4, 30), "squad": "credit"},
+                    ],
+                ),
+                make_playvox(
+                    spark,
+                    [
+                        {"evaluation_id": "p-mar", "created_at": dt.datetime(2026, 3, 15)},
+                        {"evaluation_id": "p-apr", "created_at": dt.datetime(2026, 4, 15)},
+                    ],
+                ),
+            )
+        )
+        squads_by_date = {r["date"]: r["squad"] for r in out}
         assert squads_by_date[dt.date(2026, 3, 15)] == "core"
         assert squads_by_date[dt.date(2026, 4, 15)] == "credit"
 
-    def test_outage_dates_not_filtered(self):
-        out = compute_quality_evaluations(
-            agent_info=make_roster(
-                [
-                    {"snapshot_month": dt.date(2026, 3, 1)},
-                    {"snapshot_month": dt.date(2026, 4, 1)},
-                ]
-            ),
-            playvox=make_playvox(
-                [
-                    {"evaluation_id": "p-1", "created_at": dt.datetime(2026, 3, 27)},
-                    {"evaluation_id": "p-2", "created_at": dt.datetime(2026, 4, 9)},
-                ]
-            ),        )
-        assert sorted(out["date"]) == [dt.date(2026, 3, 27), dt.date(2026, 4, 9)]
-
-    def test_output_schema_and_column_order(self):
-        out = compute_quality_evaluations(
-            agent_info=make_roster([{}]),
-            playvox=make_playvox([{}]),        )
-        assert list(out.columns) == [c for c, _ in IO_QUALITY_EVALUATIONS_SCHEMA]
-
-    def test_empty_inputs_yield_empty_frame_with_schema(self):
-        out = compute_quality_evaluations(
-            agent_info=make_roster([{}]),
-            playvox=make_playvox([])[0:0],        )
-        assert out.empty
-        assert list(out.columns) == [c for c, _ in IO_QUALITY_EVALUATIONS_SCHEMA]
-
-    def test_playvox_rows_tagged_source_playvox(self):
-        out = compute_quality_evaluations(
-            agent_info=make_roster([{}]),
-            playvox=make_playvox([{}]),
+    def test_outage_dates_not_filtered_in_raw(self, spark):
+        # The raw layer is intentionally minimal; outage filtering is metrics-layer.
+        out = _collect(
+            compute_quality_evaluations(
+                make_roster(
+                    spark,
+                    [
+                        {"snapshot_month": dt.date(2026, 3, 1),
+                         "snapshot_date": dt.date(2026, 3, 31)},
+                        {"snapshot_month": dt.date(2026, 4, 1),
+                         "snapshot_date": dt.date(2026, 4, 30)},
+                    ],
+                ),
+                make_playvox(
+                    spark,
+                    [
+                        {"evaluation_id": "p-1", "created_at": dt.datetime(2026, 3, 27)},
+                        {"evaluation_id": "p-2", "created_at": dt.datetime(2026, 4, 9)},
+                    ],
+                ),
+            )
         )
-        assert (out["source"] == SOURCE_PLAYVOX).all()
+        assert sorted(r["date"] for r in out) == [dt.date(2026, 3, 27), dt.date(2026, 4, 9)]
 
-    def test_no_sprinklr_arg_is_playvox_only(self):
-        # Backwards-compat: omitting sprinklr_sm yields Playvox-only output.
+    def test_output_schema_and_column_order(self, spark):
+        out = compute_quality_evaluations(make_roster(spark, [{}]), make_playvox(spark, [{}]))
+        assert out.columns == [c for c, _ in IO_QUALITY_EVALUATIONS_SCHEMA]
+
+    def test_empty_playvox_yields_empty(self, spark):
         out = compute_quality_evaluations(
-            agent_info=make_roster([{}]),
-            playvox=make_playvox([{}]),
+            make_roster(spark, [{}]), make_playvox(spark, [])
         )
-        assert len(out) == 1
-        assert set(out["source"]) == {SOURCE_PLAYVOX}
+        assert out.count() == 0
+        assert out.columns == [c for c, _ in IO_QUALITY_EVALUATIONS_SCHEMA]
+
+    def test_no_sprinklr_arg_is_playvox_only(self, spark):
+        out = compute_quality_evaluations(make_roster(spark, [{}]), make_playvox(spark, [{}]))
+        assert out.count() == 1
+        assert {r["source"] for r in out.collect()} == {SOURCE_PLAYVOX}
 
 
 # ---------------------------------------------------------------------------
-# Sprinklr SM union — cutover + source provenance
+# Social-Media source SWITCH at 2026-05-01 (Playvox -> Sprinklr) + provenance
 # ---------------------------------------------------------------------------
+#
+# SM quality switches source at 2026-05-01: Playvox before, Sprinklr on/after.
+# This is a clean switch, not a union — Playvox SM rows on/after the cutover are
+# dropped so the two sources never coexist. The switch is scoped to the
+# Social-Media team (roster team='social media'); Core/Fraud are always Playvox.
 
 
-class TestSprinklrSmUnion:
-    def test_union_adds_rows_tagged_source(self):
-        out = compute_quality_evaluations(
-            agent_info=make_roster([{"snapshot_month": dt.date(2026, 5, 1)}]),
-            playvox=make_playvox(
-                [{"evaluation_id": "p-1", "created_at": dt.datetime(2026, 5, 10)}]
-            ),
-            sprinklr_sm=make_sprinklr(
-                [{"evaluation_id": "sm-1", "created_at": dt.datetime(2026, 5, 15)}]
-            ),
+def _sm_roster(spark, months):
+    """Social-Media roster rows for the given (snapshot_month, snapshot_date) pairs."""
+    return make_roster(
+        spark,
+        [
+            {"snapshot_month": m, "snapshot_date": d, "squad": "social",
+             "team": "social media"}
+            for m, d in months
+        ],
+    )
+
+
+_MAY = (dt.date(2026, 5, 1), dt.date(2026, 5, 31))
+_APR = (dt.date(2026, 4, 1), dt.date(2026, 4, 30))
+
+
+class TestSocialMediaSourceSwitch:
+    def test_sprinklr_used_on_or_after_cutover(self, spark):
+        out = _collect(
+            compute_quality_evaluations(
+                _sm_roster(spark, [_MAY]),
+                make_playvox(spark, []),
+                make_sprinklr(
+                    spark,
+                    [{"evaluation_id": "sm-1", "created_at": dt.datetime(2026, 5, 15)}],
+                ),
+            )
         )
-        assert len(out) == 2
-        by_id = dict(zip(out["evaluation_id"], out["source"]))
-        assert by_id["p-1"] == SOURCE_PLAYVOX
-        assert by_id["sm-1"] == SOURCE_SPRINKLR_SM
+        assert [r["evaluation_id"] for r in out] == ["sm-1"]
+        assert out[0]["source"] == SOURCE_SPRINKLR_SM
 
-    def test_sprinklr_qa_score_preserved(self):
-        out = compute_quality_evaluations(
-            agent_info=make_roster([{"snapshot_month": dt.date(2026, 5, 1)}]),
-            playvox=make_playvox([])[0:0],
-            sprinklr_sm=make_sprinklr([{"qa_score": 87.5}]),
+    def test_clean_switch_drops_playvox_sm_on_or_after_cutover(self, spark):
+        # An SM agent with BOTH a Playvox eval and a Sprinklr eval on the SAME May
+        # date -> only the Sprinklr one survives (no union, no double-count).
+        out = _collect(
+            compute_quality_evaluations(
+                _sm_roster(spark, [_MAY]),
+                make_playvox(
+                    spark,
+                    [{"evaluation_id": "pv-may", "qa_score": 60.0,
+                      "created_at": dt.datetime(2026, 5, 15, 10, 0)}],
+                ),
+                make_sprinklr(
+                    spark,
+                    [{"evaluation_id": "spr-may", "qa_score": 95.0,
+                      "created_at": dt.datetime(2026, 5, 15, 11, 0)}],
+                ),
+            )
+        )
+        by_id = {r["evaluation_id"]: r["source"] for r in out}
+        assert by_id == {"spr-may": SOURCE_SPRINKLR_SM}
+        assert "pv-may" not in by_id  # Playvox SM on/after cutover is dropped
+
+    def test_playvox_sm_kept_before_cutover(self, spark):
+        # Before the cutover SM stays Playvox (and Sprinklr is floored out).
+        out = _collect(
+            compute_quality_evaluations(
+                _sm_roster(spark, [_APR]),
+                make_playvox(
+                    spark,
+                    [{"evaluation_id": "pv-apr", "qa_score": 80.0,
+                      "created_at": dt.datetime(2026, 4, 20, 10, 0)}],
+                ),
+                make_sprinklr(
+                    spark,
+                    [{"evaluation_id": "spr-apr", "qa_score": 95.0,
+                      "created_at": dt.datetime(2026, 4, 20, 11, 0)}],
+                ),
+            )
+        )
+        by_id = {r["evaluation_id"]: r["source"] for r in out}
+        assert by_id == {"pv-apr": SOURCE_PLAYVOX}  # Sprinklr Apr floored out
+
+    def test_core_fraud_always_playvox_even_after_cutover(self, spark):
+        # The switch is SM-only: a Core agent keeps Playvox on/after 2026-05-01.
+        out = _collect(
+            compute_quality_evaluations(
+                make_roster(
+                    spark,
+                    [{"team": "core", "squad": "core",
+                      "snapshot_month": dt.date(2026, 5, 1),
+                      "snapshot_date": dt.date(2026, 5, 31)}],
+                ),
+                make_playvox(
+                    spark,
+                    [{"evaluation_id": "pv-core", "qa_score": 90.0,
+                      "created_at": dt.datetime(2026, 5, 15, 10, 0)}],
+                ),
+                make_sprinklr(spark, []),
+            )
+        )
+        by_id = {r["evaluation_id"]: r["source"] for r in out}
+        assert by_id == {"pv-core": SOURCE_PLAYVOX}
+
+    def test_sprinklr_qa_score_and_scorecard_preserved(self, spark):
+        out = _collect(
+            compute_quality_evaluations(
+                _sm_roster(spark, [_MAY]),
+                make_playvox(spark, []),
+                make_sprinklr(spark, [{"qa_score": 87.5}]),
+            )
         )
         assert len(out) == 1
-        assert pytest.approx(float(out.iloc[0]["qa_score"])) == 87.5
-        assert out.iloc[0]["source"] == SOURCE_SPRINKLR_SM
+        assert abs(out[0]["qa_score"] - 87.5) < 1e-9
+        assert out[0]["source"] == SOURCE_SPRINKLR_SM
+        assert out[0]["scorecard_id"] == SPRINKLR_SCORECARD_ID
 
-    def test_before_cutover_dropped(self):
-        # An April Sprinklr row is dropped even though the roster has April.
-        out = compute_quality_evaluations(
-            agent_info=make_roster(
-                [
-                    {"snapshot_month": dt.date(2026, 4, 1)},
-                    {"snapshot_month": dt.date(2026, 5, 1)},
-                ]
-            ),
-            playvox=make_playvox([])[0:0],
-            sprinklr_sm=make_sprinklr(
-                [
-                    {"evaluation_id": "sm-apr", "created_at": dt.datetime(2026, 4, 20)},
-                    {"evaluation_id": "sm-may", "created_at": dt.datetime(2026, 5, 2)},
-                ]
-            ),
+    def test_sprinklr_before_cutover_dropped(self, spark):
+        # An April Sprinklr row is floored out; a May one is kept.
+        out = _collect(
+            compute_quality_evaluations(
+                _sm_roster(spark, [_APR, _MAY]),
+                make_playvox(spark, []),
+                make_sprinklr(
+                    spark,
+                    [
+                        {"evaluation_id": "sm-apr", "created_at": dt.datetime(2026, 4, 20)},
+                        {"evaluation_id": "sm-may", "created_at": dt.datetime(2026, 5, 2)},
+                    ],
+                ),
+            )
         )
-        assert list(out["evaluation_id"]) == ["sm-may"]
+        assert [r["evaluation_id"] for r in out] == ["sm-may"]
 
-    def test_cutover_boundary_is_inclusive(self):
-        out = compute_quality_evaluations(
-            agent_info=make_roster([{"snapshot_month": dt.date(2026, 5, 1)}]),
-            playvox=make_playvox([])[0:0],
-            sprinklr_sm=make_sprinklr(
-                [{"evaluation_id": "sm-edge", "created_at": dt.datetime(2026, 5, 1)}]
-            ),
+    def test_cutover_boundary_is_inclusive(self, spark):
+        out = _collect(
+            compute_quality_evaluations(
+                _sm_roster(spark, [_MAY]),
+                make_playvox(spark, []),
+                make_sprinklr(
+                    spark,
+                    [{"evaluation_id": "sm-edge", "created_at": dt.datetime(2026, 5, 1)}],
+                ),
+            )
         )
-        assert list(out["evaluation_id"]) == ["sm-edge"]
-        assert SPRINKLR_SM_CUTOVER == pd.Timestamp("2026-05-01")
+        assert [r["evaluation_id"] for r in out] == ["sm-edge"]
+        assert SPRINKLR_SM_CUTOVER == dt.date(2026, 5, 1)
 
-    def test_empty_sprinklr_is_noop(self):
+    def test_empty_sprinklr_is_noop(self, spark):
         out = compute_quality_evaluations(
-            agent_info=make_roster([{}]),
-            playvox=make_playvox([{}]),
-            sprinklr_sm=make_sprinklr([])[0:0],
+            make_roster(spark, [{}]), make_playvox(spark, [{}]), make_sprinklr(spark, [])
         )
-        assert len(out) == 1
-        assert set(out["source"]) == {SOURCE_PLAYVOX}
+        assert out.count() == 1
+        assert {r["source"] for r in out.collect()} == {SOURCE_PLAYVOX}
 
-    def test_sprinklr_unmatched_roster_dropped(self):
-        # Sprinklr agent not in the (active) roster → inner join drops it.
+    def test_sprinklr_unmatched_roster_dropped(self, spark):
         out = compute_quality_evaluations(
-            agent_info=make_roster(
-                [{"agent": "someone.else", "snapshot_month": dt.date(2026, 5, 1)}]
+            make_roster(
+                spark,
+                [{"agent": "someone.else", "snapshot_month": dt.date(2026, 5, 1),
+                  "snapshot_date": dt.date(2026, 5, 31)}],
             ),
-            playvox=make_playvox([])[0:0],
-            sprinklr_sm=make_sprinklr([{"agent": "jane.doe"}]),
+            make_playvox(spark, []),
+            make_sprinklr(spark, [{"agent": "jane.doe"}]),
         )
-        assert out.empty
+        assert out.count() == 0

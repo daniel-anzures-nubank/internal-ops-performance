@@ -43,7 +43,27 @@ import time
 from datetime import date
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# Locate the repo root (contains `db.py` + `extractors/`) so the sibling
+# top-level modules import. We can't rely on `__file__`: Databricks runs a
+# git-sourced `spark_python_task` via `exec()` with no `__file__` set, so we
+# search upward from every path we can discover (file, argv, cwd).
+def _repo_root() -> Path:
+    starts: list[Path] = []
+    try:
+        starts.append(Path(__file__).resolve())
+    except NameError:
+        pass
+    if sys.argv and sys.argv[0]:
+        starts.append(Path(sys.argv[0]).resolve())
+    starts.append(Path.cwd().resolve())
+    for start in starts:
+        for cand in (start, *start.parents):
+            if (cand / "db.py").is_file() and (cand / "extractors").is_dir():
+                return cand
+    return Path.cwd()
+
+
+REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics_data"))
 
@@ -113,81 +133,89 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
-    conn = open_connection()
-    try:
-        with _log_step("agent_information"):
-            roster = run_extractor(
-                conn, "agent_information", args.period_start, args.period_end
-            )
-            LOGGER.info("  %s roster rows", f"{len(roster):,}")
+    spark = open_connection()
 
-        with _log_step("playvox_evaluations"):
-            playvox = run_extractor(
-                conn, "playvox_evaluations", args.period_start, args.period_end
-            )
-            LOGGER.info("  %s Playvox evaluation rows", f"{len(playvox):,}")
+    with _log_step("agent_information"):
+        roster = run_extractor(
+            spark, "agent_information", args.period_start, args.period_end
+        )
 
-        with _log_step("sprinklr_sm_evaluations"):
-            sprinklr_sm = run_extractor(
-                conn, "sprinklr_sm_evaluations", args.period_start, args.period_end
-            )
-            LOGGER.info("  %s Sprinklr SM evaluation rows", f"{len(sprinklr_sm):,}")
+    with _log_step("playvox_evaluations"):
+        playvox = run_extractor(
+            spark, "playvox_evaluations", args.period_start, args.period_end
+        )
 
-        with _log_step("compute_quality_evaluations"):
-            result = compute_quality_evaluations(roster, playvox, sprinklr_sm)
-            LOGGER.info("  %s rows in final quality_evaluations frame", f"{len(result):,}")
+    with _log_step("sprinklr_sm_evaluations"):
+        sprinklr_sm = run_extractor(
+            spark, "sprinklr_sm_evaluations", args.period_start, args.period_end
+        )
 
-        expected_cols = [c for c, _ in IO_QUALITY_EVALUATIONS_SCHEMA]
-        result = result[expected_cols]
+    with _log_step("compute_quality_evaluations"):
+        result = compute_quality_evaluations(roster, playvox, sprinklr_sm)
 
-        if args.dry_run:
-            LOGGER.info("Dry run — not writing. Summary:")
-            print()
-            print(f"Rows (evaluations): {len(result):,}")
-            if not result.empty:
-                by_source = result["source"].value_counts().to_dict()
-                print(
-                    "By source:   "
-                    + ", ".join(f"{k}={v:,}" for k, v in sorted(by_source.items()))
-                )
-            print(f"Agents:      {result['agent'].nunique():,}")
-            print(f"Dates:       {result['date'].nunique():,}")
+    if args.dry_run:
+        from pyspark.sql import functions as F
+
+        result = result.persist()
+        LOGGER.info("Dry run — not writing. Summary:")
+        print()
+        agg = result.agg(
+            F.count(F.lit(1)).alias("rows"),
+            F.countDistinct("agent").alias("agents"),
+            F.countDistinct("date").alias("dates"),
+            F.avg("qa_score").alias("qa_mean"),
+            F.min("qa_score").alias("qa_min"),
+            F.max("qa_score").alias("qa_max"),
+        ).collect()[0]
+        print(f"Rows (evaluations): {agg['rows']:,}")
+        by_source = {
+            r["source"]: r["cnt"]
+            for r in result.groupBy("source")
+            .agg(F.count(F.lit(1)).alias("cnt"))
+            .collect()
+        }
+        if by_source:
             print(
-                f"Squads:      {result['squad'].nunique():,} "
-                f"({', '.join(sorted(result['squad'].dropna().unique()))})"
+                "By source:   "
+                + ", ".join(f"{k}={v:,}" for k, v in sorted(by_source.items()))
             )
-            if not result.empty:
-                # qa_score range — sanity-check that it's in [0, 1].
-                qa = result["qa_score"]
-                print(
-                    f"qa_score:    mean={qa.mean():.3f}  "
-                    f"min={qa.min():.3f}  max={qa.max():.3f}"
-                )
-            print()
-            print("Head:")
-            print(result.head(10).to_string(index=False))
-            return 0
+        print(f"Agents:      {agg['agents']:,}")
+        print(f"Dates:       {agg['dates']:,}")
+        squads = sorted(
+            r["squad"]
+            for r in result.select("squad").distinct().collect()
+            if r["squad"] is not None
+        )
+        print(f"Squads:      {len(squads):,} ({', '.join(squads)})")
+        if agg["qa_mean"] is not None:
+            print(
+                f"qa_score:    mean={agg['qa_mean']:.3f}  "
+                f"min={agg['qa_min']:.3f}  max={agg['qa_max']:.3f}"
+            )
+        print()
+        print("Head:")
+        result.show(10, truncate=False)
+        result.unpersist()
+        return 0
 
-        with _log_step(f"write {args.target}"):
-            run = publish(
-                conn,
-                result,
-                args.target,
-                IO_QUALITY_EVALUATIONS_SCHEMA,
-                layer="metrics_data",
-                period_start=args.period_start,
-                period_end=args.period_end,
-                run_id=args.run_id,
-                snapshot=not args.no_snapshot,
-            )
-            LOGGER.info(
-                "  wrote %s rows to %s (run_id=%s)",
-                f"{run.row_count:,}", args.target, run.run_id,
-            )
-            if run.snapshot_table:
-                LOGGER.info("  snapshot -> %s", run.snapshot_table)
-    finally:
-        conn.close()
+    with _log_step(f"write {args.target}"):
+        run = publish(
+            spark,
+            result,
+            args.target,
+            IO_QUALITY_EVALUATIONS_SCHEMA,
+            layer="metrics_data",
+            period_start=args.period_start,
+            period_end=args.period_end,
+            run_id=args.run_id,
+            snapshot=not args.no_snapshot,
+        )
+        LOGGER.info(
+            "  wrote %s rows to %s (run_id=%s)",
+            f"{run.row_count:,}", args.target, run.run_id,
+        )
+        if run.snapshot_table:
+            LOGGER.info("  snapshot -> %s", run.snapshot_table)
 
     return 0
 

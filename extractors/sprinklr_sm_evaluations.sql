@@ -15,8 +15,8 @@
 --   * Map `agent_name` -> Nubank email -> agent prefix via `sprinklr_sm_users`.
 --     Rows whose agent can't be mapped (no `user_email`) yield an empty `agent`
 --     and are dropped downstream in `build_evaluations`.
---   * Expose the same shape `build_evaluations` consumes for Playvox:
---     evaluation_id, agent, qa_score, team_name, created_at.
+--   * Expose the same shape the metrics_data shaper consumes for Playvox:
+--     evaluation_id, agent, qa_score, team_name, scorecard_id, created_at.
 --   * `qa_score` (`score_avg`) is already on the same 0-100 scale as Playvox
 --     (verified on live data), so no rescaling is needed before the UNION.
 --   * Intrinsic monitor filter (mirrors legacy `qa_base` Sprinklr branch):
@@ -26,10 +26,14 @@
 --     `ROW_NUMBER()` dedup.
 --
 -- Cutover (>= 2026-05-01)
---   Social Media only started being scored from Sprinklr in May 2026, so this
---   feed is hard-floored at 2026-05-01 regardless of `:period_start`. Earlier SM
---   quality stays Playvox-only (the floor is also enforced defensively in
---   `metrics_data/quality_evaluations.py` via `SPRINKLR_SM_CUTOVER`).
+--   SM QA evaluations migrated Playvox -> Sprinklr in May 2026, so SM quality
+--   SWITCHES source at 2026-05-01: Playvox before, Sprinklr on/after. This feed
+--   is hard-floored at 2026-05-01 regardless of `:period_start`; below that date
+--   SM stays Playvox. The metrics_data layer drops Playvox SM rows on/after the
+--   cutover so the switch is clean (not a union) and enforces the same floor via
+--   `SPRINKLR_SM_CUTOVER`. NOTE: this is a deliberate enhancement beyond legacy,
+--   whose SM-quality block (`[IO] Performance 2026 - Social Media.sql` qa_base)
+--   is Playvox-ONLY and goes dark when SM Playvox evals stop mid-May.
 --
 -- Out of scope (handled by the metrics_data / metrics layers)
 --   * Roster join, `status = 'active'` filter, squad/team derivation.
@@ -46,6 +50,7 @@
 --   agent          STRING     email prefix, lowercased (mapped from agent_name)
 --   qa_score       DOUBLE     `score_avg`
 --   team_name      STRING     literal 'SM'
+--   scorecard_id   STRING     literal 'SprinklrScorecardV1' (legacy SM qa_base)
 --   created_at     TIMESTAMP  `report_date` cast to TIMESTAMP (MX local day)
 -- =====================================================================================
 
@@ -74,6 +79,7 @@ SELECT
   LOWER(REGEXP_EXTRACT(agent_email, '^[a-zA-Z]+\\.[a-zA-Z]+', 0))        AS agent,
   CAST(score_avg AS DOUBLE)                                              AS qa_score,
   'SM'                                                                   AS team_name,
+  'SprinklrScorecardV1'                                                  AS scorecard_id,
   CAST(report_date AS TIMESTAMP)                                         AS created_at
 FROM sm_filtered
 WHERE rn = 1

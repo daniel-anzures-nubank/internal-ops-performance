@@ -1,32 +1,44 @@
-"""quality_evaluations — one row per individual QA evaluation.
+"""quality_evaluations — one row per individual QA evaluation (PySpark).
 
 This is a RAW dataset, not a finished metric. It exposes every QA evaluation
 attributed to an active roster agent, one row per evaluation, with its score. A
-downstream ``metrics`` layer averages these into the Quality score at whatever
-grain it wants (agent/day, squad/month, …) by re-averaging the raw ``qa_score``
-values.
+downstream ``metrics`` layer (``metrics/quality.py``) dedups latest-per-
+``evaluation_id`` (within each source), drops Content, applies the legacy
+blacklists / outage-date exclusions, and averages the raw ``qa_score`` values
+into the Quality score at whatever grain it wants.
 
-Sources (two, unioned)
-----------------------
-* **Playvox** (``qmo_playvox_consolidated``) — Quality of record for Core,
-  Fraud and Content, and historically for Social Media too.
+Sources (Core/Fraud Playvox; Social-Media Playvox→Sprinklr switch)
+------------------------------------------------------------------
+* **Playvox** (``qmo_playvox_consolidated``) — Quality of record for Core and
+  Fraud (always), and for Social Media **before** ``SPRINKLR_SM_CUTOVER``.
 * **Sprinklr SM** (``social_media_case_summary_information``) — Social-Media
-  case QA. Social Media QA is logged against Sprinklr cases, so from the
-  ``SPRINKLR_SM_CUTOVER`` (2026-05-01) onward we ``UNION ALL`` this feed on top
-  of Playvox. Earlier dates stay Playvox-only (no retroactive change). Both
-  feeds report ``qa_score`` on the same 0-100 scale, so they union directly.
-  A ``source`` column ('playvox' / 'sprinklr_sm') tags each row's provenance.
+  case QA. SM QA evaluations migrated Playvox→Sprinklr in May 2026, so SM quality
+  **switches source** at ``SPRINKLR_SM_CUTOVER`` (2026-05-01): Playvox for SM
+  evaluations dated ``< 2026-05-01``, Sprinklr for ``>= 2026-05-01``. Both feeds
+  report ``qa_score`` on the same 0-100 scale. A ``source`` column ('playvox' /
+  'sprinklr_sm') tags each row's provenance.
 
-Note this differs from legacy: legacy carried the Sprinklr ``UNION ALL`` only in
-the Core/Fraud Quality dataset, where it was dead code (the active-roster join
-excluded ``social``). Here the new roster keeps social agents, so the Sprinklr
-SM rows actually reach output and are scored for Social Media.
+Note: SM source switch is a clean SWITCH, not a union — and an enhancement
+-------------------------------------------------------------------------
+This is a deliberate enhancement BEYOND legacy, not a byte-for-byte SM parity
+claim. Legacy SM quality (``[IO] Performance 2026 - Social Media.sql`` ``qa_base``,
+line 2916) is **Playvox-only** (Sprinklr is used in that notebook only for
+occupancy/tNPS, never quality), so it goes dark when SM-agent Playvox evals stop
+mid-May 2026. We instead follow the real source migration: SM uses Sprinklr from
+2026-05-01 on. To keep this a clean switch, Playvox Social-Media rows dated on/
+after the cutover are dropped (see ``compute_quality_evaluations``) so they never
+coexist with the Sprinklr SM rows and double-count. Consequence:
+  * SM Jan–Apr 2026 = Playvox → matches legacy.
+  * SM May 2026+ = Sprinklr → intentionally does NOT match legacy's Playvox-only
+    SM table.
+This parallels the accepted SM Normalized-Occupancy / Sprinklr precedent.
 
 Public API
 ----------
-``compute_quality_evaluations(agent_info, playvox, sprinklr_sm=None)`` returns
-one row per evaluation. ``sprinklr_sm`` is optional for backwards-compatibility;
-when omitted the table is Playvox-only.
+``compute_quality_evaluations(agent_info, playvox, sprinklr_sm=None)`` takes
+Spark DataFrames (the extractor outputs) and returns one Spark DataFrame with
+one row per evaluation. ``sprinklr_sm`` is optional; when omitted the table is
+Playvox-only.
 
 Source tables (via extractors)
 ------------------------------
@@ -46,33 +58,38 @@ Filters applied here (deliberately minimal — this is a raw table)
 * Roster: ``status='active'`` and non-null ``squad`` (inner join attaches the
   dimensions / scopes output).
 
-Filters deferred to the future metrics layer (NOT applied here)
----------------------------------------------------------------
-* The ``scorecard_id`` / ``evaluation_id`` blacklists.
-* The hardcoded outage-date exclusions (2026-03-27, 2026-04-09).
-* Any narrower squad scoping.
+Filters deferred to the metrics layer (``metrics/quality.py``, NOT applied here)
+-------------------------------------------------------------------------------
+* The team-scoped ``scorecard_id`` / ``evaluation_id`` blacklists. ``scorecard_id``
+  is carried through this raw table so the metric layer can apply them.
+* The team-asymmetric outage-date exclusions (2026-03-27, 2026-04-09).
+* Latest-per-``evaluation_id`` dedup (per source), Content exclusion, and the
+  ``COUNT(DISTINCT evaluation_id)`` denominator.
 
 Output schema (one row per evaluation)
 --------------------------------------
     agent            STRING
     xforce           STRING
     xplead           STRING
-    team             STRING   performance team (from roster; see team_squad_mapping)
-    squad            STRING   roster squad
-    district         STRING   roster district (was ``squad_district``)
-    shift            STRING   roster shift
-    date             DATE     calendar day the evaluation was logged (MX local)
+    team             STRING     performance team (from roster; see team_squad_mapping)
+    squad            STRING     roster squad
+    district         STRING     roster district (was ``squad_district``)
+    shift            STRING     roster shift
+    date             DATE       calendar day the evaluation was logged (MX local)
+    created_at       TIMESTAMP  raw evaluation timestamp (legacy dedup order key)
     evaluation_id    STRING
-    team_name        STRING   source team / scorecard team
-    source           STRING   'playvox' | 'sprinklr_sm'
-    qa_score         DOUBLE   the evaluation's score
+    team_name        STRING     source team / scorecard team
+    scorecard_id     STRING     source scorecard id (for the metric-layer blacklist)
+    source           STRING     'playvox' | 'sprinklr_sm'
+    qa_score         DOUBLE     the evaluation's score
 """
 
 from __future__ import annotations
 
-import re
+from datetime import date
 
-import pandas as pd
+from pyspark.sql import DataFrame, Window
+from pyspark.sql import functions as F
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -90,171 +107,175 @@ QUALITY_OUT_OF_SCOPE_SQUADS: tuple[str, ...] = ()
 SOURCE_PLAYVOX = "playvox"
 SOURCE_SPRINKLR_SM = "sprinklr_sm"
 
-# Social Media only started being scored from Sprinklr in May 2026. Sprinklr SM
-# evaluations before this date are dropped so SM quality stays Playvox-only
-# historically (no retroactive change). The extractor enforces the same floor;
-# this is the module-level defensive guard.
-SPRINKLR_SM_CUTOVER = pd.Timestamp("2026-05-01")
+# Performance team string for Social Media (note the space). Used to scope the
+# SM Playvox->Sprinklr source switch to social-team rows only.
+SOCIAL_MEDIA_TEAM = "social media"
+
+# Sprinklr SM scorecard literal (legacy SM ``qa_base`` Sprinklr branch assigns
+# this constant). Carried so the metric-layer blacklist sees a stable value.
+SPRINKLR_SCORECARD_ID = "SprinklrScorecardV1"
+
+# Social Media QA evaluations MIGRATED from Playvox to Sprinklr in May 2026. SM
+# quality therefore SWITCHES source at this date: Playvox for evaluations dated
+# < 2026-05-01, Sprinklr for >= 2026-05-01. This is a clean switch, NOT a union —
+# Playvox SM rows on/after the switch are dropped (see ``compute_quality_evaluations``)
+# so they never coexist with Sprinklr SM and double-count. The Sprinklr feed is
+# floored here (and in the extractor) to >= this date; below it there are no
+# Sprinklr rows so SM stays Playvox. This is a deliberate enhancement beyond legacy
+# (whose SM quality is Playvox-only and goes dark when SM-agent Playvox evals stop
+# mid-May), paralleling the accepted SM Normalized-Occupancy / Sprinklr precedent.
+SPRINKLR_SM_CUTOVER: date = date(2026, 5, 1)
 
 # Legacy affiliation regex (Playvox path): lowercase "first.last" with an
 # optional trailing integer suffix on the @nu.com.mx domain.
-_NUBANK_EMAIL_REGEX = re.compile(r"^[a-z]+\.[a-z]+[0-9]*@nu\.com\.mx$", re.IGNORECASE)
+_NUBANK_EMAIL_REGEX = r"^[a-zA-Z]+[.][a-zA-Z]+[0-9]*@nu[.]com[.]mx$"
 
 
-def _is_nubank_email(email: object) -> bool:
-    """Return True iff `email` matches the Nubank-MX agent email pattern."""
-    if not isinstance(email, str):
-        return False
-    return _NUBANK_EMAIL_REGEX.match(email) is not None
+# ---------------------------------------------------------------------------
+# Step 1: Playvox-only source gate (team_name + Nubank-email regex)
+# ---------------------------------------------------------------------------
 
 
-def _as_naive_datetime(series: pd.Series) -> pd.Series:
-    """Coerce a datetime Series to tz-naive ``datetime64[ns]`` for merge keys."""
-    s = pd.to_datetime(series)
-    if s.dt.tz is not None:
-        return s.dt.tz_localize(None)
-    return s
+def filter_playvox(playvox: DataFrame) -> DataFrame:
+    """Apply the Playvox source gate (team_name exclusions + Nubank-email regex).
 
-
-def _floor_to_date(series: pd.Series) -> pd.Series:
-    """Truncate a timestamp / date series to ``datetime.date``.
-
-    Playvox's ``created_at`` arrives tz-naive in MX local time; coerce any
-    tz-aware values to UTC-naive before flooring to a plain calendar date.
+    Mirrors legacy ``qa_base``'s Playvox WHERE clause:
+    ``evaluation__team_name NOT IN (...)`` and the affiliation RLIKE that keeps
+    only ``first.last[N]@nu.com.mx`` emails.
     """
-    s = pd.to_datetime(series)
-    if s.dt.tz is not None:
-        s = s.dt.tz_convert("UTC").dt.tz_localize(None)
-    return s.dt.date
+    return playvox.filter(
+        ~F.col("team_name").isin(list(PLAYVOX_TEAM_NAME_EXCLUSIONS))
+        & F.col("agent_email").rlike(_NUBANK_EMAIL_REGEX)
+    )
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Playvox-only filter
+# Step 2: shape each source into the common per-evaluation frame
 # ---------------------------------------------------------------------------
 
 
-def filter_playvox(playvox: pd.DataFrame) -> pd.DataFrame:
-    """Apply the Playvox source gate (team_name + Nubank-email regex)."""
-    if playvox.empty:
-        return playvox.copy()
-
-    mask = ~playvox["team_name"].isin(PLAYVOX_TEAM_NAME_EXCLUSIONS) & playvox[
-        "agent_email"
-    ].map(_is_nubank_email)
-    return playvox.loc[mask].copy()
-
-
-# ---------------------------------------------------------------------------
-# Step 2: build the per-evaluation frame (one row per evaluation)
-# ---------------------------------------------------------------------------
-
-
-_EVAL_COLS: tuple[str, ...] = (
-    "evaluation_id",
-    "agent",
-    "qa_score",
-    "team_name",
-    "created_at",
-)
-
-def build_evaluations(playvox: pd.DataFrame) -> pd.DataFrame:
-    """Shape (already-filtered) Playvox rows into per-evaluation rows.
+def _shape_evaluations(evals: DataFrame, *, scorecard_default: str | None) -> DataFrame:
+    """Shape a source frame into the common per-evaluation columns.
 
     Result has one row per evaluation with:
-        evaluation_id, agent, qa_score, team_name, date
-    where ``date`` = floor(created_at) in MX local time.
+        evaluation_id, agent, qa_score, team_name, scorecard_id, created_at, date
+    where ``date`` = the calendar day of ``created_at`` (MX local). Rows whose
+    ``agent`` is null/empty (unmappable email) are dropped — legacy's regex
+    extraction yields an empty string for those, which never join the roster.
     """
-    if playvox is None or playvox.empty:
-        return pd.DataFrame(
-            {c: pd.Series(dtype="object") for c in _EVAL_COLS + ("date",)}
-        )
-
-    sub = playvox[list(_EVAL_COLS)].copy()
-    sub["date"] = _floor_to_date(sub["created_at"])
-    sub = sub[sub["agent"].notna() & (sub["agent"] != "")]
-    return sub.reset_index(drop=True)
+    has_scorecard = "scorecard_id" in evals.columns
+    scorecard_col = (
+        F.col("scorecard_id")
+        if has_scorecard
+        else F.lit(scorecard_default).cast("string")
+    )
+    shaped = evals.select(
+        F.col("evaluation_id").cast("string").alias("evaluation_id"),
+        F.col("agent").cast("string").alias("agent"),
+        F.col("qa_score").cast("double").alias("qa_score"),
+        F.col("team_name").cast("string").alias("team_name"),
+        scorecard_col.alias("scorecard_id"),
+        F.to_timestamp(F.col("created_at")).alias("created_at"),
+    ).withColumn("date", F.to_date(F.col("created_at")))
+    return shaped.filter(
+        F.col("agent").isNotNull() & (F.col("agent") != F.lit(""))
+    )
 
 
 # ---------------------------------------------------------------------------
-# Step 3: orchestrator — roster join (no aggregation)
+# Step 3: orchestrator — union the sources, attach the roster (no aggregation)
 # ---------------------------------------------------------------------------
-
-
-def _build_sprinklr_sm(sprinklr_sm: pd.DataFrame | None) -> pd.DataFrame:
-    """Shape Sprinklr SM evaluations and enforce the SM cutover floor.
-
-    Returns a frame with the same columns as :func:`build_evaluations` plus a
-    ``source`` column. ``None`` / empty input yields an empty frame.
-    """
-    if sprinklr_sm is None or sprinklr_sm.empty:
-        return build_evaluations(None).assign(source=pd.Series(dtype="object"))
-
-    sm_evals = build_evaluations(sprinklr_sm)
-    if not sm_evals.empty:
-        sm_dates = pd.to_datetime(sm_evals["date"])
-        sm_evals = sm_evals.loc[sm_dates >= SPRINKLR_SM_CUTOVER].copy()
-    sm_evals["source"] = SOURCE_SPRINKLR_SM
-    return sm_evals
 
 
 def compute_quality_evaluations(
-    agent_info: pd.DataFrame,
-    playvox: pd.DataFrame,
-    sprinklr_sm: pd.DataFrame | None = None,
-) -> pd.DataFrame:
+    agent_info: DataFrame,
+    playvox: DataFrame,
+    sprinklr_sm: DataFrame | None = None,
+) -> DataFrame:
     """End-to-end quality_evaluations pipeline (one row per evaluation).
 
     ``sprinklr_sm`` is the optional Sprinklr SM case-QA feed; when provided, its
-    rows on/after :data:`SPRINKLR_SM_CUTOVER` are ``UNION ALL``-ed on top of
+    rows on/after :data:`SPRINKLR_SM_CUTOVER` (2026-05-01) are unioned on top of
     Playvox (tagged ``source='sprinklr_sm'``).
+
+    Social Media quality SWITCHES source at the cutover (Playvox < 2026-05-01,
+    Sprinklr >= 2026-05-01); to keep it a clean switch rather than a union, Playvox
+    Social-Media rows dated on/after the cutover are DROPPED here so they cannot
+    coexist with the Sprinklr SM rows. The switch is scoped to the Social-Media
+    team only (roster ``team = 'social media'``); Core/Fraud are always Playvox.
     """
-    playvox_f = filter_playvox(playvox)
-    playvox_evals = build_evaluations(playvox_f)
-    playvox_evals["source"] = SOURCE_PLAYVOX
+    spark = playvox.sparkSession
 
-    sm_evals = _build_sprinklr_sm(sprinklr_sm)
+    playvox_evals = _shape_evaluations(
+        filter_playvox(playvox), scorecard_default=None
+    ).withColumn("source", F.lit(SOURCE_PLAYVOX))
 
-    # Concat only the non-empty parts so empty all-NA frames don't trip the
-    # pandas empty-concat dtype FutureWarning (and to keep the union exact).
-    parts = [p for p in (playvox_evals, sm_evals) if not p.empty]
-    evals = (
-        pd.concat(parts, ignore_index=True)
-        if parts
-        else playvox_evals  # both empty → keep the schema'd empty playvox frame
-    )
-
-    if evals.empty:
-        return pd.DataFrame(
-            {c: pd.Series(dtype="object") for c, _ in IO_QUALITY_EVALUATIONS_SCHEMA}
+    parts = [playvox_evals]
+    if sprinklr_sm is not None:
+        sm_evals = (
+            _shape_evaluations(sprinklr_sm, scorecard_default=SPRINKLR_SCORECARD_ID)
+            .filter(F.col("date") >= F.lit(SPRINKLR_SM_CUTOVER))
+            .withColumn("source", F.lit(SOURCE_SPRINKLR_SM))
         )
+        parts.append(sm_evals)
+
+    evals = parts[0]
+    for extra in parts[1:]:
+        evals = evals.unionByName(extra)
 
     # --- roster join --------------------------------------------------------
-    roster = agent_info.loc[
-        (agent_info["status"] == "active")
-        & agent_info["squad"].notna()
-        & ~agent_info["squad"].isin(QUALITY_OUT_OF_SCOPE_SQUADS),
-        [
-            "agent",
-            "xforce",
-            "xplead",
-            "team",
-            "squad",
-            "squad_district",
-            "shift",
-            "snapshot_month",
-        ],
-    ].copy()
-    roster = roster.rename(columns={"squad_district": "district"})
-    roster["snapshot_month"] = _as_naive_datetime(roster["snapshot_month"])
-
-    evals["snapshot_month"] = _as_naive_datetime(
-        pd.to_datetime(evals["date"]).dt.to_period("M").dt.to_timestamp()
+    roster = agent_info.filter(
+        (F.col("status") == F.lit("active")) & F.col("squad").isNotNull()
     )
-    enriched = evals.merge(roster, on=["agent", "snapshot_month"], how="inner")
+    if QUALITY_OUT_OF_SCOPE_SQUADS:
+        roster = roster.filter(~F.col("squad").isin(list(QUALITY_OUT_OF_SCOPE_SQUADS)))
+    roster = roster.select(
+        "agent",
+        "xforce",
+        "xplead",
+        "team",
+        "squad",
+        F.col("squad_district").alias("district"),
+        "shift",
+        F.to_date(F.col("snapshot_date")).alias("_snapshot_date"),
+        F.trunc(F.to_date(F.col("snapshot_month")), "month").alias("snapshot_month"),
+    )
 
-    enriched["qa_score"] = enriched["qa_score"].astype("float64")
+    # Deduplicate the roster to exactly ONE row per (agent, snapshot_month) BEFORE
+    # the join. The content branch of `agent_information` cross-joins each
+    # Google-Sheet content row against every month, so a content agent on >1 sheet
+    # row yields >=2 rows per (agent, snapshot_month) identical on every selected
+    # column. Without this the inner join fans out and every evaluation
+    # double-counts. Keep the latest snapshot deterministically.
+    roster_dedup_window = Window.partitionBy("agent", "snapshot_month").orderBy(
+        F.col("_snapshot_date").desc_nulls_last(),
+        F.col("squad").asc_nulls_last(),
+        F.col("district").asc_nulls_last(),
+        F.col("shift").asc_nulls_last(),
+    )
+    roster = (
+        roster.withColumn("_roster_rn", F.row_number().over(roster_dedup_window))
+        .filter(F.col("_roster_rn") == 1)
+        .drop("_roster_rn", "_snapshot_date")
+    )
 
-    out = enriched[[
+    enriched = evals.withColumn(
+        "snapshot_month", F.trunc(F.to_date(F.col("date")), "month")
+    ).join(roster, on=["agent", "snapshot_month"], how="inner")
+
+    # SM source switch (NOT a union): for the Social-Media team, evaluations dated
+    # on/after the cutover come from Sprinklr only — drop the Playvox SM rows on/
+    # after 2026-05-01 so the two sources never coexist and double-count. SM is
+    # identified by the roster ``team`` ('social media', with a space), consistent
+    # with the metric layer. Core/Fraud (and pre-cutover SM) keep Playvox.
+    sm_playvox_after_switch = (
+        (F.lower(F.col("team")) == F.lit(SOCIAL_MEDIA_TEAM))
+        & (F.col("source") == F.lit(SOURCE_PLAYVOX))
+        & (F.to_date(F.col("date")) >= F.lit(SPRINKLR_SM_CUTOVER))
+    )
+    enriched = enriched.filter(~sm_playvox_after_switch)
+
+    out = enriched.select(
         "agent",
         "xforce",
         "xplead",
@@ -262,16 +283,16 @@ def compute_quality_evaluations(
         "squad",
         "district",
         "shift",
-        "date",
+        F.to_date(F.col("date")).alias("date"),
+        F.col("created_at"),
         "evaluation_id",
         "team_name",
+        "scorecard_id",
         "source",
-        "qa_score",
-    ]].copy()
+        F.col("qa_score").cast("double").alias("qa_score"),
+    )
 
-    return out.sort_values(
-        ["date", "agent", "evaluation_id"]
-    ).reset_index(drop=True)
+    return out.orderBy("date", "agent", "evaluation_id")
 
 
 # ---------------------------------------------------------------------------
@@ -287,8 +308,10 @@ IO_QUALITY_EVALUATIONS_SCHEMA: tuple[tuple[str, str], ...] = (
     ("district", "STRING"),
     ("shift", "STRING"),
     ("date", "DATE"),
+    ("created_at", "TIMESTAMP"),
     ("evaluation_id", "STRING"),
     ("team_name", "STRING"),
+    ("scorecard_id", "STRING"),
     ("source", "STRING"),
     ("qa_score", "DOUBLE"),
 )

@@ -4,11 +4,12 @@ Metrics-layer script. Thin orchestrator — the math lives in
 ``metrics/quality.py`` and is covered by ``tests/metrics/test_quality.py``.
 Here we only:
 
-  1. Open a Databricks SQL connection (shared `db.open_connection`).
+  1. Get the ambient SparkSession (shared `db.open_connection`).
   2. Read the raw input table ``io_quality_evaluations_raw`` for the period
      (via `db.read_table`).
   3. Call ``compute_quality`` to get the day/week/month/quarter/semester/year
-     mean-score rows (latest per evaluation_id, Content excluded).
+     mean-score rows (latest per (source, evaluation_id) by created_at DESC,
+     Content excluded, team-scoped blacklists + outage drops for date < cutover).
   4. Either print a summary (`--dry-run`) or replace the target Delta table.
 
 Tables
@@ -18,17 +19,19 @@ Tables
 
 Manual adjustments
 ------------------
-None applied here (no adjustments layer yet) — the scorecard/evaluation
-blacklists and outage-date exclusions are deferred. See `metrics/quality.py`.
+The team-scoped ``scorecard_id`` / ``evaluation_id`` blacklists and the
+team-asymmetric outage-date exclusions are hardcoded, cutover-gated constants
+applied inside ``compute_quality`` (legacy QA artifacts, date < 2026-07-01). No
+adjustment-sheet tables are read here.
 
 Usage
 -----
-::
+Runs on a Databricks cluster (``spark-submit`` / a Databricks job task)::
 
-    uv run python scripts/metrics_scripts/build_quality.py \\
+    python scripts/metrics_scripts/build_quality.py \\
         --period-start 2026-05-01 --period-end 2026-05-31 --dry-run
 
-    uv run python scripts/metrics_scripts/build_quality.py \\
+    python scripts/metrics_scripts/build_quality.py \\
         --period-start 2026-01-01 --period-end 2026-05-31
 """
 
@@ -41,7 +44,27 @@ import time
 from datetime import date
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# Locate the repo root (contains `db.py` + `extractors/`) so the sibling
+# top-level modules import. We can't rely on `__file__`: Databricks runs a
+# git-sourced `spark_python_task` via `exec()` with no `__file__` set, so we
+# search upward from every path we can discover (file, argv, cwd).
+def _repo_root() -> Path:
+    starts: list[Path] = []
+    try:
+        starts.append(Path(__file__).resolve())
+    except NameError:
+        pass
+    if sys.argv and sys.argv[0]:
+        starts.append(Path(sys.argv[0]).resolve())
+    starts.append(Path.cwd().resolve())
+    for start in starts:
+        for cand in (start, *start.parents):
+            if (cand / "db.py").is_file() and (cand / "extractors").is_dir():
+                return cand
+    return Path.cwd()
+
+
+REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics"))
 
@@ -115,60 +138,74 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
-    conn = open_connection()
-    try:
-        with _log_step(f"read {args.source}"):
-            evals = read_table(conn, args.source, args.period_start, args.period_end)
-            LOGGER.info("  %s raw evaluation rows", f"{len(evals):,}")
+    spark = open_connection()
 
-        with _log_step("compute_quality"):
-            result = compute_quality(evals)
-            LOGGER.info("  %s metric rows", f"{len(result):,}")
+    with _log_step(f"read {args.source}"):
+        evals = read_table(spark, args.source, args.period_start, args.period_end)
 
-        expected_cols = [c for c, _ in IO_QUALITY_METRIC_SCHEMA]
-        result = result[expected_cols]
+    with _log_step("compute_quality"):
+        result = compute_quality(evals)
 
-        if args.dry_run:
-            LOGGER.info("Dry run — not writing. Summary:")
-            print()
-            for g in GRANULARITIES:
-                sub = result[result["date_granularity"] == g]
-                print(f"{g:>9}: {len(sub):,} rows, {sub['agent'].nunique():,} agents")
-            print(f"\nAgents: {result['agent'].nunique():,}   "
-                  f"Teams: {', '.join(sorted(result['team'].dropna().unique()))}")
-            if not result.empty:
-                mv = result["metric_value"].dropna()
-                print(f"quality score (%): min={mv.min():.1f}  "
-                      f"max={mv.max():.1f}  mean={mv.mean():.1f}")
-                print(f"evaluations/row: mean={result['denominator'].mean():.1f}")
-            print("\nHead (month grain):")
+    if args.dry_run:
+        from pyspark.sql import functions as F
+
+        result = result.persist()
+        LOGGER.info("Dry run — not writing. Summary:")
+        print()
+        by_gran = {
+            r["date_granularity"]: (r["rows"], r["agents"])
+            for r in result.groupBy("date_granularity")
+            .agg(
+                F.count(F.lit(1)).alias("rows"),
+                F.countDistinct("agent").alias("agents"),
+            )
+            .collect()
+        }
+        for g in GRANULARITIES:
+            rows, agents = by_gran.get(g, (0, 0))
+            print(f"{g:>9}: {rows:,} rows, {agents:,} agents")
+        teams = sorted(
+            r["team"]
+            for r in result.select("team").distinct().collect()
+            if r["team"] is not None
+        )
+        stats = result.agg(
+            F.countDistinct("agent").alias("agents"),
+            F.min("metric_value").alias("mv_min"),
+            F.max("metric_value").alias("mv_max"),
+            F.avg("metric_value").alias("mv_mean"),
+            F.avg("denominator").alias("evals_mean"),
+        ).collect()[0]
+        print(f"\nAgents: {stats['agents']:,}   Teams: {', '.join(teams)}")
+        if stats["mv_min"] is not None:
             print(
-                result[result["date_granularity"] == "month"]
-                .head(10)
-                .to_string(index=False)
+                f"quality score (%): min={stats['mv_min']:.1f}  "
+                f"max={stats['mv_max']:.1f}  mean={stats['mv_mean']:.1f}"
             )
-            return 0
+            print(f"evaluations/row: mean={stats['evals_mean']:.1f}")
+        print("\nHead (month grain):")
+        result.filter(F.col("date_granularity") == "month").show(10, truncate=False)
+        result.unpersist()
+        return 0
 
-        with _log_step(f"write {args.target}"):
-            run = publish(
-                conn,
-                result,
-                args.target,
-                IO_QUALITY_METRIC_SCHEMA,
-                layer="metrics",
-                period_start=args.period_start,
-                period_end=args.period_end,
-                run_id=args.run_id,
-                snapshot=not args.no_snapshot,
-            )
-            LOGGER.info(
-                "  wrote %s rows to %s (run_id=%s)",
-                f"{run.row_count:,}", args.target, run.run_id,
-            )
-            if run.snapshot_table:
-                LOGGER.info("  snapshot -> %s", run.snapshot_table)
-    finally:
-        conn.close()
+    with _log_step(f"write {args.target}"):
+        run = publish(
+            spark,
+            result,
+            args.target,
+            IO_QUALITY_METRIC_SCHEMA,
+            layer="metrics",
+            period_start=args.period_start,
+            period_end=args.period_end,
+            run_id=args.run_id,
+            snapshot=not args.no_snapshot,
+        )
+        LOGGER.info(
+            "  wrote %s rows to %s (run_id=%s)",
+            f"{run.row_count:,}", args.target, run.run_id,
+        )
+        if run.snapshot_table:
+            LOGGER.info("  snapshot -> %s", run.snapshot_table)
 
     return 0
 
