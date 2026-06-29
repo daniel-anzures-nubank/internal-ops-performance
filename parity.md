@@ -227,9 +227,112 @@ Only **one open row** remains (jonathan.pineda 02-26, 0% / immaterial). Ready to
 
 ---
 
+## Quality — `io_quality_metric` vs `usr.mx__cx.quality_io` (Core/Fraud) and the `qa_score_agent` rows of `usr.mx__cx.internal_ops_performance_2026_social_media` (SM)
+
+**Status:** validated over the complete months **`2026-01-01 … 05-31`**
+(quality is a direct per-agent-day mean — `SUM(qa_score)/COUNT(distinct evals)`,
+no cohort/trailing benchmark — so each month stands alone; June is the
+still-settling active month, reported as freshness below). Comparison is
+day-grain mean QA score (0–100), outer-joined on `(agent, date)`,
+`metric='quality'`, `date_granularity='day'`. Tolerance is **≤0.5 absolute
+score points** (the value is a 0–100 mean, not a pp). Numerator
+(`SUM(qa_score)`) and denominator (`COUNT(distinct evaluation_id)`) compared
+separately. Legacy stores the per-agent-day mean (`qa_score`) and `evaluations`;
+`SUM(qa_score) = qa_score * evaluations`.
+
+### Core / Fraud — `quality_io`
+
+**Value parity (≤0.5, complete months):** **100.0% every month** — Jan
+817/817, Feb 814/814, Mar 1,164/1,164, Apr 1,270/1,270, May 995/995. Across all
+5,060 matched agent-days the max absolute value diff is **1.4e-14** (float
+noise) — i.e. exact. **Zero** denominator mismatches, **zero** `only_new`.
+
+| month | value match ≤0.5 | matched / joined | only_legacy | only_new |
+| --- | --- | --- | --- | --- |
+| Jan | 100.0% | 817 / 817 | 9 | 0 |
+| Feb | 100.0% | 814 / 814 | 0 | 0 |
+| Mar | 100.0% | 1,164 / 1,164 | 61 | 0 |
+| Apr | 100.0% | 1,270 / 1,270 | 43 | 0 |
+| May | 100.0% | 995 / 995 | 6 | 0 |
+
+### Social Media — Playvox (< 2026-05-01) / Sprinklr (≥ 2026-05-01)
+
+SM quality **migrated from Playvox to Sprinklr in May 2026**, so the new pipeline
+uses **Playvox for evaluations before `2026-05-01` and Sprinklr from `2026-05-01`
+onward** (a clean source switch — `SPRINKLR_SM_CUTOVER` in
+`metrics_data/quality_evaluations.py`; Playvox SM rows on/after the cutover are
+dropped so the two never double-count). Legacy SM quality is **Playvox-only** — the
+SM notebook never sourced quality from Sprinklr (Sprinklr appears there only for
+occupancy `:988` and tNPS `:2060`). Consequence:
+
+- **SM Jan–Apr (Playvox) matches legacy exactly** — Jan 234/234, Feb 228/228,
+  Mar 177/177 (10 `only_legacy` = the SM 03-27 outage drop), Apr 147/147; max diff 0.0.
+- **SM May onward (Sprinklr) intentionally does NOT match legacy's Playvox-only SM**
+  — a deliberate enhancement to use the migrated source (parallels the SM-occupancy
+  decision; see `sm-occupancy-on-pre-cutover`). New SM May is fully populated through
+  `2026-05-31` (335 agent-days / 26 agents); under the prior Playvox-only build SM
+  died at 05-15 because live Playvox carries no SM evals after that.
+
+| month | source | vs legacy | matched / joined |
+| --- | --- | --- | --- |
+| Jan | Playvox | exact | 234 / 234 |
+| Feb | Playvox | exact | 228 / 228 |
+| Mar | Playvox | exact (10 `only_legacy` = 03-27 outage) | 177 / 177 |
+| Apr | Playvox | exact | 147 / 147 |
+| May | **Sprinklr** | **by-design divergence** (legacy = Playvox-only) | n/a |
+
+### Divergences
+
+| Divergence | Rows (Jan–May) | Cause | num/den | Class |
+| --- | --- | --- | --- | --- |
+| `only_legacy`: **`2026-03-27` (61 Core/Fraud) + `2026-04-09` (43 Core/Fraud)** | 104 | **Legacy outage-filter is broken.** `[IO] Quality Dataset.sql:139/161` filters `local_mx_evaluation__created_at NOT IN ('2026-03-27','2026-04-09')` — but `local_mx_evaluation__created_at` is a **timestamp** and the literals are date-strings (= midnight), so the filter matches nothing and legacy `quality_io` **keeps** both outage days (verified: 61 + 43 agent-days present, evals 157 + 144). The new pipeline applies the outage carve-out as a real DATE filter (quirk #2) and correctly drops both days for Core/Fraud. New does what the legacy comment *intended* ("deleting data with general access problems"); legacy's frozen output is the broken one. | drops both | **legacy-bug** |
+| `only_legacy`: **SM `2026-03-27`** | 10 | Same broken-filter class on the SM side. SM legacy (`Social Media.sql:2931`) drops 03-27 in `qa_deduped` but via the same timestamp-vs-date pattern, so legacy keeps it; the new SM metric correctly drops 03-27 only (and **keeps 04-09**, verified: the lone surviving outage row anywhere in the new day metric is `social media / 2026-04-09`, 11 rows) — exactly the team-asymmetric outage of quirk #2. | drops 03-27 | **legacy-bug** (per quirk #2) |
+| `only_legacy`: **`enablement` 2026-01-02 (9) + `planning` May (6, scattered)** | 15 | Org-support squads. The new pipeline carries **no** `enablement`/`planning` quality rows at any grain (DIME/roster-squad exclusion); legacy's `agent_information` only drops `squad IN ('social','content')` (`Quality Dataset.sql:65`) so it keeps enablement/planning. Same roster-squad-vs-DIME-squad column nuance documented for Shrinkage. | — | **by-design** |
+| **SM May+ uses Sprinklr; legacy used Playvox-only** | SM May (≈26 agents/day, 335 rows) | SM quality **migrated Playvox→Sprinklr in May 2026** (owner-confirmed). The new pipeline switches SM to the Sprinklr source from `2026-05-01`, so SM May+ reflects the migrated source and is complete through 05-31; legacy's frozen SM is Playvox-only (which tails off after 05-15, since live Playvox has no SM evals past then). Deliberate enhancement, same spirit as SM occupancy. Earlier this showed as "SM source freshness" only because fix #4 had wrongly forced SM Playvox-only until July; reverting that resolved it. | source switch | **by-design** (SM source migration) |
+| `only_new`: **none** | 0 | New never adds Core/Fraud/SM agent-days legacy lacks (within complete months). | — | — |
+
+### Reproduced and matching (not divergences)
+- **Team-scoped blacklists** (quirk #1): Core/Fraud drop the 4 `scorecard_id` +
+  4 `evaluation_id` ids; SM drops only `scorecard_id='68def79b3f83da8cc9cb5299'`.
+  Verified on the raw table: **0** blacklisted scorecard/eval ids survive
+  pre-cutover.
+- **Team-asymmetric outage** (quirk #2): Core/Fraud drop **both** 03-27 + 04-09;
+  SM drops **only** 03-27 (keeps 04-09). Verified — the only outage-date row left
+  in the new day metric is SM 04-09 (11 rows). (This is the *intended* drop; the
+  divergence above is only because legacy's own filter failed to apply it.)
+- **SM source switch** (Playvox → Sprinklr at `2026-05-01`): SM quality uses
+  Playvox for evaluations `< 2026-05-01` (matches legacy) and Sprinklr from
+  `2026-05-01` onward (deliberate enhancement reflecting the real source migration;
+  legacy SM quality was Playvox-only). The switch is clean — no Playvox SM rows
+  survive on/after the cutover, so no double-count. Core/Fraud are always Playvox.
+- **Dedup** (latest per `evaluation_id` by `created_at DESC`) and **denominator =
+  `COUNT(distinct evaluation_id)`**: reproduced — denominator matches exactly on
+  all 5,060 Core/Fraud matched rows and all Jan–Apr SM rows.
+- **Content team absent** from quality on both sides (Content → CSAT, a separate
+  metric) — no Content rows leak into either side. By-design, confirmed.
+
+### Verdict
+**At parity. No open items.** Core/Fraud value parity is **100% and bit-exact**
+Jan–May (5,060/5,060, max diff 1.4e-14; re-confirmed on the shipped table —
+May 995/995, max diff 0.0). Coverage is clean apart from classified `only_legacy`:
+the **114** outage rows (104 Core/Fraud 03-27+04-09, 10 SM 03-27) are a
+**legacy-bug** — legacy's timestamp-vs-date outage filter silently fails and keeps
+the days; the new pipeline drops them, which the **owner confirmed is the desired
+correction**. The **15** enablement/planning rows are **by-design** (org-support
+squad exclusion). SM is **exact for Jan–Apr** (Playvox); **SM May+ is a deliberate
+Sprinklr enhancement** (the Playvox→Sprinklr migration), now complete through 05-31
+and intentionally diverging from legacy's Playvox-only SM — same class as SM
+occupancy, not an open item.
+
+**June (active month, not a gate):** Core/Fraud 707/707 value-exact (100%), 0
+`only_new`, 252 `only_legacy` — purely freshness (new max 2026-06-19 vs legacy
+2026-06-26, the trailing week not yet loaded).
+
+---
+
 ## Other metrics — not yet parity-checked
 
-Quality and the composite indices (Xpeer/XForce Index, etc.) have **not** been
+The composite indices (Xpeer/XForce Index, etc.) have **not** been
 validated against legacy yet. Check for the same phantom-adherence cutover,
 meeting/leave filter, and DIME-squad filter as Adherence / Normalized Occupancy /
 NTPJ before assuming parity.
