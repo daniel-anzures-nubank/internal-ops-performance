@@ -143,12 +143,6 @@ NTPJ_OUT_OF_SCOPE_SQUADS: tuple[str, ...] = ()
 # 2025-12-01 roster snapshot; from this month on, each job joins its own month.
 ROSTER_PIN_2025_MONTH: date = date(2025, 12, 1)
 
-# Legacy NTPJ shifts the DIME slot start +6h before matching it against a job's
-# local start time (``[IO] NTPJ Dataset.sql:230`` / ``:514``). The dime extractor
-# stores ``slot_start_local_unix`` without that offset, so the job→slot match in
-# ``attach_dimensioned_activity`` adds it. (NOcc/occupancy use no offset.)
-DIME_NTPJ_SLOT_OFFSET_SECONDS: int = 6 * 60 * 60
-
 
 # ---------------------------------------------------------------------------
 # job_id derivation (must match legacy verbatim for downstream benchmark joins)
@@ -343,19 +337,11 @@ def attach_dimensioned_activity(jobs: DataFrame, dime_raw: DataFrame) -> DataFra
     """
     job_start_unix = F.unix_timestamp(F.col("start_time"))
 
-    # Legacy NTPJ compares the job's local start against the DIME slot start shifted
-    # +6h: ``manual_adjustments_ntpj`` uses
-    # ``slot_start = unix_timestamp(local_timestamp_dime_slot_starts_at) + (6*60*60)``
-    # (``[IO] NTPJ Dataset.sql:230``; also ``dime_ntpj:514``). The dime extractor
-    # stores ``slot_start_local_unix`` WITHOUT that offset (see
-    # ``extractors/dime_slots.sql`` — "the metric layer must add +6*60*60"), so we
-    # add it here for the slot-time match. (NOcc/occupancy do NOT add it — different
-    # legacy convention — which is why this must NOT be copied from there.)
     slots = dime_raw.select(
         F.col("agent").alias("_d_agent"),
         F.to_date(F.col("date")).alias("_d_date"),
-        (F.col("slot_start_local_unix") + F.lit(DIME_NTPJ_SLOT_OFFSET_SECONDS)).alias("_slot_start"),
-        (F.col("slot_end_local_unix") + F.lit(DIME_NTPJ_SLOT_OFFSET_SECONDS)).alias("_slot_end"),
+        F.col("slot_start_local_unix").alias("_slot_start"),
+        F.col("slot_end_local_unix").alias("_slot_end"),
         F.col("dimensioned_activity").alias("_dimensioned_activity"),
     )
 
