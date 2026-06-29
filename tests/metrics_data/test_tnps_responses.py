@@ -1,19 +1,19 @@
-"""Unit tests for ``metrics_data/tnps_responses.py``.
+"""Unit tests for ``metrics_data/tnps_responses.py`` (PySpark).
 
-Small synthetic pandas frames, no warehouse, sub-second runs.
+Small synthetic Spark frames, no warehouse.
 
 tnps_responses is a RAW dataset: one row per Social-Media tNPS survey response
 (no classification, no NPS aggregation). We verify the human-agent filter, the
 roster join that attaches the standardized dimensions
-(agent, xforce, xplead, team, squad, district, shift), and the output contract.
+(agent, xforce, xplead, team, squad, district, shift) on the response's natural
+snapshot_month, and the output contract.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 
-import pandas as pd
-import pytest
+from pyspark.sql import types as T
 
 from tnps_responses import (
     IO_TNPS_RESPONSES_SCHEMA,
@@ -32,29 +32,52 @@ def _mock_email(local: str, domain: str = _MEXICO_NUBANK_DOMAIN) -> str:
 # Builders
 # ---------------------------------------------------------------------------
 
+_TNPS_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("agent_email_id", T.StringType()),
+        T.StructField("case_number", T.StringType()),
+        T.StructField("date", T.DateType()),
+        T.StructField("survey_response_date", T.DateType()),
+        T.StructField("survey_score", T.IntegerType()),
+    ]
+)
 
-def make_tnps_row(**overrides) -> dict:
-    base = {
+
+def make_tnps(spark, rows):
+    defaults = {
         "agent": "jane.doe",
         "agent_email_id": _mock_email("jane.doe"),
         "case_number": "1001",
         "date": dt.date(2026, 5, 15),
         "survey_response_date": dt.date(2026, 5, 15),
-        "case_closure_time": dt.date(2026, 5, 15),
         "survey_score": 10,
     }
-    base.update(overrides)
-    return base
+    data = [{**defaults, **r} for r in rows]
+    return spark.createDataFrame(
+        [tuple(r[f.name] for f in _TNPS_SCHEMA.fields) for r in data], _TNPS_SCHEMA
+    )
 
 
-def make_tnps(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame([make_tnps_row(**r) for r in rows])
+_ROSTER_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("xforce", T.StringType()),
+        T.StructField("xplead", T.StringType()),
+        T.StructField("team", T.StringType()),
+        T.StructField("squad", T.StringType()),
+        T.StructField("squad_district", T.StringType()),
+        T.StructField("status", T.StringType()),
+        T.StructField("shift", T.StringType()),
+        T.StructField("snapshot_date", T.DateType()),
+        T.StructField("snapshot_month", T.DateType()),
+    ]
+)
 
 
-def make_roster(rows: list[dict]) -> pd.DataFrame:
+def make_roster(spark, rows):
     defaults = {
         "agent": "jane.doe",
-        "actor_id": "actor-1",
         "xforce": "lead.one",
         "xplead": "boss.one",
         "team": "social media",
@@ -64,10 +87,15 @@ def make_roster(rows: list[dict]) -> pd.DataFrame:
         "shift": "morning",
         "snapshot_date": dt.date(2026, 5, 31),
         "snapshot_month": dt.date(2026, 5, 1),
-        "hire_start_date": dt.date(2025, 1, 15),
-        "last_change_date": dt.date(2025, 1, 15),
     }
-    return pd.DataFrame([{**defaults, **r} for r in rows])
+    data = [{**defaults, **r} for r in rows]
+    return spark.createDataFrame(
+        [tuple(r[f.name] for f in _ROSTER_SCHEMA.fields) for r in data], _ROSTER_SCHEMA
+    )
+
+
+def _collect(out):
+    return out.collect()
 
 
 # ---------------------------------------------------------------------------
@@ -76,10 +104,13 @@ def make_roster(rows: list[dict]) -> pd.DataFrame:
 
 
 class TestComputeTnpsResponses:
-    def test_one_response_one_row(self):
-        out = compute_tnps_responses(make_roster([{}]), make_tnps([{"survey_score": 9}]))
-        assert len(out) == 1
-        row = out.iloc[0]
+    def test_one_response_one_row(self, spark):
+        out = compute_tnps_responses(
+            make_roster(spark, [{}]), make_tnps(spark, [{"survey_score": 9}])
+        )
+        rows = _collect(out)
+        assert len(rows) == 1
+        row = rows[0]
         assert row["agent"] == "jane.doe"
         assert row["date"] == dt.date(2026, 5, 15)
         assert row["case_number"] == "1001"
@@ -89,114 +120,159 @@ class TestComputeTnpsResponses:
         assert row["district"] == "social"
         assert row["shift"] == "morning"
 
-    def test_two_responses_two_rows(self):
+    def test_two_responses_two_rows(self, spark):
         out = compute_tnps_responses(
-            make_roster([{}]),
+            make_roster(spark, [{}]),
             make_tnps(
+                spark,
                 [
                     {"case_number": "1001", "survey_score": 10},
                     {"case_number": "1002", "survey_score": 4},
-                ]
+                ],
             ),
         )
-        assert len(out) == 2
-        assert sorted(out["case_number"]) == ["1001", "1002"]
+        rows = _collect(out)
+        assert len(rows) == 2
+        assert sorted(r["case_number"] for r in rows) == ["1001", "1002"]
 
-    def test_no_classification_or_aggregation(self):
+    def test_same_case_two_responses_both_kept(self, spark):
+        # RAW layer does NOT dedup the case — both responses survive (the metric
+        # layer does classify-then-distinct).
+        out = compute_tnps_responses(
+            make_roster(spark, [{}]),
+            make_tnps(
+                spark,
+                [
+                    {"case_number": "1001", "survey_score": 10},
+                    {"case_number": "1001", "survey_score": 3},
+                ],
+            ),
+        )
+        assert len(_collect(out)) == 2
+
+    def test_no_classification_or_aggregation(self, spark):
         # Raw scores are preserved verbatim (no promoter/detractor mapping).
         out = compute_tnps_responses(
-            make_roster([{}]),
-            make_tnps([{"case_number": "c", "survey_score": 7}]),
+            make_roster(spark, [{}]),
+            make_tnps(spark, [{"case_number": "c", "survey_score": 7}]),
         )
-        assert int(out.iloc[0]["survey_score"]) == 7
+        assert int(_collect(out)[0]["survey_score"]) == 7
 
-    def test_null_score_kept(self):
+    def test_null_score_kept(self, spark):
         out = compute_tnps_responses(
-            make_roster([{}]),
-            make_tnps([{"survey_score": None}]),
+            make_roster(spark, [{}]),
+            make_tnps(spark, [{"survey_score": None}]),
         )
-        assert len(out) == 1
-        assert pd.isna(out.iloc[0]["survey_score"])
+        rows = _collect(out)
+        assert len(rows) == 1
+        assert rows[0]["survey_score"] is None
 
-    def test_unattributed_agent_dropped(self):
+    def test_unattributed_agent_dropped(self, spark):
         out = compute_tnps_responses(
-            make_roster([{}]),
-            make_tnps([{"agent": ""}]),
+            make_roster(spark, [{}]),
+            make_tnps(spark, [{"agent": ""}]),
         )
-        assert out.empty
+        assert len(out.take(1)) == 0
 
-    def test_inactive_agent_dropped(self):
+    def test_null_agent_dropped(self, spark):
         out = compute_tnps_responses(
-            make_roster([{"status": "inactive"}]),
-            make_tnps([{}]),
+            make_roster(spark, [{}]),
+            make_tnps(spark, [{"agent": None}]),
         )
-        assert out.empty
+        assert len(out.take(1)) == 0
 
-    def test_null_squad_agent_dropped(self):
+    def test_inactive_agent_dropped(self, spark):
         out = compute_tnps_responses(
-            make_roster([{"squad": None}]),
-            make_tnps([{}]),
+            make_roster(spark, [{"status": "inactive"}]),
+            make_tnps(spark, [{}]),
         )
-        assert out.empty
+        assert len(out.take(1)) == 0
 
-    def test_no_roster_match_dropped(self):
+    def test_null_squad_agent_dropped(self, spark):
         out = compute_tnps_responses(
-            make_roster([{"agent": "someone.else"}]),
-            make_tnps([{}]),
+            make_roster(spark, [{"squad": None}]),
+            make_tnps(spark, [{}]),
         )
-        assert out.empty
+        assert len(out.take(1)) == 0
 
-    def test_uses_natural_snapshot_month(self):
+    def test_no_roster_match_dropped(self, spark):
+        out = compute_tnps_responses(
+            make_roster(spark, [{"agent": "someone.else"}]),
+            make_tnps(spark, [{}]),
+        )
+        assert len(out.take(1)) == 0
+
+    def test_uses_natural_snapshot_month(self, spark):
         out = compute_tnps_responses(
             make_roster(
+                spark,
                 [
                     {"snapshot_month": dt.date(2026, 3, 1), "squad": "social"},
                     {"snapshot_month": dt.date(2026, 4, 1), "squad": "social_b"},
-                ]
+                ],
             ),
             make_tnps(
+                spark,
                 [
                     {"case_number": "mar", "date": dt.date(2026, 3, 10)},
                     {"case_number": "apr", "date": dt.date(2026, 4, 10)},
-                ]
+                ],
             ),
         )
-        assert len(out) == 2
-        squads_by_case = dict(zip(out["case_number"], out["squad"]))
+        rows = _collect(out)
+        assert len(rows) == 2
+        squads_by_case = {r["case_number"]: r["squad"] for r in rows}
         assert squads_by_case["mar"] == "social"
         assert squads_by_case["apr"] == "social_b"
 
-    def test_outage_date_not_filtered(self):
+    def test_roster_fanout_deduped(self, spark):
+        # Two identical roster rows for the same (agent, snapshot_month) must not
+        # fan out the inner join into duplicate response rows.
+        out = compute_tnps_responses(
+            make_roster(
+                spark,
+                [
+                    {"snapshot_date": dt.date(2026, 5, 31)},
+                    {"snapshot_date": dt.date(2026, 5, 15)},
+                ],
+            ),
+            make_tnps(spark, [{}]),
+        )
+        assert len(_collect(out)) == 1
+
+    def test_outage_date_not_filtered(self, spark):
         # The legacy 2026-03-27 outage exclusion is a metrics-layer concern.
         out = compute_tnps_responses(
-            make_roster([{"snapshot_month": dt.date(2026, 3, 1)}]),
-            make_tnps([{"date": dt.date(2026, 3, 27)}]),
+            make_roster(spark, [{"snapshot_month": dt.date(2026, 3, 1)}]),
+            make_tnps(spark, [{"date": dt.date(2026, 3, 27)}]),
         )
-        assert len(out) == 1
+        assert len(_collect(out)) == 1
 
-    def test_validity_window_not_applied(self):
+    def test_validity_window_not_applied(self, spark):
         # survey_response_date far after closure is kept (deferred to metrics).
         out = compute_tnps_responses(
-            make_roster([{}]),
+            make_roster(spark, [{}]),
             make_tnps(
+                spark,
                 [
                     {
                         "date": dt.date(2026, 5, 15),
                         "survey_response_date": dt.date(2026, 5, 30),
                     }
-                ]
+                ],
             ),
         )
-        assert len(out) == 1
+        assert len(_collect(out)) == 1
 
-    def test_out_of_scope_squads_constant_is_empty(self):
+    def test_out_of_scope_squads_constant_is_empty(self, spark):
         assert TNPS_OUT_OF_SCOPE_SQUADS == ()
 
-    def test_output_schema_and_column_order(self):
-        out = compute_tnps_responses(make_roster([{}]), make_tnps([{}]))
-        assert list(out.columns) == [c for c, _ in IO_TNPS_RESPONSES_SCHEMA]
+    def test_output_schema_and_column_order(self, spark):
+        out = compute_tnps_responses(make_roster(spark, [{}]), make_tnps(spark, [{}]))
+        assert out.columns == [c for c, _ in IO_TNPS_RESPONSES_SCHEMA]
 
-    def test_empty_input_yields_empty_frame_with_schema(self):
-        out = compute_tnps_responses(make_roster([{}]), make_tnps([])[0:0])
-        assert out.empty
-        assert list(out.columns) == [c for c, _ in IO_TNPS_RESPONSES_SCHEMA]
+    def test_empty_input_yields_empty_frame_with_schema(self, spark):
+        empty = spark.createDataFrame([], _TNPS_SCHEMA)
+        out = compute_tnps_responses(make_roster(spark, [{}]), empty)
+        assert len(out.take(1)) == 0
+        assert out.columns == [c for c, _ in IO_TNPS_RESPONSES_SCHEMA]

@@ -1,37 +1,50 @@
-"""tnps_responses — one row per Social-Media tNPS survey response.
+"""tnps_responses — one row per Social-Media tNPS survey response (PySpark).
 
 This is a RAW dataset, not a finished metric. It exposes every transactional-NPS
 (tNPS) survey response attributable to an active social agent, one row per
-response, with its raw 0-10 score. A downstream ``metrics`` layer classifies each
-response (promoter ``>= 9`` / detractor ``<= 6`` / neutral 7-8) and computes the
-**Human tNPS** metric: ``(promoters - detractors) / valid_responses``.
+response, with its raw 0-10 score. A downstream ``metrics`` layer
+(``metrics/tnps.py``) applies the validity window, classifies each response
+(promoter ``>= 9`` / detractor ``<= 6`` / neutral 7-8), and computes the
+**Human tNPS** metric: ``(promoters - detractors) / valid_responses`` via
+classify-then-COUNT(DISTINCT case_number).
 
 tNPS only applies to **Social Media**. The source
 (``sprinklr_tnps_data``) only contains surveys for cases handled by a human social
 agent, so every row here is a human social agent's survey.
 
+Agent attribution — direct from ``agent_email_id`` (NOT ``sprinklr_sm_users``)
+------------------------------------------------------------------------------
+The extractor normalizes the agent key with
+``LOWER(REGEXP_EXTRACT(agent_email_id, '^[a-zA-Z]+\\.[a-zA-Z]+', 0))`` directly
+off the survey's ``agent_email_id`` — matching legacy ``tnps_initial_base``
+(``REGEXP_EXTRACT(agent_email_id, ...)``). It does **not** join the
+``usr.mx__enablement.sprinklr_sm_users`` mapping (which has known swapped
+name<->email rows), so tNPS is not exposed to that attribution defect.
+
 Public API
 ----------
-``compute_tnps_responses(agent_info, tnps)`` returns one row per survey response.
+``compute_tnps_responses(agent_info, tnps)`` takes Spark DataFrames (the
+extractor outputs) and returns one Spark DataFrame with one row per survey
+response.
 
 Source tables (via extractors)
 ------------------------------
 * ``agent_information`` → ``etl.mx__series_contract.cx_mx_bdx_snapshots`` (+ ``ops_actors``).
-* ``tnps``             → ``usr.sprinklr_api_data_integration.sprinklr_tnps_data``.
+* ``tnps_responses``    → ``usr.sprinklr_api_data_integration.sprinklr_tnps_data``.
 
 Filters applied here (deliberately minimal — this is a raw table)
 -----------------------------------------------------------------
-* Drop rows whose ``agent`` did not resolve (empty string) — i.e. unattributable
-  / non-human surveys.
+* Drop rows whose ``agent`` did not resolve (null / empty string) — i.e.
+  unattributable / non-human surveys.
 * Roster: ``status = 'active'`` and non-null ``squad`` (inner join attaches the
-  dimensions / scopes output to active agents).
+  dimensions / scopes output to active agents on the response's snapshot_month).
 
-Filters deferred to the future metrics layer (NOT applied here)
----------------------------------------------------------------
+Filters deferred to the metrics layer (``metrics/tnps.py``, NOT applied here)
+-----------------------------------------------------------------------------
 * Promoter / detractor / neutral classification and the NPS ratio.
 * The validity window ``survey_response_date <= date + 1 day``.
 * The outage-date exclusion (``2026-03-27``).
-* Dedup to one response per ``case_number`` (legacy counts DISTINCT case_number).
+* The classify-then-COUNT(DISTINCT case_number) aggregation.
 
 Output schema (one row per survey response)
 --------------------------------------------
@@ -50,7 +63,8 @@ Output schema (one row per survey response)
 
 from __future__ import annotations
 
-import pandas as pd
+from pyspark.sql import DataFrame, Window
+from pyspark.sql import functions as F
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -62,72 +76,61 @@ TNPS_OUT_OF_SCOPE_SQUADS: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
-# Small utility
-# ---------------------------------------------------------------------------
-
-
-def _as_naive_datetime(series: pd.Series) -> pd.Series:
-    """Coerce a datetime Series to tz-naive ``datetime64[ns]`` for merge keys."""
-    s = pd.to_datetime(series)
-    if s.dt.tz is not None:
-        return s.dt.tz_localize(None)
-    return s
-
-
-# ---------------------------------------------------------------------------
 # Orchestrator — roster join (no aggregation)
 # ---------------------------------------------------------------------------
 
 
 def compute_tnps_responses(
-    agent_info: pd.DataFrame,
-    tnps: pd.DataFrame,
-) -> pd.DataFrame:
+    agent_info: DataFrame,
+    tnps: DataFrame,
+) -> DataFrame:
     """End-to-end tnps_responses pipeline (one row per survey response)."""
-    if tnps.empty:
-        return pd.DataFrame(
-            {c: pd.Series(dtype="object") for c, _ in IO_TNPS_RESPONSES_SCHEMA}
-        )
+    spark = tnps.sparkSession
 
-    responses = tnps.copy()
-    responses = responses[
-        responses["agent"].notna() & (responses["agent"] != "")
-    ].copy()
-
-    if responses.empty:
-        return pd.DataFrame(
-            {c: pd.Series(dtype="object") for c, _ in IO_TNPS_RESPONSES_SCHEMA}
-        )
+    responses = tnps.filter(
+        F.col("agent").isNotNull() & (F.col("agent") != F.lit(""))
+    )
 
     # --- roster join --------------------------------------------------------
-    roster = agent_info.loc[
-        (agent_info["status"] == "active")
-        & agent_info["squad"].notna()
-        & ~agent_info["squad"].isin(TNPS_OUT_OF_SCOPE_SQUADS),
-        [
-            "agent",
-            "xforce",
-            "xplead",
-            "team",
-            "squad",
-            "squad_district",
-            "shift",
-            "snapshot_month",
-        ],
-    ].copy()
-    roster = roster.rename(columns={"squad_district": "district"})
-    roster["snapshot_month"] = _as_naive_datetime(roster["snapshot_month"])
-
-    responses["snapshot_month"] = _as_naive_datetime(
-        pd.to_datetime(responses["date"]).dt.to_period("M").dt.to_timestamp()
+    roster = agent_info.filter(
+        (F.col("status") == F.lit("active")) & F.col("squad").isNotNull()
     )
-    enriched = responses.merge(roster, on=["agent", "snapshot_month"], how="inner")
+    if TNPS_OUT_OF_SCOPE_SQUADS:
+        roster = roster.filter(~F.col("squad").isin(list(TNPS_OUT_OF_SCOPE_SQUADS)))
+    roster = roster.select(
+        "agent",
+        "xforce",
+        "xplead",
+        "team",
+        "squad",
+        F.col("squad_district").alias("district"),
+        "shift",
+        F.to_date(F.col("snapshot_date")).alias("_snapshot_date"),
+        F.trunc(F.to_date(F.col("snapshot_month")), "month").alias("snapshot_month"),
+    )
 
-    enriched["survey_score"] = pd.to_numeric(
-        enriched["survey_score"], errors="coerce"
-    ).astype("Int64")
+    # Deduplicate the roster to exactly ONE row per (agent, snapshot_month) BEFORE
+    # the join (mirrors quality_evaluations): the content branch of
+    # `agent_information` can yield >1 identical row per (agent, snapshot_month),
+    # which would fan out the inner join and double-count responses. Keep the
+    # latest snapshot deterministically.
+    roster_dedup_window = Window.partitionBy("agent", "snapshot_month").orderBy(
+        F.col("_snapshot_date").desc_nulls_last(),
+        F.col("squad").asc_nulls_last(),
+        F.col("district").asc_nulls_last(),
+        F.col("shift").asc_nulls_last(),
+    )
+    roster = (
+        roster.withColumn("_roster_rn", F.row_number().over(roster_dedup_window))
+        .filter(F.col("_roster_rn") == 1)
+        .drop("_roster_rn", "_snapshot_date")
+    )
 
-    out = enriched[[
+    enriched = responses.withColumn(
+        "snapshot_month", F.trunc(F.to_date(F.col("date")), "month")
+    ).join(roster, on=["agent", "snapshot_month"], how="inner")
+
+    out = enriched.select(
         "agent",
         "xforce",
         "xplead",
@@ -135,13 +138,13 @@ def compute_tnps_responses(
         "squad",
         "district",
         "shift",
-        "date",
-        "case_number",
-        "survey_response_date",
-        "survey_score",
-    ]].copy()
+        F.to_date(F.col("date")).alias("date"),
+        F.col("case_number").cast("string").alias("case_number"),
+        F.to_date(F.col("survey_response_date")).alias("survey_response_date"),
+        F.col("survey_score").cast("int").alias("survey_score"),
+    )
 
-    return out.sort_values(["date", "agent", "case_number"]).reset_index(drop=True)
+    return out.orderBy("date", "agent", "case_number")
 
 
 # ---------------------------------------------------------------------------
