@@ -330,6 +330,88 @@ occupancy, not an open item.
 
 ---
 
+## TNPS — `io_tnps_metric` vs the `tnps_agent` rows of `usr.mx__cx.internal_ops_performance_2026_social_media` (Social Media only)
+
+**Status:** validated over the complete months **`2026-01-01 … 05-31`**
+(Human tNPS is a direct per-agent-day ratio — no cohort/trailing benchmark — so
+each month stands alone; June is the still-settling active month, reported as
+freshness below). Comparison is day-grain tNPS score, outer-joined on
+`(agent, date)`, `metric='tnps'` / `date_granularity='day'` / team `social media`
+on the new side vs legacy `metric='tnps_agent'` / `date_granularity='day'`
+(legacy `date_reference` cast to DATE). Tolerance is **≤0.5 absolute** (tNPS is a
+`numerator/denominator*100` score that can be **negative**, not a pp). Numerator
+(`#distinct cases with ≥1 promoter − #distinct cases with ≥1 detractor`) and
+denominator (`#distinct cases with ≥1 valid response`) compared separately. The
+era-split snapshot pin (`tnps_base_2025`, `Social Media.sql:2103`) only applies to
+closure dates `< 2025-12-01`, so it is N/A in this window.
+
+**Value parity (≤0.5, complete months): 100.0% every month** — Jan 239/239,
+Feb 302/302, Mar 392/392, Apr 264/264, May 249/249. Across all **1,446** matched
+agent-days the numerator is exact (1,446/1,446), the denominator is exact
+(1,446/1,446), and the max absolute value diff is **0.0** — i.e. bit-exact. Both
+sides carry the same **10 negative-value** rows (detractor-heavy days), so the
+signed-ratio path is reproduced. **Zero** `only_legacy`, **zero** `only_new` on
+the complete months. NULL/zero-denominator path is clean (0 den-zero rows).
+
+| month | value match ≤0.5 | matched / joined | only_legacy | only_new |
+| --- | --- | --- | --- | --- |
+| Jan | 100.0% | 239 / 239 | 0 | 0 |
+| Feb | 100.0% | 302 / 302 | 0 | 0 |
+| Mar | 100.0% | 392 / 392 | 0 | 0 |
+| Apr | 100.0% | 264 / 264 | 0 | 0 |
+| May | 100.0% | 249 / 249 | 0 | 0 |
+
+### Divergences
+
+| Divergence | Rows (Jan–May) | Cause | num/den | Class |
+| --- | --- | --- | --- | --- |
+| none | 0 | Complete months are bit-exact on value, numerator, denominator, and coverage. | — | — |
+
+**June (active month, not a gate):** within the loaded June window (new max
+`2026-06-21` vs legacy `2026-06-29`) the 236 matched rows are **100% value-exact**,
+0 `only_new`. The **104** `only_legacy` June rows all fall on `2026-06-22` onward —
+purely the trailing week not yet loaded into the new pipeline (freshness/boundary,
+same class as the other metrics' active-month tail).
+
+### Reproduced and matching (not divergences)
+- **Agent attribution via `LOWER(REGEXP_EXTRACT(agent_email_id, ...))`** — both
+  sides extract the agent from the email directly and **neither** joins
+  `sprinklr_sm_users` (the swapped name↔email table), so TNPS is not exposed to
+  that defect. Verified: 0 agent-level divergences.
+- **Validity window** `survey_response_date <= case_closure_time + INTERVAL 1 DAY`
+  (`Social Media.sql:2078`) — both source columns DATE-typed, so the comparison is
+  byte-for-byte; reproduced.
+- **`2026-03-27` outage drop** (`Social Media.sql:2087`,
+  `DATE_TRUNC('DAY', case_closure_time) != '2026-03-27'`) — its DATE_TRUNC cast
+  actually fires here (unlike Quality's broken timestamp filter), so both sides
+  drop the day. Verified: **0** rows on 03-27 on both sides (both empty, as
+  expected).
+- **Classify-then-`COUNT(DISTINCT)`, not dedup-to-one-row**
+  (`Social Media.sql:2080-2089`) — implemented exactly as legacy. In this window
+  there happen to be **0 mixed-class cases** (no case carries both a valid
+  promoter ≥9 and a valid detractor ≤6 response, across 3,885 kept cases), so the
+  classify-vs-dedup distinction has no observable effect Jan–May; the code path is
+  correct but untriggered. Independent recompute from
+  `io_tnps_responses_raw` reproduces the table's num/den exactly on every
+  roster-active row.
+- **Roster active-status join** (`agent_information`, `b.status='active'`,
+  `Social Media.sql:2096`) — applied identically on both sides. The 16 raw
+  response-days dropped from the new metric are **also absent from legacy** (0 of
+  16 present in legacy), so the roster filter never surfaces as a divergence.
+- **Score thresholds** promoter ≥9 / detractor ≤6 / neutral 7–8 / valid = non-null
+  (`Social Media.sql:2069-2077`) — reproduced.
+
+### Verdict
+**At parity. No open items.** Value parity is **100% and bit-exact** Jan–May
+(1,446/1,446 matched, max diff 0.0; numerator and denominator both exact),
+coverage is perfectly clean (0 `only_legacy`, 0 `only_new`). The validity window,
+03-27 outage drop, classify-then-COUNT(DISTINCT) logic, email-direct attribution
+(no `sprinklr_sm_users` exposure), and roster active-status join are all
+reproduced. June's only divergence is the trailing-week freshness gap
+(104 `only_legacy` on/after 06-22); the loaded June window is 100% value-exact.
+
+---
+
 ## Other metrics — not yet parity-checked
 
 The composite indices (Xpeer/XForce Index, etc.) have **not** been
