@@ -145,9 +145,91 @@ agents; everything else is at parity.
 
 ---
 
+## Shrinkage — `io_shrinkage_metric` vs `usr.mx__cx.shrinkage_io`
+
+**Status:** validated over the complete months **`2026-01-01 … 05-31`**
+(shrinkage is a direct per-agent-day ratio — no cohort/trailing benchmark — so
+each month stands alone; June is the still-settling active month, reported as
+freshness below). Comparison is day-grain shrinkage% (`numerator/denominator*100`),
+outer-joined on `(agent, date_reference=date)`, `metric='shrinkage'`,
+`date_granularity='day'`.
+
+**Value parity (≤0.5pp, complete months):** **Jan 100%** (9,656/9,656),
+**Feb 100%** (8,376/8,376), **Mar 100%** (9,747/9,747), **Apr 99.93%**
+(9,387/9,394), **May 99.83%** (9,980/9,997). 24 matched-row value mismatches
+across Jan–May, all classified (20 legacy-bug, 4 by-design); none open. Numerator
+(shrinkage_slot) and the NULL-denominator path are otherwise exact.
+
+| month | matched ≤0.5pp | matched / joined | only_legacy | only_new |
+| --- | --- | --- | --- | --- |
+| Jan | 100.0% | 9,656 / 9,656 | 0 | 33 |
+| Feb | 100.0% | 8,376 / 8,376 | 1 | 335 |
+| Mar | 100.0% | 9,747 / 9,747 | 85 | 500 |
+| Apr | 99.93% | 9,387 / 9,394 | 0 | 922 |
+| May | 99.83% | 9,980 / 9,997 | 0 | 1,318 |
+
+June is the active/settling month (live data has moved vs legacy's frozen
+snapshot); not a parity gate. The Mar/Apr `only_legacy` counts above are **after**
+the shrinkage outage carve-out (Mar 413→85, Apr 328→0 once shrinkage stopped
+applying the `Fallas Generales` rows — see "Reproduced and matching").
+
+### Coverage divergences
+
+| Divergence | Rows (Jan–May) | Cause | num/den | Class |
+| --- | --- | --- | --- | --- |
+| `only_new`: **Social + Content/Enablement** (roster team `social` / `content`) | ≈2,300 | Legacy's `agent_information` roster drops `squad IN ('social','content')` (`[IO] Shrinkage Dataset.sql:65`), so these never reach `shrinkage_io`. The new pipeline excludes by **DIME-squad** (`content`/`planning`/`quality`/`social`/`wfm`/`enablement`, `shrinkage_slots.py` → `filter_dime`, legacy lines 249-250), which is a different column: agents whose roster team is social/content but whose `agent_dime_squad` is *not* in the DIME-exclusion set survive the DIME filter and appear new-only. Both sides intend to drop org-support; the residual is the roster-squad vs DIME-squad column mismatch. | — | by-design |
+| `only_legacy`: **2026-03-10, all Core squads** (lifecycle/savings/credit/collections/engagement; legacy num=0) | 57 | The approved **Core-wide `2026-03-10` standardization** — `adj_exclusiones_generales` row `Core,Todos,2026-03-10` ("DIME ETL no coincide con DIME Drive … XPLead david.fernandez"). Legacy scopes the carve-out to `xplead='david.fernandez'` only (as in Adherence/NOCC), so it keeps the other Core agents; the new pipeline drops all Core on 03-10. Identical class to the NOCC March 03-10 ripple. This is the bulk of March's residual `only_legacy` (85). | drops both | by-design (approved standardization) |
+| `only_legacy`: **2026-03-10 `quality`** | ≈28 | DIME-squad nuance: roster team `quality` agents whose `agent_dime_squad` IS `quality` are dropped by the new DIME filter; legacy's roster keeps team-quality agents whose DIME squad differs. | — | by-design |
+| `only_legacy`: **jonathan.pineda 2026-02-26** (legacy 0%) | 1 | Single Feb agent-day present in legacy (num 0 / den 16) but absent from the new metric — a roster `status`/snapshot edge for that one agent-day. Immaterial (0% shrinkage, 1 row). | — | open (immaterial) |
+
+### Value divergences (24 of 47,170 matched rows, Jan–May)
+
+| Divergence | Rows | Cause | num/den | Class |
+| --- | --- | --- | --- | --- |
+| **Legacy >100% shrinkage** — vacation/licence agents (carmina.venegas, lucia.espinosa, nadia.tovias, gabriela.vega, …) | 20 | Legacy's vacation/licence hardcodes (`shrinkage_final_2026` lines 264-276) force the agent's slots **into the numerator** (`shrinkage_slot`), but `required_slot` is `COUNT(activity_type_required != 'time_off')` (line 281) and those slots are `time_off` — so they're added to num but **excluded from den**. Result: legacy num > den → impossible ratios (133%–1600%, or NULL when den hits 0). The new pipeline ports the same carve-out via `adj_inconsistencias_dime` (relabel `time_off`→`shrinkage`), which counts the slot in **both** num and den → a sane 100%. New is correct; legacy is mathematically broken. | den (legacy drops time_off from den) | legacy-bug |
+| **jefferson.nunes / patricia.gomez 2026-05-01** | 2 | Deliberate user correction — the adjustment sheet carries May-1 `time_off` rows for these two that legacy lacks (legacy carves out only 5 named agents on May-1). New drops their May-1 slots from num+den; legacy keeps them. | den | by-design |
+| **quality 2026-05-22** (fernanda.rodriguez, miriam.hernandez) | 2 | DIME-squad-quality nuance on a single day — slot-count difference between the new DIME-squad-filtered base and legacy's roster base for these two quality agents. | both (−3/−3) | by-design |
+
+### Reproduced and matching (not divergences)
+- The **2026-03-01 slot-level formula switch** (pre: `activity_type_required='shrinkage'`;
+  post: + `dime_invalid_notation` with a meeting/leave `dimensioned_activity` —
+  Mouring/Weekly/Permiso Medico/Huddle/Licencia/Vacacion, legacy line 263).
+- The **era-gated required_slot denominator** (pre-cutover drops `dime_invalid_notation`,
+  post-cutover drops `time_off`, legacy lines 280-281) and the `lunch_break` drop (line 248).
+- The **shrinkage DIME-squad exclusion** (`content`/`planning`/`quality`/`social`/`wfm`/
+  `enablement`, lines 249-250 — broader than the adherence/occupancy list and applied at the
+  slot stage so it constrains both num and den).
+- The **maria.reyes Feb-only maternity reclass** (sheet `fecha_fin` corrected to
+  `2026-02-28` so the inclusive matcher reproduces legacy's `date < '2026-03-01'`),
+  training/shadowing window drops, the `jose.velez` et al. **2026-03-24…28** day-control
+  carve-out (line 294), and the vacation/licence reclasses that *do* match (agents whose
+  underlying slots are not `time_off`, e.g. carmina post-relabel = 100%).
+- **Outage dates `Fallas Generales` (2026-03-27 / 04-09) deliberately NOT applied to
+  shrinkage.** Legacy shrinkage has no org-wide outage carve-out (it keeps all 328
+  agents), while Adherence / Normalized Occupancy legitimately drop those days. The
+  shared `exclusiones_generales` tab carries `Core/Fraud,Todos` outage rows; shrinkage
+  now filters them out by `descripcion='Fallas Generales'`
+  (`metrics/shrinkage.py::_drop_outage_exclusions`, owner decision), keeping the
+  CNVB day-controls and the 03-10 standardization. Verified: new keeps 348/345 agents on
+  those dates (legacy 328; surplus = the by-design social/content unification).
+- **israel.cadena 2026-03-19** now matches (100% = 100%): his `adj_inconsistencias_dime`
+  row `equipo` was corrected `Fraud`→`Core` so the team-scoped vacation reclass applies.
+
+### Verdict
+**At parity on the complete months** — value parity 100% / 100% / 100% / 99.93% /
+99.83% (Jan–May). Coverage is clean: `only_legacy` is 0 (Jan/Apr/May), 1 (Feb,
+immaterial), 85 (Mar, dominated by the approved Core-wide 03-10 standardization);
+`only_new` is the by-design social/content unification. All 24 value mismatches are
+classified — **20 legacy-bug** (legacy's >100% time_off-in-numerator defect, new is
+correct) and **4 by-design** (jefferson.nunes/patricia.gomez May-1, quality 05-22). The
+03-27/04-09 outage carve-out and the israel.cadena / maria.reyes sheet fixes are shipped.
+Only **one open row** remains (jonathan.pineda 02-26, 0% / immaterial). Ready to merge.
+
+---
+
 ## Other metrics — not yet parity-checked
 
-Quality, Shrinkage, and the composite indices (Xpeer/XForce Index, etc.) have
-**not** been validated against legacy yet. Check for the same
-phantom-adherence cutover, meeting/leave filter, and DIME-squad filter as
-Adherence / Normalized Occupancy / NTPJ before assuming parity.
+Quality and the composite indices (Xpeer/XForce Index, etc.) have **not** been
+validated against legacy yet. Check for the same phantom-adherence cutover,
+meeting/leave filter, and DIME-squad filter as Adherence / Normalized Occupancy /
+NTPJ before assuming parity.
