@@ -17,9 +17,14 @@
 --       NOT IN (CONCAT('testuser', '@', 'nu.com.mx'))
 --       NOT LIKE '%consorcio%'  (outsourced — not in Nubank's roster)
 --       NOT LIKE '%conjur%'     (outsourced — not in Nubank's roster)
---   * Dedup by `evaluation_id` keeping the latest version (latest `updated_at`,
---     then latest `created_at`). `qmo_playvox_consolidated` carries every revision
---     of an evaluation as a separate row; consumers always want the latest.
+--   * Dedup by `evaluation_id` keeping the latest version. `qmo_playvox_consolidated`
+--     carries every revision of an evaluation as a separate row. Legacy `qa_deduped`
+--     picks the winner with `ROW_NUMBER() OVER (PARTITION BY evaluation__id ORDER BY
+--     local_mx_evaluation__created_at DESC)`, so we order by `created_at DESC` FIRST
+--     (legacy primary key) with `updated_at DESC` only as a deterministic tiebreaker.
+--     `created_at` is carried through end-to-end so the metric layer's re-dedup uses
+--     the same `created_at DESC` order (a no-op here, but it keeps the two layers'
+--     winner selection identical).
 --
 -- Out of scope (handled by the metrics layer)
 --   * Team-name exclusions (legacy: `NOT IN ("REGULATORY SOLUTIONS", "AML")`).
@@ -59,8 +64,8 @@ WITH playvox_filtered AS (
     local_mx_evaluation__updated_at,
     ROW_NUMBER() OVER (
       PARTITION BY evaluation__id
-      ORDER BY local_mx_evaluation__updated_at DESC NULLS LAST,
-               local_mx_evaluation__created_at DESC NULLS LAST
+      ORDER BY local_mx_evaluation__created_at DESC NULLS LAST,
+               local_mx_evaluation__updated_at DESC NULLS LAST
     ) AS rn
   FROM etl.mx__dataset.qmo_playvox_consolidated
   WHERE local_mx_evaluation__created_at >= :period_start

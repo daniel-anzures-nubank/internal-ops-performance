@@ -1,72 +1,78 @@
-"""quality — the Quality (QA) performance metric (Core / Fraud / Social Media).
+"""quality — the Quality (QA) performance metric (Core / Fraud / Social Media), PySpark.
 
 Quality is the simple average of an agent's QA evaluation scores for the period:
 
-    quality = SUM(qa_score) / COUNT(evaluations)   (mean of the scores)
+    quality = SUM(qa_score) / COUNT(DISTINCT evaluation_id)   (mean of the scores)
 
-**Target ≥ 95%.** Scores are already on a 0-100 scale, so ``metric_value`` is the
-mean directly (``numerator = SUM(qa_score)``, ``denominator = # evaluations``,
-``scale = 1``).
+**Target >= 95%.** Scores are already on a 0-100 scale, so ``metric_value`` is the
+mean directly (``numerator = SUM(qa_score)``, ``denominator = # distinct
+evaluations``, ``scale = 1``).
 
 Team coverage
 -------------
 Core, Fraud, and **Social Media** all score Quality as the mean of their QA
-evaluation scores. **Content is excluded**: its quality of record is the
-separate **Quality (CSAT)** metric (`metrics/content_csat.py` →
-`io_content_csat_*`).
+evaluation scores. **Content is excluded**: its quality of record is the separate
+**Quality (CSAT)** metric. ``compute_quality`` excludes only ``team == 'content'``;
+the social team string is ``'social media'`` (with a space).
 
 Sources (Playvox + Sprinklr SM)
 -------------------------------
 Quality is scored from two feeds, unioned in the raw layer
-(``io_quality_evaluations_raw``):
-
-* **Playvox** (``qmo_playvox_consolidated``) — Core / Fraud / Content, and
-  historically Social Media too.
-* **Sprinklr SM** (``social_media_case_summary_information``) — Social-Media
-  case QA, from ``2026-05-01`` onward (``UNION ALL``-ed on top of Playvox).
-
-Both are on the same 0-100 scale, and the raw table carries a ``source`` column
-('playvox' / 'sprinklr_sm') for provenance. This metric averages all (deduped)
-evaluations regardless of source, so a social agent with both Playvox and
-Sprinklr evaluations contributes both. (Legacy carried the Sprinklr ``UNION ALL``
-only in the Core/Fraud dataset, where it was dead code — the active-roster join
-excluded ``social`` — so the new pipeline is the first to actually score SM from
-Sprinklr.)
+(``io_quality_evaluations_raw``): Playvox (Core / Fraud / Content / historically
+SM) and Sprinklr SM (Social-Media case QA, from the 2026-07-01 cutover onward).
+The raw table carries a ``source`` column ('playvox' / 'sprinklr_sm'). Dedup is
+**per (source, evaluation_id)** so a Playvox ``evaluation__id`` and a Sprinklr
+``case_number`` can never collide and silently drop a row (legacy dedups within
+each single-source notebook).
 
 Input
 -----
 ``io_quality_evaluations_raw`` (one row per evaluation), via
 ``metrics_data/quality_evaluations.py``. Required columns: ``agent, xforce,
-xplead, team, squad, district, shift, date, evaluation_id, team_name, source,
-qa_score``.
+xplead, team, squad, district, shift, date, created_at, evaluation_id,
+team_name, scorecard_id, source, qa_score``.
 
-Steps applied here (deferred by the raw layer)
-----------------------------------------------
-* **Latest record per ``evaluation_id``** (legacy ``ROW_NUMBER() OVER (PARTITION
-  BY evaluation_id ORDER BY created_at DESC)``, keep rn=1). The raw table only
-  carries day-grain ``date`` (not the original ``created_at`` timestamp), so we
-  keep the row with the latest ``date`` per ``evaluation_id`` (same-day re-scores
-  can't be ordered finer — see caveat below).
-* **Drop Content**: ``team == 'content'`` rows are removed (CSAT is content's
-  quality).
-* Rows with a null ``qa_score`` are dropped.
+Legacy parity steps applied here (deferred by the raw layer)
+------------------------------------------------------------
+* **Team-scoped blacklists** (date < 2026-07-01), verified against legacy:
+    - Core / Fraud (``[IO] Quality Dataset.sql`` ``qa_base``, lines 162/166): drop
+      ``scorecard_id IN BLACKLIST_SCORECARD_IDS`` AND ``evaluation_id IN
+      BLACKLIST_EVALUATION_IDS``.
+    - Social Media (``[IO] Performance 2026 - Social Media.sql`` ``qa_base``,
+      line 2920): drop ONLY ``scorecard_id == SM_BLACKLIST_SCORECARD_ID`` — NO
+      evaluation_id blacklist.
+* **Team-asymmetric outage-date exclusion** (date < 2026-07-01), verified
+  against legacy:
+    - Core / Fraud (``qa_score_2026``, line 233; ``qa_score_2025``): drop
+      ``date IN (2026-03-27, 2026-04-09)`` AFTER the dedup.
+    - Social Media (``qa_deduped``, line 2931): drop ONLY ``2026-03-27``, BEFORE
+      the dedup (the filter sits in the ROW_NUMBER CTE's WHERE).
+* **Latest record per (source, evaluation_id)** by ``created_at DESC`` (legacy
+  ``ROW_NUMBER() OVER (PARTITION BY evaluation_id ORDER BY
+  local_mx_evaluation__created_at DESC)``, keep rn=1).
+* **Drop Content** (``team == 'content'``) and **drop null ``qa_score``** rows.
 
-NOT applied here (future Adjustments layer)
--------------------------------------------
-* The ``scorecard_id`` / ``evaluation_id`` blacklists.
-* Outage-date exclusions (2026-03-27, 2026-04-09).
+Era-gating (legacy ``qa_score_2025`` snapshot pin) — N/A for our window
+-----------------------------------------------------------------------
+Legacy pins evaluations with ``created_at < 2025-12-01`` to the 2025-12-01 roster
+snapshot. That pinning lives in the roster join (``metrics_data``); the validation
+window starts 2026-01-01, so no evaluation reaches before Dec-2025 and this rule
+never fires. Documented as N/A — not implemented here.
 
 Output — tidy long format, one row per (agent, date_reference, granularity)
 ---------------------------------------------------------------------------
 ``agent, xforce, xplead, team, squad, district, shift, date_reference,
 date_granularity, metric, numerator, denominator, metric_value`` where
-``numerator`` = sum of scores, ``denominator`` = # of evaluations,
+``numerator`` = sum of scores, ``denominator`` = # distinct evaluations,
 ``metric_value`` = mean score.
 """
 
 from __future__ import annotations
 
-import pandas as pd
+from datetime import date
+
+from pyspark.sql import DataFrame, Window
+from pyspark.sql import functions as F
 
 from metric_utils import aggregate_long, empty_metric_frame
 
@@ -75,20 +81,95 @@ METRIC_NAME = "quality"
 # Content's quality of record is CSAT, not the Playvox QA mean.
 EXCLUDED_TEAMS: tuple[str, ...] = ("content",)
 
+# Performance team string for Social Media (note the space). Used to scope the
+# team-asymmetric blacklist / outage rules.
+SOCIAL_MEDIA_TEAM = "social media"
 
-def _dedup_latest_per_evaluation(evals: pd.DataFrame) -> pd.DataFrame:
-    """Keep the latest row per ``evaluation_id`` (by ``date``).
+# Cutover before which the legacy QA quirks (blacklists, outage drops) apply.
+# From this date onward they are dropped (corrections take effect).
+QUALITY_CUTOVER: date = date(2026, 7, 1)
 
-    Mirrors legacy ``ROW_NUMBER() ... ORDER BY created_at DESC`` at day grain.
+# --- Team-scoped blacklists (legacy QA artifacts, pre-cutover only) ---------
+#
+# Core / Fraud — legacy/[IO] Quality Dataset.sql qa_base:
+#   scorecard__id NOT IN (...)  (line 162)
+#   evaluation__id NOT IN (...)  (line 166)
+BLACKLIST_SCORECARD_IDS: tuple[str, ...] = (
+    "68def79b3f83da8cc9cb5299",
+    "6812b3e46abeabb0653d197e",
+    "688017f4bb266bb43b6c9565",
+    "68680819336107d9f140d1ce",
+)
+BLACKLIST_EVALUATION_IDS: tuple[str, ...] = (
+    "68646ed2f093c149757ba038",
+    "687704e7a077fb121012dd5d",
+    "688017f4bb266bb43b6c9565",
+    "68680819336107d9f140d1ce",
+)
+# Social Media — legacy/[IO] Performance 2026 - Social Media.sql qa_base
+#   scorecard__id NOT IN ("68def79b3f83da8cc9cb5299")  (line 2920); NO eval_id list.
+SM_BLACKLIST_SCORECARD_IDS: tuple[str, ...] = ("68def79b3f83da8cc9cb5299",)
+
+# --- Team-asymmetric outage dates (legacy "general access problems") --------
+# Core / Fraud drop both; Social Media drops only 2026-03-27.
+OUTAGE_DATES_CORE_FRAUD: tuple[date, ...] = (date(2026, 3, 27), date(2026, 4, 9))
+OUTAGE_DATES_SOCIAL_MEDIA: tuple[date, ...] = (date(2026, 3, 27),)
+
+
+def _is_social_media(col: "F.Column") -> "F.Column":
+    """True where the ``team`` column is the Social-Media team string."""
+    return F.lower(col) == F.lit(SOCIAL_MEDIA_TEAM)
+
+
+def _apply_blacklists(evals: DataFrame) -> DataFrame:
+    """Drop blacklisted evaluations, team-scoped, for date < cutover.
+
+    Core/Fraud: drop scorecard_id-in-list OR evaluation_id-in-list.
+    Social Media: drop scorecard_id == the single SM scorecard only.
+    Rows on/after the cutover are never blacklisted.
     """
-    work = evals.copy()
-    work["_date"] = pd.to_datetime(work["date"])
-    work = work.sort_values("_date")
-    work = work.drop_duplicates(subset=["evaluation_id"], keep="last")
-    return work.drop(columns=["_date"])
+    cal = F.to_date(F.col("date"))
+    pre_cutover = cal < F.lit(QUALITY_CUTOVER)
+    is_sm = _is_social_media(F.col("team"))
+
+    core_fraud_hit = F.col("scorecard_id").isin(list(BLACKLIST_SCORECARD_IDS)) | F.col(
+        "evaluation_id"
+    ).isin(list(BLACKLIST_EVALUATION_IDS))
+    sm_hit = F.col("scorecard_id").isin(list(SM_BLACKLIST_SCORECARD_IDS))
+
+    blacklisted = pre_cutover & F.when(is_sm, sm_hit).otherwise(core_fraud_hit)
+    return evals.filter(~blacklisted)
 
 
-def compute_quality(quality_evaluations: pd.DataFrame) -> pd.DataFrame:
+def _outage_mask(team_col: "F.Column", date_col: "F.Column") -> "F.Column":
+    """True where the row is on a team-scoped outage date AND pre-cutover."""
+    cal = F.to_date(date_col)
+    pre_cutover = cal < F.lit(QUALITY_CUTOVER)
+    is_sm = _is_social_media(team_col)
+    sm_outage = cal.isin(list(OUTAGE_DATES_SOCIAL_MEDIA))
+    cf_outage = cal.isin(list(OUTAGE_DATES_CORE_FRAUD))
+    return pre_cutover & F.when(is_sm, sm_outage).otherwise(cf_outage)
+
+
+def _dedup_latest_per_evaluation(evals: DataFrame) -> DataFrame:
+    """Keep the latest row per ``(source, evaluation_id)`` by ``created_at DESC``.
+
+    Mirrors legacy ``ROW_NUMBER() OVER (PARTITION BY evaluation_id ORDER BY
+    created_at DESC)`` keep rn=1, dedup'd WITHIN each source (legacy dedups inside
+    each single-source notebook) so a Playvox id and a Sprinklr case_number can
+    never collide. Falls back to ``date`` then ``qa_score`` as deterministic
+    tiebreakers when ``created_at`` ties.
+    """
+    w = Window.partitionBy("source", "evaluation_id").orderBy(
+        F.col("created_at").desc_nulls_last(),
+        F.to_date(F.col("date")).desc_nulls_last(),
+        F.col("qa_score").desc_nulls_last(),
+    )
+    ranked = evals.withColumn("_rn", F.row_number().over(w))
+    return ranked.filter(F.col("_rn") == 1).drop("_rn")
+
+
+def compute_quality(quality_evaluations: DataFrame) -> DataFrame:
     """Compute the Quality metric at all granularities.
 
     Args:
@@ -98,19 +179,43 @@ def compute_quality(quality_evaluations: pd.DataFrame) -> pd.DataFrame:
     Returns:
         Tidy long-format metric rows (see module docstring).
     """
-    if quality_evaluations.empty:
-        return empty_metric_frame()
+    spark = quality_evaluations.sparkSession
 
-    evals = quality_evaluations[quality_evaluations["qa_score"].notna()].copy()
-    evals = evals[~evals["team"].astype("string").str.lower().isin(EXCLUDED_TEAMS)]
-    if evals.empty:
-        return empty_metric_frame()
+    evals = quality_evaluations.filter(F.col("qa_score").isNotNull())
+    evals = evals.filter(
+        ~F.lower(F.col("team")).isin(list(EXCLUDED_TEAMS))
+    )
+
+    # Legacy blacklists run in qa_base, i.e. BEFORE the dedup window — a
+    # blacklisted revision must not be eligible to win the dedup.
+    evals = _apply_blacklists(evals)
+
+    # Outage ordering is team-asymmetric:
+    #   * Social Media (legacy qa_deduped, line 2931) filters 2026-03-27 INSIDE the
+    #     ROW_NUMBER CTE -> the outage filter applies BEFORE the dedup.
+    #   * Core / Fraud (legacy qa_score_2026, line 233) filters the outage dates in
+    #     the post-dedup aggregation CTE -> AFTER the dedup.
+    # An evaluation_id belongs to exactly one team, so we split the filter around
+    # the dedup by team.
+    is_sm = _is_social_media(F.col("team"))
+    sm_pre_dedup_drop = is_sm & _outage_mask(F.col("team"), F.col("date"))
+    evals = evals.filter(~sm_pre_dedup_drop)
 
     evals = _dedup_latest_per_evaluation(evals)
 
-    # One row per evaluation → SUM(qa_score) / COUNT = mean. scale=1 because
-    # qa_score is already a 0-100 percentage.
-    evals["_one"] = 1.0
+    # Core/Fraud outage drop (post-dedup). SM was already filtered above; guard
+    # against double-applying by scoping to non-SM here.
+    cf_post_dedup_drop = (~is_sm) & _outage_mask(F.col("team"), F.col("date"))
+    evals = evals.filter(~cf_post_dedup_drop)
+
+    if len(evals.take(1)) == 0:
+        return empty_metric_frame(spark)
+
+    # One (deduped) row per evaluation -> SUM(qa_score) / COUNT = mean. The
+    # denominator counts distinct evaluations; after the per-(source,
+    # evaluation_id) dedup, one row == one distinct evaluation, so a row count is
+    # exactly COUNT(DISTINCT evaluation_id). scale=1 (qa_score is already 0-100).
+    evals = evals.withColumn("_one", F.lit(1.0))
     return aggregate_long(
         evals,
         numerator_col="qa_score",
