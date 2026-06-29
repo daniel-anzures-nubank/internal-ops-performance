@@ -224,7 +224,7 @@ def compute_shrinkage_rollups(agent_metric: DataFrame) -> DataFrame:
     rolled = _rollup(work, level="xforce").unionByName(
         _rollup(work, level="xplead")
     )
-    if rolled.rdd.isEmpty():
+    if len(rolled.take(1)) == 0:
         return empty_metric_frame(spark)
     return rolled.orderBy(
         "date_granularity",
