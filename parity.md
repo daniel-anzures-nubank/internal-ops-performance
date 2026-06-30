@@ -539,9 +539,66 @@ per-response question/denominator handling.
 
 ---
 
+## Xpeer Index — `io_xpeer_index_metric` (metric `xpeer_index`) vs `index_agent` in the three legacy decks (`internal_ops_performance_2026` = Core/Fraud, `_social_media`, `_content`)
+
+**Status:** shipped (Core/Fraud + SM at parity); **Content blocked by a base-metric
+gap** (tracked, see below). The Xpeer Index is the agent-level composite (legacy
+`index_agent`): a simple mean of an agent's transformed component metrics, folded
+to `metric_value = numerator/denominator*100` where `denominator = n_components*100`.
+It reads the finished `io_*_metric` agent tables — so its parity is bounded by
+theirs. Component transforms: Adherence `COALESCE(0)`; NTPJ fold (`≤100→100`,
+`100–200→200−x`, `>200/NULL→0`); NO truncate (`≥100→100`, else value, `NULL→0`);
+WoWs (`≥5→100`, `<5→x/5·100`, `NULL→0`); tNPS/Quality/CSAT raw. Legacy emits
+**week + month only** (unions `index_agents_weekly`+`index_agents_monthly`).
+
+**Composition by team / era (verified against legacy denominators):**
+- **Core/Fraud**: Adherence + NTPJ always (NTPJ is a **fixed** divisor term — a
+  missing ntpj row folds to 0 but still counts; verified Jan CF agents with no
+  ntpj row are den=200) + Quality (Feb+) + NO (Mar+, minus the `nitza.zarza`
+  Apr–May carve-out). The main-deck **support squads** (`quality` / `planning` /
+  `enablement` / `idsec`) that legacy keeps with **`team = NULL`** get this same
+  CF roster (verified: all 40 NULL-team adherence agents are in the legacy CF
+  deck, den 200/300/400, never 100). An unexpected NON-NULL team → Adherence-only.
+- **Content**: Adherence + NTPJ **present-only** (drops from sum AND divisor when
+  absent — verified legacy `_content` Feb = den 100, Adherence-only, since Content
+  has no ntpj rows before March) + NO (Mar+) + CSAT (Mar+).
+- **Social Media**: Adherence + WoWs always + tNPS (when present) + Quality (Feb+)
+  + NO (Mar+); SM excludes NTPJ.
+
+**Parity (week + month, pre-cutover):**
+| Deck | grain | total | only_legacy | only_new | value match (≤0.5) | avg abs diff |
+| --- | --- | --- | --- | --- | --- | --- |
+| Core/Fraud | month | 2,024 | 16 | 0 | 1,558 (77%) | **0.72** |
+| Core/Fraud | week | 7,669 | 16 | 1 | 5,895 (77%) | **0.82** |
+| Social Media | month | 158 | 0 | 0 | 112 (71%) | **0.69** |
+| Social Media | week | 585 | 2 | 0 | 392 (67%) | **0.94** |
+
+Coverage is clean. The sub-1.0 residual on matched rows is base-metric
+propagation + the documented by-design enhancements those bases carry (SM
+occupancy ON; SM quality Playvox→Sprinklr@May; Content CSAT ±1–2). SM compared
+≤ 2026-06-10 (legacy `_social_media` is a frozen snapshot).
+
+### Divergences
+| Divergence | Cause | Class |
+| --- | --- | --- |
+| Core/Fraud & SM matched rows off by avg < 1.0 | propagation of the by-design base-metric enhancements (the index is a mean of the new base metrics) | by-design |
+| **Content values off by ~35–50** (den matches; e.g. `alejandra.monroy` 2026-06 new 50.9 vs legacy 96) | `io_ntpj_metric` (1/66 Content month-values match; 140.5 vs 95.8) and `io_normalized_occupancy_metric` (0/83; often NULL vs ~99) are **not at parity for Content** — legacy `_content` computes ntpj/nocc from a Content-specific source. **Not an xpeer_index defect**; the composite consumes broken inputs and auto-corrects once the bases cover Content. | open (base-metric gap; tracked) |
+| `numerator` column representation (legacy stores a different numerator than `metric_value` implies, e.g. 95.0 vs 95.42) | legacy populates `numerator` separately from the published `metric_value`; parity is judged on `metric_value` (which matches). | by-design |
+
+### Verdict
+**Shipped.** The composite logic is byte-for-byte faithful (granularity gate,
+Dec-2025 weekly bucket, Content NTPJ present-only, NULL-team→CF). Core/Fraud and
+SM are at parity (avg abs diff < 1.0, expected base propagation). **Content is
+deferred**, blocked on bringing `io_ntpj_metric` + `io_normalized_occupancy_metric`
+to parity for Content agents — owner decision (2026-06-30) to ship the correct
+composite now and fix the Content base metrics separately.
+
+---
+
 ## Other metrics — not yet parity-checked
 
-The composite indices (Xpeer/XForce Index, etc.) have **not** been
-validated against legacy yet. Check for the same phantom-adherence cutover,
-meeting/leave filter, and DIME-squad filter as Adherence / Normalized Occupancy /
-NTPJ before assuming parity.
+The remaining composite indices (Average Xpeer Index, XForce Index, Average
+XForce Index, Improved Benchmarks, XPeers-in-Target, Nuvinhos Performance) have
+**not** been validated against legacy yet. Check for the same phantom-adherence
+cutover, meeting/leave filter, and DIME-squad filter as Adherence / Normalized
+Occupancy / NTPJ before assuming parity, plus the week+month-only restriction.
