@@ -4,11 +4,12 @@ Metrics-layer script. Thin orchestrator — the math lives in
 ``metrics/xforce_index.py`` and is covered by
 ``tests/metrics/test_xforce_index.py``. Here we only:
 
-  1. Open a Databricks SQL connection (shared `db.open_connection`).
-  2. Read the component metric tables for the period (via `db.read_table`,
+  1. Get the ambient SparkSession (shared ``db.open_connection``).
+  2. Read the component metric tables for the period (via ``db.read_table``,
      scoped on ``date_reference``).
-  3. Call ``compute_xforce_index`` to combine them at all granularities.
-  4. Either print a summary (`--dry-run`) or replace the target Delta table.
+  3. Call ``compute_xforce_index`` to combine them (per deck; week + month only
+     before the 2026-07-01 cutover).
+  4. Either print a summary (``--dry-run``) or replace the target Delta table.
 
 Tables
 ------
@@ -17,20 +18,21 @@ Tables
     - ``usr.danielanzures.io_xpeers_in_target_metric``
     - ``usr.danielanzures.io_average_xpeer_index_metric``
     - ``usr.danielanzures.io_improved_benchmarks_metric``     (xforce roll-up)
-* Output: ``usr.danielanzures.io_xforce_index_metric`` (override `--target`).
+* Output: ``usr.danielanzures.io_xforce_index_metric`` (override ``--target``).
 
-Manual adjustments
-------------------
-None applied here (no adjustments layer yet).
+``io_improved_benchmarks_metric`` is currently DEFERRED (not yet at parity). It
+may be **absent or empty**; the build degrades gracefully — the improved
+component folds to 0 and the 4th-component count still follows legacy's date
+rule. Until it lands, this metric cannot be parity-validated on the cluster.
 
 Usage
 -----
-::
+Runs on a Databricks cluster (``spark-submit`` / a Databricks job task)::
 
-    uv run python scripts/metrics_scripts/build_xforce_index.py \\
+    python scripts/metrics_scripts/build_xforce_index.py \\
         --period-start 2026-05-01 --period-end 2026-05-31 --dry-run
 
-    uv run python scripts/metrics_scripts/build_xforce_index.py \\
+    python scripts/metrics_scripts/build_xforce_index.py \\
         --period-start 2026-01-01 --period-end 2026-05-31
 """
 
@@ -43,7 +45,28 @@ import time
 from datetime import date
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Locate the repo root (contains `db.py` + `extractors/`) so the sibling
+# top-level modules import. We can't rely on `__file__`: Databricks runs a
+# git-sourced `spark_python_task` via `exec()` with no `__file__` set, so we
+# search upward from every path we can discover (file, argv, cwd).
+def _repo_root() -> Path:
+    starts: list[Path] = []
+    try:
+        starts.append(Path(__file__).resolve())
+    except NameError:
+        pass
+    if sys.argv and sys.argv[0]:
+        starts.append(Path(sys.argv[0]).resolve())
+    starts.append(Path.cwd().resolve())
+    for start in starts:
+        for cand in (start, *start.parents):
+            if (cand / "db.py").is_file() and (cand / "extractors").is_dir():
+                return cand
+    return Path.cwd()
+
+
+REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics"))
 
@@ -56,23 +79,28 @@ from xforce_index import (  # noqa: E402
 
 LOGGER = logging.getLogger("cx_metrics.xforce_index")
 
-# (flag suffix, default table, compute kwarg)
-INPUTS: tuple[tuple[str, str, str], ...] = (
-    ("shrinkage", "usr.danielanzures.io_shrinkage_metric", "shrinkage"),
+# (flag suffix, default table, compute kwarg, optional?)
+# improved-benchmarks is OPTIONAL: the table may not exist yet (deferred). A
+# missing/empty improved input is handled by compute_xforce_index.
+INPUTS: tuple[tuple[str, str, str, bool], ...] = (
+    ("shrinkage", "usr.danielanzures.io_shrinkage_metric", "shrinkage", False),
     (
         "xpeers-in-target",
         "usr.danielanzures.io_xpeers_in_target_metric",
         "xpeers_in_target",
+        False,
     ),
     (
         "average-xpeer-index",
         "usr.danielanzures.io_average_xpeer_index_metric",
         "average_xpeer_index",
+        False,
     ),
     (
         "improved-benchmarks",
         "usr.danielanzures.io_improved_benchmarks_metric",
         "improved_benchmarks",
+        True,
     ),
 )
 
@@ -86,11 +114,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--period-start", required=True, type=date.fromisoformat)
     parser.add_argument("--period-end", required=True, type=date.fromisoformat)
-    for flag, default, _ in INPUTS:
+    for flag, default, _, optional in INPUTS:
+        suffix = " (optional — may not exist yet)" if optional else ""
         parser.add_argument(
             f"--{flag}-source",
             default=default,
-            help=f"Input metric table (default: {default}).",
+            help=f"Input metric table (default: {default}).{suffix}",
         )
     parser.add_argument(
         "--target",
@@ -130,6 +159,26 @@ def _log_step(label: str):
     return _Timer()
 
 
+def _read_optional(spark, source, period_start, period_end):
+    """Read an optional source table; return ``None`` if it doesn't exist.
+
+    The improved_benchmarks table is deferred and may not be built yet. We treat
+    a missing table (AnalysisException / table-not-found) as ``None`` so the
+    build still produces a (3-component-numerator) result rather than failing.
+    """
+    try:
+        return read_table(
+            spark, source, period_start, period_end, date_col="date_reference"
+        )
+    except Exception as exc:  # noqa: BLE001 - any read failure -> treat as absent
+        LOGGER.warning(
+            "Optional source %s unavailable (%s); proceeding without it.",
+            source,
+            type(exc).__name__,
+        )
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     logging.basicConfig(
@@ -140,70 +189,89 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
-    conn = open_connection()
-    try:
-        frames: dict[str, object] = {}
-        for flag, _, kwarg in INPUTS:
-            source = getattr(args, f"{flag.replace('-', '_')}_source")
-            with _log_step(f"read {source}"):
-                df = read_table(
-                    conn,
+    spark = open_connection()
+
+    frames: dict[str, object] = {}
+    for flag, _, kwarg, optional in INPUTS:
+        source = getattr(args, f"{flag.replace('-', '_')}_source")
+        with _log_step(f"read {source}"):
+            if optional:
+                frames[kwarg] = _read_optional(
+                    spark, source, args.period_start, args.period_end
+                )
+            else:
+                frames[kwarg] = read_table(
+                    spark,
                     source,
                     args.period_start,
                     args.period_end,
                     date_col="date_reference",
                 )
-                LOGGER.info("  %s rows", f"{len(df):,}")
-            frames[kwarg] = df
 
-        with _log_step("compute_xforce_index"):
-            result = compute_xforce_index(**frames)
-            LOGGER.info("  %s metric rows", f"{len(result):,}")
+    with _log_step("compute_xforce_index"):
+        result = compute_xforce_index(**frames)
 
-        expected_cols = [c for c, _ in IO_XFORCE_INDEX_METRIC_SCHEMA]
-        result = result[expected_cols]
+    if args.dry_run:
+        from pyspark.sql import functions as F
 
-        if args.dry_run:
-            LOGGER.info("Dry run — not writing. Summary:")
-            print()
-            for g in GRANULARITIES:
-                sub = result[result["date_granularity"] == g]
-                print(f"{g:>9}: {len(sub):,} rows, {sub['xforce'].nunique():,} xforces")
-            print(f"\nTeams: {', '.join(sorted(result['team'].dropna().unique()))}")
-            # Component count split (3 vs 4) at month grain.
-            mo = result[result["date_granularity"] == "month"]
-            four = (mo["denominator"] == 400).sum()
-            print(f"month rows: {len(mo):,}  (4-component: {four:,}, 3-component: {len(mo) - four:,})")
-            if not result.empty:
-                mv = result["metric_value"].dropna()
-                print(
-                    f"metric_value: min={mv.min():.1f}  max={mv.max():.1f}  "
-                    f"mean={mv.mean():.1f}"
-                )
-            print("\nHead (month grain):")
-            print(mo.head(10).to_string(index=False))
-            return 0
-
-        with _log_step(f"write {args.target}"):
-            run = publish(
-                conn,
-                result,
-                args.target,
-                IO_XFORCE_INDEX_METRIC_SCHEMA,
-                layer="metrics",
-                period_start=args.period_start,
-                period_end=args.period_end,
-                run_id=args.run_id,
-                snapshot=not args.no_snapshot,
+        result = result.persist()
+        LOGGER.info("Dry run — not writing. Summary:")
+        print()
+        by_gran = {
+            r["date_granularity"]: (r["rows"], r["xforces"])
+            for r in result.groupBy("date_granularity")
+            .agg(
+                F.count(F.lit(1)).alias("rows"),
+                F.countDistinct("xforce").alias("xforces"),
             )
-            LOGGER.info(
-                "  wrote %s rows to %s (run_id=%s)",
-                f"{run.row_count:,}", args.target, run.run_id,
+            .collect()
+        }
+        for g in GRANULARITIES:
+            rows, xforces = by_gran.get(g, (0, 0))
+            print(f"{g:>9}: {rows:,} rows, {xforces:,} xforces")
+
+        # Component-count split (3 vs 4) at month grain.
+        mo = result.filter(F.col("date_granularity") == "month")
+        four = mo.filter(F.col("denominator") == 400).count()
+        total = mo.count()
+        print(
+            f"\nmonth rows: {total:,}  "
+            f"(4-component: {four:,}, 3-component: {total - four:,})"
+        )
+
+        stats = result.agg(
+            F.min("metric_value").alias("mv_min"),
+            F.max("metric_value").alias("mv_max"),
+            F.avg("metric_value").alias("mv_mean"),
+        ).collect()[0]
+        if stats["mv_min"] is not None:
+            print(
+                f"metric_value: min={stats['mv_min']:.1f}  "
+                f"max={stats['mv_max']:.1f}  mean={stats['mv_mean']:.1f}"
             )
-            if run.snapshot_table:
-                LOGGER.info("  snapshot -> %s", run.snapshot_table)
-    finally:
-        conn.close()
+        print("\nHead (month grain):")
+        mo.show(10, truncate=False)
+        result.unpersist()
+        return 0
+
+    with _log_step(f"write {args.target}"):
+        run = publish(
+            spark,
+            result,
+            args.target,
+            IO_XFORCE_INDEX_METRIC_SCHEMA,
+            layer="metrics",
+            period_start=args.period_start,
+            period_end=args.period_end,
+            run_id=args.run_id,
+            snapshot=not args.no_snapshot,
+        )
+        LOGGER.info(
+            "  wrote %s rows to %s (run_id=%s)",
+            f"{run.row_count:,}", args.target, run.run_id,
+        )
+        if run.snapshot_table:
+            LOGGER.info("  snapshot -> %s", run.snapshot_table)
 
     return 0
 
