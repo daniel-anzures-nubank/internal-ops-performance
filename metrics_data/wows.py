@@ -1,16 +1,18 @@
-"""wows — one row per Social-Media WoW experience.
+"""wows — one row per Social-Media WoW experience (PySpark).
 
 This is a RAW dataset, not a finished metric. It exposes every WoW experience
 logged for an active social agent, one row per WoW, with its case id. A
-downstream ``metrics`` layer counts these (``COUNT(DISTINCT case_id)`` per
-agent / period) into the **WoWs** metric (monthly target >= 5).
+downstream ``metrics`` layer (``metrics/wows_metric.py``) counts these
+(``COUNT(DISTINCT case_id)`` per agent / period) into the **WoWs** metric
+(monthly target >= 5).
 
 WoWs only apply to **Social Media**. The source sheet only contains social
 agents' WoWs.
 
 Public API
 ----------
-``compute_wows(agent_info, wows)`` returns one row per WoW experience.
+``compute_wows(agent_info, wows)`` takes Spark DataFrames (the extractor
+outputs) and returns one Spark DataFrame with one row per WoW experience.
 
 Source tables (via extractors)
 ------------------------------
@@ -19,12 +21,12 @@ Source tables (via extractors)
 
 Filters applied here (deliberately minimal — this is a raw table)
 -----------------------------------------------------------------
-* Drop rows whose ``agent`` did not resolve (empty string).
+* Drop rows whose ``agent`` did not resolve (null / empty string).
 * Roster: ``status = 'active'`` and non-null ``squad`` (inner join attaches the
-  dimensions / scopes output to active agents).
+  dimensions / scopes output to active agents on the WoW's snapshot_month).
 
-Filters deferred to the future metrics layer (NOT applied here)
----------------------------------------------------------------
+Filters deferred to the metrics layer (``metrics/wows_metric.py``, NOT applied here)
+------------------------------------------------------------------------------------
 * ``COUNT(DISTINCT case_id)`` aggregation and the monthly target (>= 5).
 * The outage-date exclusion (``2026-03-27``).
 
@@ -43,7 +45,8 @@ Output schema (one row per WoW experience)
 
 from __future__ import annotations
 
-import pandas as pd
+from pyspark.sql import DataFrame, Window
+from pyspark.sql import functions as F
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -55,64 +58,57 @@ WOWS_OUT_OF_SCOPE_SQUADS: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
-# Small utility
-# ---------------------------------------------------------------------------
-
-
-def _as_naive_datetime(series: pd.Series) -> pd.Series:
-    """Coerce a datetime Series to tz-naive ``datetime64[ns]`` for merge keys."""
-    s = pd.to_datetime(series)
-    if s.dt.tz is not None:
-        return s.dt.tz_localize(None)
-    return s
-
-
-# ---------------------------------------------------------------------------
 # Orchestrator — roster join (no aggregation)
 # ---------------------------------------------------------------------------
 
 
 def compute_wows(
-    agent_info: pd.DataFrame,
-    wows: pd.DataFrame,
-) -> pd.DataFrame:
+    agent_info: DataFrame,
+    wows: DataFrame,
+) -> DataFrame:
     """End-to-end wows pipeline (one row per WoW experience)."""
-    if wows.empty:
-        return pd.DataFrame({c: pd.Series(dtype="object") for c, _ in IO_WOWS_SCHEMA})
-
-    rows = wows.copy()
-    rows = rows[rows["agent"].notna() & (rows["agent"] != "")].copy()
-
-    if rows.empty:
-        return pd.DataFrame({c: pd.Series(dtype="object") for c, _ in IO_WOWS_SCHEMA})
+    rows = wows.filter(F.col("agent").isNotNull() & (F.col("agent") != F.lit("")))
 
     # --- roster join --------------------------------------------------------
-    roster = agent_info.loc[
-        (agent_info["status"] == "active")
-        & agent_info["squad"].notna()
-        & ~agent_info["squad"].isin(WOWS_OUT_OF_SCOPE_SQUADS),
-        [
-            "agent",
-            "xforce",
-            "xplead",
-            "team",
-            "squad",
-            "squad_district",
-            "shift",
-            "snapshot_month",
-        ],
-    ].copy()
-    roster = roster.rename(columns={"squad_district": "district"})
-    roster["snapshot_month"] = _as_naive_datetime(roster["snapshot_month"])
-
-    rows["snapshot_month"] = _as_naive_datetime(
-        pd.to_datetime(rows["date"]).dt.to_period("M").dt.to_timestamp()
+    roster = agent_info.filter(
+        (F.col("status") == F.lit("active")) & F.col("squad").isNotNull()
     )
-    enriched = rows.merge(roster, on=["agent", "snapshot_month"], how="inner")
+    if WOWS_OUT_OF_SCOPE_SQUADS:
+        roster = roster.filter(~F.col("squad").isin(list(WOWS_OUT_OF_SCOPE_SQUADS)))
+    roster = roster.select(
+        "agent",
+        "xforce",
+        "xplead",
+        "team",
+        "squad",
+        F.col("squad_district").alias("district"),
+        "shift",
+        F.to_date(F.col("snapshot_date")).alias("_snapshot_date"),
+        F.trunc(F.to_date(F.col("snapshot_month")), "month").alias("snapshot_month"),
+    )
 
-    enriched["case_id"] = enriched["case_id"].astype("string")
+    # Deduplicate the roster to exactly ONE row per (agent, snapshot_month) BEFORE
+    # the join (mirrors tnps_responses / quality_evaluations): the content branch
+    # of `agent_information` can yield >1 identical row per (agent, snapshot_month),
+    # which would fan out the inner join and double-count WoWs. Keep the latest
+    # snapshot deterministically.
+    roster_dedup_window = Window.partitionBy("agent", "snapshot_month").orderBy(
+        F.col("_snapshot_date").desc_nulls_last(),
+        F.col("squad").asc_nulls_last(),
+        F.col("district").asc_nulls_last(),
+        F.col("shift").asc_nulls_last(),
+    )
+    roster = (
+        roster.withColumn("_roster_rn", F.row_number().over(roster_dedup_window))
+        .filter(F.col("_roster_rn") == 1)
+        .drop("_roster_rn", "_snapshot_date")
+    )
 
-    out = enriched[[
+    enriched = rows.withColumn(
+        "snapshot_month", F.trunc(F.to_date(F.col("date")), "month")
+    ).join(roster, on=["agent", "snapshot_month"], how="inner")
+
+    out = enriched.select(
         "agent",
         "xforce",
         "xplead",
@@ -120,11 +116,11 @@ def compute_wows(
         "squad",
         "district",
         "shift",
-        "date",
-        "case_id",
-    ]].copy()
+        F.to_date(F.col("date")).alias("date"),
+        F.col("case_id").cast("string").alias("case_id"),
+    )
 
-    return out.sort_values(["date", "agent", "case_id"]).reset_index(drop=True)
+    return out.orderBy("date", "agent", "case_id")
 
 
 # ---------------------------------------------------------------------------

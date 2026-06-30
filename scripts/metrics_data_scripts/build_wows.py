@@ -1,9 +1,9 @@
 """Build the wows dataset and (optionally) write it to Databricks.
 
 Thin orchestrator. The math lives in ``metrics_data/wows.py`` and is covered by
-``tests/test_wows.py``. Here we only:
+``tests/metrics_data/test_wows.py``. Here we only:
 
-  1. Open a Databricks SQL connection (shared `db.open_connection`).
+  1. Get the ambient SparkSession (shared `db.open_connection`).
   2. Run the two extractors needed:
        * ``agent_information``  (roster)
        * ``wows``               (WoWs Google Sheet)
@@ -18,18 +18,18 @@ Default: ``usr.danielanzures.io_wows_raw``. Override with ``--target``.
 
 Manual adjustments
 ------------------
-None are applied here. The Google-Sheets-driven adjustments layer (incl. the
-``2026-03-27`` outage exclusion and the monthly count/target) is a follow-up;
-this script intentionally produces the raw per-WoW baseline.
+None are applied here. The outage exclusion (``2026-03-27``) and the monthly
+count/target live in the metrics layer (``metrics/wows_metric.py``); this script
+intentionally produces the raw per-WoW baseline.
 
 Usage
 -----
-::
+Runs on a Databricks cluster (``spark-submit`` / a Databricks job task)::
 
-    uv run python scripts/metrics_data_scripts/build_wows.py \\
+    python scripts/metrics_data_scripts/build_wows.py \\
         --period-start 2026-05-01 --period-end 2026-05-31 --dry-run
 
-    uv run python scripts/metrics_data_scripts/build_wows.py \\
+    python scripts/metrics_data_scripts/build_wows.py \\
         --period-start 2026-01-01 --period-end 2026-05-31
 """
 
@@ -42,7 +42,28 @@ import time
 from datetime import date
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Locate the repo root (contains `db.py` + `extractors/`) so the sibling
+# top-level modules import. We can't rely on `__file__`: Databricks runs a
+# git-sourced `spark_python_task` via `exec()` with no `__file__` set, so we
+# search upward from every path we can discover (file, argv, cwd).
+def _repo_root() -> Path:
+    starts: list[Path] = []
+    try:
+        starts.append(Path(__file__).resolve())
+    except NameError:
+        pass
+    if sys.argv and sys.argv[0]:
+        starts.append(Path(sys.argv[0]).resolve())
+    starts.append(Path.cwd().resolve())
+    for start in starts:
+        for cand in (start, *start.parents):
+            if (cand / "db.py").is_file() and (cand / "extractors").is_dir():
+                return cand
+    return Path.cwd()
+
+
+REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics_data"))
 
@@ -109,61 +130,65 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
-    conn = open_connection()
-    try:
-        with _log_step("agent_information"):
-            roster = run_extractor(
-                conn, "agent_information", args.period_start, args.period_end
-            )
-            LOGGER.info("  %s roster rows", f"{len(roster):,}")
+    spark = open_connection()
 
-        with _log_step("wows"):
-            wows = run_extractor(conn, "wows", args.period_start, args.period_end)
-            LOGGER.info("  %s WoW sheet rows", f"{len(wows):,}")
+    with _log_step("agent_information"):
+        roster = run_extractor(
+            spark, "agent_information", args.period_start, args.period_end
+        )
 
-        with _log_step("compute_wows"):
-            result = compute_wows(roster, wows)
-            LOGGER.info("  %s rows in final wows frame", f"{len(result):,}")
+    with _log_step("wows"):
+        wows = run_extractor(spark, "wows", args.period_start, args.period_end)
 
-        expected_cols = [c for c, _ in IO_WOWS_SCHEMA]
-        result = result[expected_cols]
+    with _log_step("compute_wows"):
+        result = compute_wows(roster, wows)
 
-        if args.dry_run:
-            LOGGER.info("Dry run — not writing. Summary:")
-            print()
-            print(f"Rows (WoWs):       {len(result):,}")
-            print(f"Agents:            {result['agent'].nunique():,}")
-            print(f"Dates:             {result['date'].nunique():,}")
-            print(f"Distinct case_ids: {result['case_id'].nunique():,}")
-            print(
-                f"Squads:            {result['squad'].nunique():,} "
-                f"({', '.join(sorted(result['squad'].dropna().unique()))})"
-            )
-            print()
-            print("Head:")
-            print(result.head(10).to_string(index=False))
-            return 0
+    if args.dry_run:
+        from pyspark.sql import functions as F
 
-        with _log_step(f"write {args.target}"):
-            run = publish(
-                conn,
-                result,
-                args.target,
-                IO_WOWS_SCHEMA,
-                layer="metrics_data",
-                period_start=args.period_start,
-                period_end=args.period_end,
-                run_id=args.run_id,
-                snapshot=not args.no_snapshot,
-            )
-            LOGGER.info(
-                "  wrote %s rows to %s (run_id=%s)",
-                f"{run.row_count:,}", args.target, run.run_id,
-            )
-            if run.snapshot_table:
-                LOGGER.info("  snapshot -> %s", run.snapshot_table)
-    finally:
-        conn.close()
+        result = result.persist()
+        LOGGER.info("Dry run — not writing. Summary:")
+        print()
+        agg = result.agg(
+            F.count(F.lit(1)).alias("rows"),
+            F.countDistinct("agent").alias("agents"),
+            F.countDistinct("date").alias("dates"),
+            F.countDistinct("case_id").alias("cases"),
+        ).collect()[0]
+        print(f"Rows (WoWs):       {agg['rows']:,}")
+        print(f"Agents:            {agg['agents']:,}")
+        print(f"Dates:             {agg['dates']:,}")
+        print(f"Distinct case_ids: {agg['cases']:,}")
+        squads = sorted(
+            r["squad"]
+            for r in result.select("squad").distinct().collect()
+            if r["squad"] is not None
+        )
+        print(f"Squads:            {len(squads):,} ({', '.join(squads)})")
+        print()
+        print("Head:")
+        result.show(10, truncate=False)
+        result.unpersist()
+        return 0
+
+    with _log_step(f"write {args.target}"):
+        run = publish(
+            spark,
+            result,
+            args.target,
+            IO_WOWS_SCHEMA,
+            layer="metrics_data",
+            period_start=args.period_start,
+            period_end=args.period_end,
+            run_id=args.run_id,
+            snapshot=not args.no_snapshot,
+        )
+        LOGGER.info(
+            "  wrote %s rows to %s (run_id=%s)",
+            f"{run.row_count:,}", args.target, run.run_id,
+        )
+        if run.snapshot_table:
+            LOGGER.info("  snapshot -> %s", run.snapshot_table)
 
     return 0
 
