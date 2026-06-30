@@ -304,14 +304,46 @@ class TestFix1Granularity:
         assert {r["date_granularity"] for r in rows(out)} == {"week", "month"}
 
 
+class TestDeck:
+    def test_core_and_fraud_merge_into_one_main_row(self, spark):
+        # A cross-team XForce (core + fraud agents) is ONE main-deck row — legacy
+        # groups the main deck by (xforce, xplead) over both teams.
+        # a (core): adh 96(✓) ntpj 90(✓) -> 2/2 ; b (fraud): adh 90(✗) ntpj 130(✗) -> 0/2
+        out = compute_xpeers_in_target(
+            adherence=frame(spark, [m("adherence", "a", 96, team="core", xforce="x"),
+                                    m("adherence", "b", 90, team="fraud", xforce="x")]),
+            ntpj=frame(spark, [m("ntpj", "a", 90, team="core", xforce="x"),
+                               m("ntpj", "b", 130, team="fraud", xforce="x")]),
+        )
+        r = one(out)
+        assert r["team"] is None
+        assert abs(r["numerator"] - 2.0) < 1e-9
+        assert abs(r["denominator"] - 4.0) < 1e-9
+        assert abs(r["metric_value"] - 50.0) < 1e-9
+
+    def test_cross_deck_xforce_stays_split(self, spark):
+        # An XForce with core AND social-media agents must NOT merge (different
+        # decks/notebooks) — two rows for the same xforce.
+        out = compute_xpeers_in_target(
+            adherence=frame(spark, [
+                m("adherence", "a", 96, team="core", xforce="x"),
+                m("adherence", "b", 96, team="social media", xforce="x")]),
+            ntpj=frame(spark, [m("ntpj", "a", 90, team="core", xforce="x")]),
+            tnps=frame(spark, [m("tnps", "a", 90, team="social media", xforce="x")]),
+            wows=frame(spark, [m("wows", "a", 6, team="social media", xforce="x")]),
+        )
+        xf_rows = grain_rows(out, METRIC_NAME)
+        assert len(xf_rows) == 2  # one main, one sm
+
+
 class TestGeneral:
     def test_content_excluded(self, spark):
         out = compute_xpeers_in_target(
-            adherence=frame(spark, [m("adherence", "a", 96, team="content"),
+            adherence=frame(spark, [m("adherence", "a", 96, team="content", xforce="ct"),
                                     m("adherence", "b", 96, team="core", xforce="cf")]),
             ntpj=frame(spark, [m("ntpj", "b", 90, team="core", xforce="cf")]),
         )
-        assert {r["team"] for r in grain_rows(out, METRIC_NAME)} == {"core"}
+        assert {r["xforce"] for r in grain_rows(out, METRIC_NAME)} == {"cf"}
 
     def test_driver_is_adherence(self, spark):
         out = compute_xpeers_in_target(
@@ -336,7 +368,7 @@ class TestGeneral:
         assert [c for c, _ in IO_XPEERS_IN_TARGET_METRIC_SCHEMA] == list(METRIC_COLUMNS)
         r = one(out)
         assert r["agent"] is None and r["squad"] is None and r["shift"] is None
-        assert r["xforce"] == "xf" and r["team"] == "core"
+        assert r["xforce"] == "xf" and r["team"] is None  # legacy carries no team
 
     def test_empty_returns_empty(self, spark):
         out = compute_xpeers_in_target(adherence=frame(spark, []))
