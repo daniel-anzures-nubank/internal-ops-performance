@@ -1,18 +1,21 @@
-"""Unit tests for ``metrics_data/content_csat.py``.
+"""Unit tests for ``metrics_data/content_csat.py`` (PySpark).
 
-Small synthetic pandas frames, no warehouse, sub-second runs.
+Small synthetic Spark frames, no warehouse.
 
 content_csat is a RAW dataset: one row per Content CSAT survey response fanned
 out to each content agent serving the rated ``target_squad``. We verify the
-per-response promoter count / csat_score, the target_squad normalization, the
-target_squad-based fan-out join, and the output contract.
+per-response promoter count / csat_score (>= 4 promoter, NULL not a promoter, the
+8-question denominator), the target_squad normalization (E.M.I./GENERAL ->
+emi_general, else lower), the target_squad-based fan-out join (one response
+credited to every serving agent), the roster dedup (a duplicated roster row does
+NOT double-count), and the output contract.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 
-import pandas as pd
+from pyspark.sql import types as T
 
 from content_csat import (
     IO_CONTENT_CSAT_SCHEMA,
@@ -31,10 +34,30 @@ def _mock_email(local: str, domain: str = _MEXICO_NUBANK_DOMAIN) -> str:
 # Builders
 # ---------------------------------------------------------------------------
 
+_CSAT_SCHEMA = T.StructType(
+    [
+        T.StructField("survey_timestamp", T.TimestampType()),
+        T.StructField("date_reference", T.TimestampType()),
+        T.StructField("requested_by", T.StringType()),
+        T.StructField("email_address", T.StringType()),
+        T.StructField("squad", T.StringType()),
+        T.StructField("mes", T.StringType()),
+        T.StructField("facilidad", T.IntegerType()),
+        T.StructField("comprension", T.IntegerType()),
+        T.StructField("comunicacion", T.IntegerType()),
+        T.StructField("calidad", T.IntegerType()),
+        T.StructField("tiempo", T.IntegerType()),
+        T.StructField("manejo_de_cambios", T.IntegerType()),
+        T.StructField("expectativas", T.IntegerType()),
+        T.StructField("aportacion_estrategica", T.IntegerType()),
+        T.StructField("nps", T.IntegerType()),
+    ]
+)
 
-def make_csat_row(**overrides) -> dict:
+
+def make_csat(spark, rows):
     # Default: all 8 questions = 5 (all promoters).
-    base = {
+    defaults = {
         "survey_timestamp": dt.datetime(2026, 4, 9, 15, 14, 11),
         "date_reference": dt.datetime(2026, 3, 9, 15, 14, 11),
         "requested_by": "julio.duran",
@@ -51,18 +74,32 @@ def make_csat_row(**overrides) -> dict:
         "aportacion_estrategica": 5,
         "nps": 9,
     }
-    base.update(overrides)
-    return base
+    data = [{**defaults, **r} for r in rows]
+    return spark.createDataFrame(
+        [tuple(r[f.name] for f in _CSAT_SCHEMA.fields) for r in data], _CSAT_SCHEMA
+    )
 
 
-def make_csat(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame([make_csat_row(**r) for r in rows])
+_ROSTER_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("xforce", T.StringType()),
+        T.StructField("xplead", T.StringType()),
+        T.StructField("team", T.StringType()),
+        T.StructField("squad", T.StringType()),
+        T.StructField("squad_district", T.StringType()),
+        T.StructField("status", T.StringType()),
+        T.StructField("shift", T.StringType()),
+        T.StructField("snapshot_date", T.DateType()),
+        T.StructField("snapshot_month", T.DateType()),
+        T.StructField("target_squad", T.StringType()),
+    ]
+)
 
 
-def make_roster(rows: list[dict]) -> pd.DataFrame:
+def make_roster(spark, rows):
     defaults = {
         "agent": "alejandra.erazo",
-        "actor_id": "actor-1",
         "xforce": "karina.gonzalez",
         "xplead": "alejandra.mota",
         "team": "content",
@@ -72,23 +109,30 @@ def make_roster(rows: list[dict]) -> pd.DataFrame:
         "shift": None,
         "snapshot_date": dt.date(2026, 3, 1),
         "snapshot_month": dt.date(2026, 3, 1),
-        "hire_start_date": None,
-        "last_change_date": None,
         "target_squad": "txn",
     }
-    return pd.DataFrame([{**defaults, **r} for r in rows])
+    data = [{**defaults, **r} for r in rows]
+    return spark.createDataFrame(
+        [tuple(r[f.name] for f in _ROSTER_SCHEMA.fields) for r in data],
+        _ROSTER_SCHEMA,
+    )
+
+
+def _collect(out):
+    return out.collect()
 
 
 # ---------------------------------------------------------------------------
-# compute_content_csat — end-to-end
+# compute_content_csat — end-to-end (one row per response × content agent)
 # ---------------------------------------------------------------------------
 
 
 class TestComputeContentCsat:
-    def test_all_promoters(self):
-        out = compute_content_csat(make_roster([{}]), make_csat([{}]))
-        assert len(out) == 1
-        row = out.iloc[0]
+    def test_all_promoters(self, spark):
+        out = compute_content_csat(make_roster(spark, [{}]), make_csat(spark, [{}]))
+        rows = _collect(out)
+        assert len(rows) == 1
+        row = rows[0]
         assert row["promoters"] == 8
         assert row["number_of_questions"] == NUMBER_OF_QUESTIONS == 8
         assert row["csat_score"] == 1.0
@@ -99,102 +143,220 @@ class TestComputeContentCsat:
         assert row["target_squad"] == "txn"
         assert row["date"] == dt.date(2026, 3, 9)
 
-    def test_promoter_threshold(self):
+    def test_promoter_threshold(self, spark):
         # scores >= 4 are promoters; 3 is not.
         out = compute_content_csat(
-            make_roster([{}]),
-            make_csat([{
-                "facilidad": 4, "comprension": 3, "comunicacion": 5,
-                "calidad": 1, "tiempo": 4, "manejo_de_cambios": 2,
-                "expectativas": 4, "aportacion_estrategica": 5,
-            }]),
+            make_roster(spark, [{}]),
+            make_csat(
+                spark,
+                [
+                    {
+                        "facilidad": 4,
+                        "comprension": 3,
+                        "comunicacion": 5,
+                        "calidad": 1,
+                        "tiempo": 4,
+                        "manejo_de_cambios": 2,
+                        "expectativas": 4,
+                        "aportacion_estrategica": 5,
+                    }
+                ],
+            ),
         )
+        row = _collect(out)[0]
         # promoters: 4,_,5,_,4,_,4,5 -> facilidad,comunicacion,tiempo,expectativas,aportacion = 5
-        assert out.iloc[0]["promoters"] == 5
-        assert abs(out.iloc[0]["csat_score"] - 5 / 8) < 1e-9
+        assert row["promoters"] == 5
+        assert abs(row["csat_score"] - 5 / 8) < 1e-9
 
-    def test_null_score_not_promoter(self):
+    def test_null_score_not_promoter(self, spark):
         out = compute_content_csat(
-            make_roster([{}]),
-            make_csat([{"facilidad": None}]),
+            make_roster(spark, [{}]),
+            make_csat(spark, [{"facilidad": None}]),
         )
-        assert out.iloc[0]["promoters"] == 7
+        assert _collect(out)[0]["promoters"] == 7
 
-    def test_emi_label_normalizes(self):
+    def test_all_null_scores_zero_promoters(self, spark):
         out = compute_content_csat(
-            make_roster([{"target_squad": "emi_general"}]),
-            make_csat([{"squad": "E.M.I."}]),
+            make_roster(spark, [{}]),
+            make_csat(
+                spark,
+                [
+                    {
+                        "facilidad": None,
+                        "comprension": None,
+                        "comunicacion": None,
+                        "calidad": None,
+                        "tiempo": None,
+                        "manejo_de_cambios": None,
+                        "expectativas": None,
+                        "aportacion_estrategica": None,
+                    }
+                ],
+            ),
         )
-        assert len(out) == 1
-        assert out.iloc[0]["target_squad"] == "emi_general"
+        row = _collect(out)[0]
+        assert row["promoters"] == 0
+        assert row["number_of_questions"] == 8
+        assert row["csat_score"] == 0.0
 
-    def test_general_label_normalizes(self):
+    def test_emi_label_normalizes(self, spark):
         out = compute_content_csat(
-            make_roster([{"target_squad": "emi_general"}]),
-            make_csat([{
-                "squad": "GENERAL (CHANNEL SOLUTIONS, PLANNING, SERVICE EXCELLENCE, QA, OPS DEFENSE)"
-            }]),
+            make_roster(spark, [{"target_squad": "emi_general"}]),
+            make_csat(spark, [{"squad": "E.M.I."}]),
         )
-        assert len(out) == 1
-        assert out.iloc[0]["target_squad"] == "emi_general"
+        rows = _collect(out)
+        assert len(rows) == 1
+        assert rows[0]["target_squad"] == "emi_general"
 
-    def test_fan_out_to_all_serving_agents(self):
+    def test_general_label_normalizes(self, spark):
+        out = compute_content_csat(
+            make_roster(spark, [{"target_squad": "emi_general"}]),
+            make_csat(
+                spark,
+                [
+                    {
+                        "squad": "GENERAL (CHANNEL SOLUTIONS, PLANNING, SERVICE EXCELLENCE, QA, OPS DEFENSE)"
+                    }
+                ],
+            ),
+        )
+        rows = _collect(out)
+        assert len(rows) == 1
+        assert rows[0]["target_squad"] == "emi_general"
+
+    def test_other_squad_lowercased(self, spark):
+        # A non-special display squad is just lowercased to match the roster.
+        out = compute_content_csat(
+            make_roster(spark, [{"target_squad": "idsec"}]),
+            make_csat(spark, [{"squad": "IDSec"}]),
+        )
+        rows = _collect(out)
+        assert len(rows) == 1
+        assert rows[0]["target_squad"] == "idsec"
+
+    def test_fan_out_to_all_serving_agents(self, spark):
         # One response, two content agents serving TXN -> two rows.
-        roster = make_roster([
-            {"agent": "alejandra.erazo", "target_squad": "txn"},
-            {"agent": "aura.olvera", "target_squad": "txn"},
-        ])
-        out = compute_content_csat(roster, make_csat([{"squad": "TXN"}]))
-        assert len(out) == 2
-        assert set(out["agent"]) == {"alejandra.erazo", "aura.olvera"}
-
-    def test_no_match_for_other_target_squad(self):
-        out = compute_content_csat(
-            make_roster([{"target_squad": "idsec"}]),
-            make_csat([{"squad": "TXN"}]),
+        roster = make_roster(
+            spark,
+            [
+                {"agent": "alejandra.erazo", "target_squad": "txn"},
+                {"agent": "aura.olvera", "target_squad": "txn"},
+            ],
         )
-        assert out.empty
+        out = compute_content_csat(roster, make_csat(spark, [{"squad": "TXN"}]))
+        rows = _collect(out)
+        assert len(rows) == 2
+        assert {r["agent"] for r in rows} == {"alejandra.erazo", "aura.olvera"}
 
-    def test_inactive_agent_dropped(self):
-        out = compute_content_csat(
-            make_roster([{"status": "inactive"}]),
-            make_csat([{}]),
+    def test_roster_dedup_does_not_double_count(self, spark):
+        # Two identical roster rows for the same (agent, target_squad,
+        # snapshot_month) must not fan out the inner join into duplicates.
+        roster = make_roster(
+            spark,
+            [
+                {"snapshot_date": dt.date(2026, 3, 1)},
+                {"snapshot_date": dt.date(2026, 3, 15)},
+            ],
         )
-        assert out.empty
+        out = compute_content_csat(roster, make_csat(spark, [{}]))
+        assert len(_collect(out)) == 1
 
-    def test_null_target_squad_roster_dropped(self):
+    def test_no_match_for_other_target_squad(self, spark):
+        out = compute_content_csat(
+            make_roster(spark, [{"target_squad": "idsec"}]),
+            make_csat(spark, [{"squad": "TXN"}]),
+        )
+        assert len(out.take(1)) == 0
+
+    def test_inactive_agent_dropped(self, spark):
+        out = compute_content_csat(
+            make_roster(spark, [{"status": "inactive"}]),
+            make_csat(spark, [{}]),
+        )
+        assert len(out.take(1)) == 0
+
+    def test_null_target_squad_roster_dropped(self, spark):
         # A non-content (BDX) roster row has NULL target_squad and must not match.
         out = compute_content_csat(
-            make_roster([{"target_squad": None}]),
-            make_csat([{}]),
+            make_roster(spark, [{"target_squad": None}]),
+            make_csat(spark, [{}]),
         )
-        assert out.empty
+        assert len(out.take(1)) == 0
 
-    def test_month_attribution_join(self):
+    def test_empty_target_squad_roster_dropped(self, spark):
+        out = compute_content_csat(
+            make_roster(spark, [{"target_squad": ""}]),
+            make_csat(spark, [{}]),
+        )
+        assert len(out.take(1)) == 0
+
+    def test_month_attribution_join(self, spark):
         # A March-rated response only matches the March roster row.
-        roster = make_roster([
-            {"snapshot_month": dt.date(2026, 3, 1), "agent": "march.agent"},
-            {"snapshot_month": dt.date(2026, 4, 1), "agent": "april.agent"},
-        ])
-        out = compute_content_csat(roster, make_csat([{}]))  # date_reference March
-        assert set(out["agent"]) == {"march.agent"}
+        roster = make_roster(
+            spark,
+            [
+                {"snapshot_month": dt.date(2026, 3, 1), "agent": "march.agent"},
+                {"snapshot_month": dt.date(2026, 4, 1), "agent": "april.agent"},
+            ],
+        )
+        out = compute_content_csat(roster, make_csat(spark, [{}]))  # ref March
+        assert {r["agent"] for r in _collect(out)} == {"march.agent"}
 
-    def test_aggregation_deferred(self):
+    def test_date_is_date_reference_day(self, spark):
+        # `date` is the DATE of date_reference (= survey_timestamp - 1 month,
+        # already applied upstream). April-filled survey rates March.
+        out = compute_content_csat(
+            make_roster(spark, [{}]),
+            make_csat(
+                spark,
+                [
+                    {
+                        "survey_timestamp": dt.datetime(2026, 4, 9, 15, 14, 11),
+                        "date_reference": dt.datetime(2026, 3, 9, 15, 14, 11),
+                    }
+                ],
+            ),
+        )
+        row = _collect(out)[0]
+        assert row["date"] == dt.date(2026, 3, 9)
+        assert row["survey_timestamp"] == dt.datetime(2026, 4, 9, 15, 14, 11)
+
+    def test_aggregation_deferred(self, spark):
         # Two responses for the same agent stay as two rows (no per-agent rollup).
         out = compute_content_csat(
-            make_roster([{}]),
-            make_csat([
-                {"requested_by": "a", "survey_timestamp": dt.datetime(2026, 4, 9, 1)},
-                {"requested_by": "b", "survey_timestamp": dt.datetime(2026, 4, 9, 2)},
-            ]),
+            make_roster(spark, [{}]),
+            make_csat(
+                spark,
+                [
+                    {
+                        "requested_by": "a.one",
+                        "survey_timestamp": dt.datetime(2026, 4, 9, 1),
+                    },
+                    {
+                        "requested_by": "b.two",
+                        "survey_timestamp": dt.datetime(2026, 4, 9, 2),
+                    },
+                ],
+            ),
         )
-        assert len(out) == 2
+        assert len(_collect(out)) == 2
 
-    def test_output_schema_and_column_order(self):
-        out = compute_content_csat(make_roster([{}]), make_csat([{}]))
-        assert list(out.columns) == [c for c, _ in IO_CONTENT_CSAT_SCHEMA]
+    def test_nps_ignored(self, spark):
+        # The separate `nps` column is not part of CSAT and is not surfaced.
+        out = compute_content_csat(
+            make_roster(spark, [{}]),
+            make_csat(spark, [{"nps": 0}]),
+        )
+        row = _collect(out)[0]
+        assert "nps" not in out.columns
+        assert row["promoters"] == 8  # nps does not affect the promoter count
 
-    def test_empty_input_yields_empty_frame_with_schema(self):
-        out = compute_content_csat(make_roster([{}]), make_csat([])[0:0])
-        assert out.empty
-        assert list(out.columns) == [c for c, _ in IO_CONTENT_CSAT_SCHEMA]
+    def test_output_schema_and_column_order(self, spark):
+        out = compute_content_csat(make_roster(spark, [{}]), make_csat(spark, [{}]))
+        assert out.columns == [c for c, _ in IO_CONTENT_CSAT_SCHEMA]
+
+    def test_empty_input_yields_empty_frame_with_schema(self, spark):
+        empty = spark.createDataFrame([], _CSAT_SCHEMA)
+        out = compute_content_csat(make_roster(spark, [{}]), empty)
+        assert len(out.take(1)) == 0
+        assert out.columns == [c for c, _ in IO_CONTENT_CSAT_SCHEMA]

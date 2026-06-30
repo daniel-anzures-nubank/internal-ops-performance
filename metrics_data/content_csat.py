@@ -1,4 +1,4 @@
-"""content_csat — one row per Content CSAT survey response × content agent.
+"""content_csat — one row per Content CSAT survey response × content agent (PySpark).
 
 This is a RAW dataset feeding the Content **Quality (CSAT)** metric. Each Content
 CSAT survey response rates how well the Content (enablement) team supported a
@@ -17,7 +17,9 @@ CSAT only applies to **Content**.
 
 Public API
 ----------
-``compute_content_csat(agent_info, csat)``.
+``compute_content_csat(agent_info, csat)`` takes Spark DataFrames (the extractor
+outputs) and returns one Spark DataFrame with one row per (response × content
+agent).
 
 Source tables (via extractors)
 ------------------------------
@@ -27,9 +29,9 @@ Source tables (via extractors)
 
 Filters applied here (minimal — raw table)
 ------------------------------------------
-* Roster: ``status = 'active'`` and non-null ``target_squad`` (inner join on
-  ``(target_squad, snapshot_month)`` — this scopes output to content and fans the
-  response out to that month's content agents serving the squad).
+* Roster: ``status = 'active'`` and non-null / non-empty ``target_squad`` (inner
+  join on ``(target_squad, snapshot_month)`` — this scopes output to content and
+  fans the response out to that month's content agents serving the squad).
 
 Deferred to the metrics layer (NOT applied here)
 ------------------------------------------------
@@ -56,7 +58,12 @@ Output schema (one row per survey response × content agent)
 
 from __future__ import annotations
 
-import pandas as pd
+from pyspark.sql import DataFrame, Window
+from pyspark.sql import functions as F
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 # The 8 CSAT questions (each scored 1-5; promoter if >= 4).
 _QUESTION_COLS: tuple[str, ...] = (
@@ -80,84 +87,101 @@ _EMI_GENERAL_LABELS: tuple[str, ...] = (
 )
 
 
-def _as_naive_datetime(series: pd.Series) -> pd.Series:
-    """Coerce a datetime Series to tz-naive ``datetime64[ns]`` for merge keys."""
-    s = pd.to_datetime(series)
-    if getattr(s.dt, "tz", None) is not None:
-        return s.dt.tz_localize(None)
-    return s
-
-
-def _normalize_target_squad(squad: pd.Series) -> pd.Series:
-    """Map the survey's display-form ``squad`` to the roster ``target_squad`` key.
-
-    Matches legacy: 'E.M.I.' and the long 'GENERAL (...)' label both become
-    'emi_general'; everything else is lowercased.
-    """
-    lowered = squad.astype("string").str.lower()
-    return lowered.mask(squad.isin(_EMI_GENERAL_LABELS), "emi_general")
+# ---------------------------------------------------------------------------
+# Orchestrator — promoter count + fan-out roster join (no aggregation)
+# ---------------------------------------------------------------------------
 
 
 def compute_content_csat(
-    agent_info: pd.DataFrame,
-    csat: pd.DataFrame,
-) -> pd.DataFrame:
+    agent_info: DataFrame,
+    csat: DataFrame,
+) -> DataFrame:
     """End-to-end content CSAT pipeline (one row per response × content agent)."""
-    if csat.empty:
-        return pd.DataFrame(
-            {c: pd.Series(dtype="object") for c, _ in IO_CONTENT_CSAT_SCHEMA}
-        )
-
-    rows = csat.copy()
-
     # --- per-response promoter count -------------------------------------
-    promoter_flags = pd.DataFrame(index=rows.index)
-    for col in _QUESTION_COLS:
-        score = pd.to_numeric(rows.get(col), errors="coerce")
-        promoter_flags[col] = (score >= PROMOTER_THRESHOLD).astype("int64")
-    rows["promoters"] = promoter_flags.sum(axis=1).astype("int64")
-    rows["number_of_questions"] = NUMBER_OF_QUESTIONS
-    rows["csat_score"] = rows["promoters"] / rows["number_of_questions"]
+    # For each question, promoter = (score >= 4). A NULL score is NOT a promoter
+    # (null >= 4 -> null -> otherwise(0)). promoters = sum of the 8 flags.
+    flags = [
+        F.when(F.col(c).cast("double") >= F.lit(PROMOTER_THRESHOLD), F.lit(1))
+        .otherwise(F.lit(0))
+        for c in _QUESTION_COLS
+    ]
+    promoters = flags[0]
+    for flag in flags[1:]:
+        promoters = promoters + flag
 
-    # --- join key normalization ------------------------------------------
-    rows["target_squad"] = _normalize_target_squad(rows["squad"])
-    ref = _as_naive_datetime(rows["date_reference"])
-    rows["date"] = ref.dt.date
-    rows["snapshot_month"] = ref.dt.to_period("M").dt.to_timestamp()
-    # Drop the raw display `squad` so it doesn't collide with the roster's `squad`
-    # (the agent's roster squad, e.g. 'enablement') on the merge below.
-    rows = rows.drop(columns=["squad"])
-
-    # --- fan-out join to the content roster on target_squad --------------
-    roster = agent_info.loc[
-        (agent_info["status"] == "active")
-        & agent_info["target_squad"].notna()
-        & (agent_info["target_squad"] != ""),
-        [
-            "agent",
-            "xforce",
-            "xplead",
-            "team",
-            "squad",
-            "squad_district",
-            "shift",
-            "target_squad",
-            "snapshot_month",
-        ],
-    ].copy()
-    roster = roster.rename(columns={"squad_district": "district"})
-    roster["snapshot_month"] = _as_naive_datetime(roster["snapshot_month"])
-
-    enriched = rows.merge(
-        roster, on=["target_squad", "snapshot_month"], how="inner"
+    rows = (
+        csat.withColumn("promoters", promoters.cast("int"))
+        .withColumn("number_of_questions", F.lit(NUMBER_OF_QUESTIONS).cast("int"))
+        .withColumn(
+            "csat_score",
+            (F.col("promoters").cast("double") / F.lit(float(NUMBER_OF_QUESTIONS))),
+        )
     )
 
-    if enriched.empty:
-        return pd.DataFrame(
-            {c: pd.Series(dtype="object") for c, _ in IO_CONTENT_CSAT_SCHEMA}
+    # --- join key normalization ------------------------------------------
+    # The survey's display-form `squad` maps to the roster `target_squad`:
+    # 'E.M.I.' and the long 'GENERAL (...)' label both become 'emi_general';
+    # everything else is lowercased.
+    target_squad = (
+        F.when(
+            F.col("squad").isin(list(_EMI_GENERAL_LABELS)), F.lit("emi_general")
+        ).otherwise(F.lower(F.col("squad")))
+    )
+    rows = (
+        rows.withColumn("target_squad", target_squad)
+        .withColumn("date", F.to_date(F.col("date_reference")))
+        .withColumn(
+            "snapshot_month", F.trunc(F.to_date(F.col("date_reference")), "month")
         )
+        # Drop the raw display `squad` so it doesn't collide with the roster's
+        # `squad` (the agent's roster squad, e.g. 'enablement') on the join.
+        .drop("squad")
+    )
 
-    out = enriched[[
+    # --- content roster -----------------------------------------------------
+    roster = agent_info.filter(
+        (F.col("status") == F.lit("active"))
+        & F.col("target_squad").isNotNull()
+        & (F.col("target_squad") != F.lit(""))
+    ).select(
+        "agent",
+        "xforce",
+        "xplead",
+        "team",
+        "squad",
+        F.col("squad_district").alias("district"),
+        "shift",
+        "target_squad",
+        F.to_date(F.col("snapshot_date")).alias("_snapshot_date"),
+        F.trunc(F.to_date(F.col("snapshot_month")), "month").alias("snapshot_month"),
+    )
+
+    # Deduplicate the roster to exactly ONE row per
+    # (agent, target_squad, snapshot_month) BEFORE the join (mirrors
+    # tnps_responses): the content branch of `agent_information` can yield >1
+    # identical row per (agent, target_squad, snapshot_month), which would fan
+    # out the inner join and double-count the numerator/denominator. Keep the
+    # latest snapshot deterministically.
+    roster_dedup_window = Window.partitionBy(
+        "agent", "target_squad", "snapshot_month"
+    ).orderBy(
+        F.col("_snapshot_date").desc_nulls_last(),
+        F.col("squad").asc_nulls_last(),
+        F.col("district").asc_nulls_last(),
+        F.col("shift").asc_nulls_last(),
+    )
+    roster = (
+        roster.withColumn("_roster_rn", F.row_number().over(roster_dedup_window))
+        .filter(F.col("_roster_rn") == 1)
+        .drop("_roster_rn", "_snapshot_date")
+    )
+
+    # --- fan-out join to the content roster on (target_squad, snapshot_month).
+    # This is the intentional fan-out: one response -> many agents serving the
+    # squad that month.
+    enriched = rows.join(roster, on=["target_squad", "snapshot_month"], how="inner")
+
+    out = enriched.select(
         "agent",
         "xforce",
         "xplead",
@@ -172,12 +196,15 @@ def compute_content_csat(
         "promoters",
         "number_of_questions",
         "csat_score",
-    ]].copy()
+    )
 
-    return out.sort_values(
-        ["date", "target_squad", "agent", "survey_timestamp"]
-    ).reset_index(drop=True)
+    return out.orderBy("date", "target_squad", "agent", "survey_timestamp")
 
+
+# ---------------------------------------------------------------------------
+# Output schema declaration — used by
+# scripts/metrics_data_scripts/build_content_csat.py
+# ---------------------------------------------------------------------------
 
 IO_CONTENT_CSAT_SCHEMA: tuple[tuple[str, str], ...] = (
     ("agent", "STRING"),

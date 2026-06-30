@@ -1,9 +1,9 @@
 """Build the content_csat dataset and (optionally) write it to Databricks.
 
 Thin orchestrator. The math lives in ``metrics_data/content_csat.py`` and is
-covered by ``tests/test_content_csat.py``. Here we only:
+covered by ``tests/metrics_data/test_content_csat.py``. Here we only:
 
-  1. Open a Databricks SQL connection (shared `db.open_connection`).
+  1. Get the ambient SparkSession (shared `db.open_connection`).
   2. Run the two extractors needed:
        * ``agent_information``  (roster, incl. content `target_squad`)
        * ``content_csat``       (Content CSAT survey responses)
@@ -24,12 +24,12 @@ the metrics layer; this script produces the raw per-response (× agent) baseline
 
 Usage
 -----
-::
+Runs on a Databricks cluster (``spark-submit`` / a Databricks job task)::
 
-    uv run python scripts/metrics_data_scripts/build_content_csat.py \\
+    python scripts/metrics_data_scripts/build_content_csat.py \\
         --period-start 2026-03-01 --period-end 2026-05-31 --dry-run
 
-    uv run python scripts/metrics_data_scripts/build_content_csat.py \\
+    python scripts/metrics_data_scripts/build_content_csat.py \\
         --period-start 2025-12-01 --period-end 2026-05-31
 """
 
@@ -42,12 +42,36 @@ import time
 from datetime import date
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Locate the repo root (contains `db.py` + `extractors/`) so the sibling
+# top-level modules import. We can't rely on `__file__`: Databricks runs a
+# git-sourced `spark_python_task` via `exec()` with no `__file__` set, so we
+# search upward from every path we can discover (file, argv, cwd).
+def _repo_root() -> Path:
+    starts: list[Path] = []
+    try:
+        starts.append(Path(__file__).resolve())
+    except NameError:
+        pass
+    if sys.argv and sys.argv[0]:
+        starts.append(Path(sys.argv[0]).resolve())
+    starts.append(Path.cwd().resolve())
+    for start in starts:
+        for cand in (start, *start.parents):
+            if (cand / "db.py").is_file() and (cand / "extractors").is_dir():
+                return cand
+    return Path.cwd()
+
+
+REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics_data"))
 
 from db import open_connection, run_extractor, publish  # noqa: E402
-from content_csat import IO_CONTENT_CSAT_SCHEMA, compute_content_csat  # noqa: E402
+from content_csat import (  # noqa: E402
+    IO_CONTENT_CSAT_SCHEMA,
+    compute_content_csat,
+)
 
 LOGGER = logging.getLogger("cx_metrics.content_csat")
 
@@ -109,68 +133,79 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
-    conn = open_connection()
-    try:
-        with _log_step("agent_information"):
-            roster = run_extractor(
-                conn, "agent_information", args.period_start, args.period_end
+    spark = open_connection()
+
+    with _log_step("agent_information"):
+        roster = run_extractor(
+            spark, "agent_information", args.period_start, args.period_end
+        )
+
+    with _log_step("content_csat"):
+        csat = run_extractor(
+            spark, "content_csat", args.period_start, args.period_end
+        )
+
+    with _log_step("compute_content_csat"):
+        result = compute_content_csat(roster, csat)
+
+    if args.dry_run:
+        from pyspark.sql import functions as F
+
+        result = result.persist()
+        LOGGER.info("Dry run — not writing. Summary:")
+        print()
+        agg = result.agg(
+            F.count(F.lit(1)).alias("rows"),
+            F.countDistinct("agent").alias("agents"),
+            F.countDistinct("date").alias("dates"),
+            F.min("csat_score").alias("score_min"),
+            F.max("csat_score").alias("score_max"),
+            F.avg("csat_score").alias("score_mean"),
+        ).collect()[0]
+        distinct_responses = (
+            result.select("survey_timestamp", "requested_by", "target_squad")
+            .distinct()
+            .count()
+        )
+        print(f"Rows (response x agent): {agg['rows']:,}")
+        print(f"Distinct responses:      {distinct_responses:,}")
+        print(f"Content agents:          {agg['agents']:,}")
+        print(f"Distinct ref dates:      {agg['dates']:,}")
+        squads = sorted(
+            r["target_squad"]
+            for r in result.select("target_squad").distinct().collect()
+            if r["target_squad"] is not None
+        )
+        print(f"Target squads:           {len(squads):,} ({', '.join(squads)})")
+        if agg["score_min"] is not None:
+            print(
+                f"csat_score: min={agg['score_min']:.3f}  "
+                f"max={agg['score_max']:.3f}  mean={agg['score_mean']:.3f}"
             )
-            LOGGER.info("  %s roster rows", f"{len(roster):,}")
+        print()
+        print("Head:")
+        result.show(10, truncate=False)
+        result.unpersist()
+        return 0
 
-        with _log_step("content_csat"):
-            csat = run_extractor(
-                conn, "content_csat", args.period_start, args.period_end
-            )
-            LOGGER.info("  %s survey responses", f"{len(csat):,}")
-
-        with _log_step("compute_content_csat"):
-            result = compute_content_csat(roster, csat)
-            LOGGER.info("  %s rows in final content_csat frame", f"{len(result):,}")
-
-        expected_cols = [c for c, _ in IO_CONTENT_CSAT_SCHEMA]
-        result = result[expected_cols]
-
-        if args.dry_run:
-            LOGGER.info("Dry run — not writing. Summary:")
-            print()
-            print(f"Rows (response x agent): {len(result):,}")
-            print(f"Distinct responses:      "
-                  f"{result[['survey_timestamp', 'requested_by', 'target_squad']].drop_duplicates().shape[0]:,}")
-            print(f"Content agents:          {result['agent'].nunique():,}")
-            print(f"Target squads:           {result['target_squad'].nunique():,} "
-                  f"({', '.join(sorted(result['target_squad'].dropna().unique()))})")
-            print(f"Distinct ref dates:      {result['date'].nunique():,}")
-            if not result.empty:
-                print(
-                    f"csat_score: min={result['csat_score'].min():.3f}  "
-                    f"max={result['csat_score'].max():.3f}  "
-                    f"mean={result['csat_score'].mean():.3f}"
-                )
-            print()
-            print("Head:")
-            print(result.head(10).to_string(index=False))
-            return 0
-
-        with _log_step(f"write {args.target}"):
-            run = publish(
-                conn,
-                result,
-                args.target,
-                IO_CONTENT_CSAT_SCHEMA,
-                layer="metrics_data",
-                period_start=args.period_start,
-                period_end=args.period_end,
-                run_id=args.run_id,
-                snapshot=not args.no_snapshot,
-            )
-            LOGGER.info(
-                "  wrote %s rows to %s (run_id=%s)",
-                f"{run.row_count:,}", args.target, run.run_id,
-            )
-            if run.snapshot_table:
-                LOGGER.info("  snapshot -> %s", run.snapshot_table)
-    finally:
-        conn.close()
+    with _log_step(f"write {args.target}"):
+        run = publish(
+            spark,
+            result,
+            args.target,
+            IO_CONTENT_CSAT_SCHEMA,
+            layer="metrics_data",
+            period_start=args.period_start,
+            period_end=args.period_end,
+            run_id=args.run_id,
+            snapshot=not args.no_snapshot,
+        )
+        LOGGER.info(
+            "  wrote %s rows to %s (run_id=%s)",
+            f"{run.row_count:,}", args.target, run.run_id,
+        )
+        if run.snapshot_table:
+            LOGGER.info("  snapshot -> %s", run.snapshot_table)
 
     return 0
 

@@ -1,4 +1,4 @@
-"""content_csat — the Content Quality (CSAT) performance metric (Content only).
+"""content_csat — the Content Quality (CSAT) performance metric (Content only), PySpark.
 
 (Module file is ``content_csat_metric.py`` — not ``content_csat.py`` — because
 the raw-layer module is already ``metrics_data/content_csat.py``; the two share a
@@ -13,7 +13,7 @@ CSAT is the share of survey questions answered favourably ("promoter" = answer
 
     content_csat = SUM(promoters) / SUM(number_of_questions)
 
-per agent per period. **Target ≥ 95%.** This is **Content's** quality component
+per agent per period. **Target >= 95%.** This is **Content's** quality component
 (Core / Fraud / Social Media use the Playvox ``quality`` metric instead — see
 ``docs/metrics_definitions.md``).
 
@@ -49,7 +49,8 @@ promoter answers, ``denominator`` = total questions, ``metric_value`` =
 
 from __future__ import annotations
 
-import pandas as pd
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
 from metric_utils import aggregate_long, empty_metric_frame
 
@@ -59,7 +60,7 @@ METRIC_NAME = "content_csat"
 CSAT_TEAM = "content"
 
 
-def compute_content_csat(content_csat: pd.DataFrame) -> pd.DataFrame:
+def compute_content_csat(content_csat: DataFrame) -> DataFrame:
     """Compute the Content CSAT metric at all granularities.
 
     Args:
@@ -69,19 +70,21 @@ def compute_content_csat(content_csat: pd.DataFrame) -> pd.DataFrame:
     Returns:
         Tidy long-format metric rows (see module docstring / schema).
     """
-    if content_csat.empty:
-        return empty_metric_frame()
+    spark = content_csat.sparkSession
 
-    work = content_csat[
-        content_csat["team"].astype("string").str.lower() == CSAT_TEAM
-    ].copy()
-    if work.empty:
-        return empty_metric_frame()
+    work = content_csat.filter(F.lower(F.col("team")) == F.lit(CSAT_TEAM))
 
-    work["promoters"] = pd.to_numeric(work["promoters"], errors="coerce").fillna(0)
-    work["number_of_questions"] = pd.to_numeric(
-        work["number_of_questions"], errors="coerce"
-    ).fillna(0)
+    if len(work.take(1)) == 0:
+        return empty_metric_frame(spark)
+
+    # Coerce the numerator/denominator to numeric; NULL -> 0 (matches the legacy
+    # pandas `fillna(0)`).
+    work = work.withColumn(
+        "promoters", F.coalesce(F.col("promoters").cast("double"), F.lit(0.0))
+    ).withColumn(
+        "number_of_questions",
+        F.coalesce(F.col("number_of_questions").cast("double"), F.lit(0.0)),
+    )
 
     return aggregate_long(
         work,
