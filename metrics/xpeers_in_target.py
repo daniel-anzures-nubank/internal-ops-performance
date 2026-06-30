@@ -97,6 +97,25 @@ For every row ``agent`` / ``squad`` / ``district`` / ``shift`` are NULL (except
 the degenerate key, which is also NULL for SM), ``numerator`` = targets achieved,
 ``denominator`` = total targets, ``metric_value`` = ``numerator / denominator *
 100``.
+
+Known parity bounds (pre-cutover)
+---------------------------------
+This module computes the metric **correctly** (per ``(xforce, xplead)``); two
+legacy divergences are intentionally NOT reproduced and bound byte-for-byte
+parity to the early months (both peak in January):
+
+1. **Legacy xplead fan-out bug** — legacy ``xpeers_in_target_base`` LEFT JOINs
+   each component to adherence on ``xforce`` *only* (not ``xplead``), so an
+   XForce that spans multiple XPLeads gets a cross-product (its adherence is
+   multiplied and its components summed across XPLeads). We aggregate once per
+   ``(xforce, xplead)`` instead. Affects only multi-XPLead XForces (~36 in Jan,
+   2–5/month after — XPLead reassignments concentrate at onboarding).
+2. **NTPJ base-metric early-month gap** — the in-target counts inherit the NTPJ
+   metric, which is not yet at parity in the early months (the deferred NTPJ
+   early-month benchmark / improved_benchmarks work). This bounds every month
+   (Jan ~11 avg abs diff → Apr/May ~0.5). Apr–Jun (where NTPJ is at parity) match
+   legacy; Jan–Mar cannot until that base lands. Social Media is at parity
+   throughout (~2 avg abs diff, bounded only by the SM base metrics).
 """
 
 from __future__ import annotations
