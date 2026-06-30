@@ -483,6 +483,62 @@ all reproduced. quarter/semester/year are the by-design 6-granularity superset.
 
 ---
 
+## Content CSAT — `io_content_csat_metric` (metric `content_csat`) vs the `qa_score_agent` rows of `usr.mx__cx.internal_ops_performance_2026_content` (Content only)
+
+**Status:** shipped with a documented open residual (see below). CSAT is a
+**ratio**: `numerator = SUM(promoters)`, `denominator = SUM(number_of_questions)`,
+`metric_value = num/den*100` (target ≥ 95%). Per monthly survey response a
+"promoter" is a question answered ≥ 4 (1-5 scale); each response is fanned out to
+every active content agent serving the rated `target_squad` that month;
+`date_reference = survey_timestamp − 1 month`. Legacy emits day/week/month only.
+**Caveat:** `internal_ops_performance_2026_content` is a **live table rebuilt
+nightly** — a mid-rebuild read returns transient empties; compare during a stable
+window.
+
+**Two owner-relevant decisions baked in (don't "fix" later):**
+1. **5 questions, not 8.** The survey sheet has 8 question columns but legacy
+   `[IO] Performance 2026 - Content` (qa_base) scores only the first 5
+   (`facilidad, comprension, comunicacion, calidad, tiempo`); the trailing 3
+   (`manejo_de_cambios, expectativas, aportacion_estrategica`) are excluded.
+   Verified from the sheet: first-5 reproduces legacy's numerator exactly
+   (erazo/txn/Mar = 36 promoters / 40; all-8 gave 57). Owner decision: keep the
+   5-question CSAT for **all** dates (no cutover correction to 8).
+2. **February is a legacy seed.** The CSAT survey sheet has **zero** February
+   responses (earliest fill is March → date_reference March), yet legacy carries
+   17 February month rows (luis.rosario 66.67%, the rest 100%). Reproduced from
+   `usr.danielanzures.content_csat_feb_2026` (materialized from legacy) and
+   unioned into the metric by `build_content_csat.py`, scoped to the run window.
+   Verified **17/17 February rows value-exact**.
+
+**Parity (stable-window read):**
+| grain | both | only_new | only_legacy | value match (≤0.5) |
+| --- | --- | --- | --- | --- |
+| day | 103 | 0 | 0 | 85 / 103 |
+| week | 72 | 0 | 0 | 54 / 72 |
+| month | 60 | 0 | 0 | 48 / 60 (**February 17/17 exact**) |
+
+Coverage is exact on day/week/month (0 `only_new`, 0 `only_legacy`). The
+denominator matches on 101/103 day rows. quarter/semester/year are `only_new`
+(by-design 6-granularity superset; all legacy content/SM metrics emit only
+day/week/month).
+
+### Divergences
+| Divergence | Rows | Cause | Class |
+| --- | --- | --- | --- |
+| Mar–May numerator off by ±1–2 | 18 day / 18 week / 12 month | Legacy's per-response question tally **varies** — e.g. a fully-answered, no-blank 2-response day (jesus.morales/CREDIT, 05-09) where legacy's denominator is **8, not 10** (4 questions counted for one response, 5 for the other). Nothing in the source explains it; the exact rule lives in the legacy `qa_base` SQL and could not be reverse-engineered from data. | **open** |
+| `quarter` / `semester` / `year` | 34 / 17 / 17 `only_new` | by-design 6-granularity superset (legacy emits day/week/month only). | by-design |
+
+### Verdict
+**Shipped; one open residual.** The 5-question rule and the February seed are
+reproduced **exactly** (February 17/17; denominator matches 101/103 day rows; full
+day/week/month coverage). A residual ~12–18% of **Mar–May** rows differ by ±1–2
+due to a legacy variable-question-count quirk in `qa_base` that needs the legacy
+SQL to reproduce byte-for-byte — owner chose to ship and defer it. To close it
+later: read `[IO] Performance 2026 - Content` (qa_base) and match its exact
+per-response question/denominator handling.
+
+---
+
 ## Other metrics — not yet parity-checked
 
 The composite indices (Xpeer/XForce Index, etc.) have **not** been
