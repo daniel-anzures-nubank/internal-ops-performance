@@ -161,42 +161,44 @@ def _empty_units(spark) -> DataFrame:
     return spark.createDataFrame([], schema)
 
 
-def _flag_improved(units: DataFrame, *, direction: str) -> DataFrame:
-    """Add ``improved`` / ``counted`` via month-over-month LAG within (key, xforce).
+def _flag_improved(benchmarks: DataFrame, *, direction: str) -> DataFrame:
+    """Per ``(key, month)`` ``improved`` / ``counted`` via month-over-month LAG.
 
-    ``units`` carries ``key, xforce, xplead, month, team, squad, district,
-    benchmark``. The benchmark is rounded to :data:`BENCHMARK_ROUND_DECIMALS`
-    before the LAG/compare (legacy parity). Ties count as improved; the first
-    month (NULL previous) is neither improved nor counted.
+    ``benchmarks`` carries ``key, month, benchmark`` — **one row per
+    ``(key, month)``**. The benchmark is a property of the key (a job_id's
+    expected duration / a district-shift's occupancy), NOT of the
+    xforce/squad/district attribution, so the LAG partitions by ``key`` ONLY
+    (legacy ``PARTITION BY job_id``/``district-shift``). The benchmark is rounded
+    to :data:`BENCHMARK_ROUND_DECIMALS` before the compare. Ties count as
+    improved; the first month (NULL previous) is neither improved nor counted.
+
+    Returns ``key, month, improved, counted`` — the per-key flag that is then
+    joined onto the xforce/squad/district attribution rows.
     """
     bench = F.round(F.col("benchmark"), BENCHMARK_ROUND_DECIMALS)
-    # LAG partition is (key, xforce) ORDER BY month — matches legacy
-    # `PARTITION BY job_id, xforce ORDER BY benchmark_month`. The rows carry
-    # squad/district but the partition deliberately does not (legacy parity).
-    w = Window.partitionBy("key", "xforce").orderBy("month")
+    w = Window.partitionBy("key").orderBy("month")
     prev = F.lag(bench).over(w)
 
-    if direction == "lower":
-        improved = bench <= prev
-    else:
-        improved = bench >= prev
-
+    improved = (bench <= prev) if direction == "lower" else (bench >= prev)
     counted = prev.isNotNull()
-    return units.select(
+    return benchmarks.select(
         "key",
-        "xforce",
-        "xplead",
         "month",
-        "team",
-        "squad",
-        "district",
         (improved & counted).cast("long").alias("improved"),
         counted.cast("long").alias("counted"),
     )
 
 
 def _ntpj_benchmark_units(jobs: DataFrame) -> DataFrame:
-    """Per ``(job_id, xforce, xplead, month, squad, district)`` NTPJ benchmark + flag."""
+    """NTPJ benchmark units: attribution rows + the per-job_id improvement flag.
+
+    The benchmark is per ``(job_id, month)`` (cohort-wide ``exp_duration_job``,
+    legacy trailing-window rule). The improvement flag is computed at that grain
+    (LAG by job_id), then joined onto the distinct ``(job_id, xforce, xplead,
+    month, squad, district)`` attribution rows — so a single job_id splits across
+    every (squad, district) its agents worked, but the improvement decision is
+    made ONCE per job_id (not per split row). Returns the :data:`_UNIT_COLS`.
+    """
     spark = jobs.sparkSession
     finished = jobs.filter(
         F.lower(F.col("status")) == F.lit(FINISHED_STATUS)
@@ -212,21 +214,22 @@ def _ntpj_benchmark_units(jobs: DataFrame) -> DataFrame:
         F.count(F.lit(1)).alias("tot_count"),
     )
     expected = _expected_duration_by_month(monthly_totals)  # job_id, month, exp_duration_job
+    benchmarks = expected.select(
+        F.col("job_id").alias("key"),
+        "month",
+        F.col("exp_duration_job").alias("benchmark"),
+    )
+    flags = _flag_improved(benchmarks, direction="lower")  # key, month, improved, counted
 
-    # The benchmark units (squad/district splitting): one row per
-    # (job_id, xforce, xplead, month, squad, district), carrying the agent's
-    # roster attribution. Legacy ntpj_benchmark joins normalized_time_per_job to
-    # agent_information per-agent, then GROUP BY ALL averages exp_duration_job;
-    # here every job already carries its agent's squad/district, so we take the
-    # distinct attribution keys per (job_id, month) and attach the shared
-    # per-job_id benchmark. The agent's contribution rows are required-activity
-    # only (legacy required_hours IS NOT NULL).
+    # Attribution: distinct (job_id, xforce, xplead, month, squad, district) over
+    # the agent contribution rows (required-activity only, legacy required_hours
+    # IS NOT NULL). One row per (squad, district) an xforce's agents worked it in.
     contrib = finished.filter(F.col("required_activity_on_day_flag") == F.lit(1))
     if len(contrib.take(1)) == 0:
         return _empty_units(spark)
 
-    keys = contrib.select(
-        F.col("job_id"),
+    attribution = contrib.select(
+        F.col("job_id").alias("key"),
         "xforce",
         "xplead",
         "month",
@@ -235,25 +238,17 @@ def _ntpj_benchmark_units(jobs: DataFrame) -> DataFrame:
         "district",
     ).distinct()
 
-    units = keys.join(
-        expected.select("job_id", "month", "exp_duration_job"),
-        on=["job_id", "month"],
-        how="inner",
-    ).select(
-        F.col("job_id").alias("key"),
-        "xforce",
-        "xplead",
-        "month",
-        "team",
-        "squad",
-        "district",
-        F.col("exp_duration_job").alias("benchmark"),
-    )
-    return _flag_improved(units, direction="lower")
+    return attribution.join(flags, on=["key", "month"], how="inner").select(*_UNIT_COLS)
 
 
 def _occupancy_benchmark_units(occ: DataFrame) -> DataFrame:
-    """Per ``(district-shift, xforce, xplead, month, squad, district)`` occupancy benchmark + flag."""
+    """Occupancy benchmark units: attribution rows + the per-district-shift flag.
+
+    The benchmark is per ``(district, shift, month)`` (mean of the squad
+    occupancy ratios). The improvement flag is computed at that grain (LAG by the
+    ``district - shift`` key), then joined onto the distinct ``(key, xforce,
+    xplead, month, squad, district)`` attribution rows. Returns :data:`_UNIT_COLS`.
+    """
     spark = occ.sparkSession
     act = F.lower(F.col("activity_type_required"))
     productive = (
@@ -275,14 +270,21 @@ def _occupancy_benchmark_units(occ: DataFrame) -> DataFrame:
             F.lit(None).cast("double")
         ),
     )
-    bench = squad.groupBy("month", "district", "shift").agg(
-        F.avg("ratio").alias("benchmark")
+    benchmarks = (
+        squad.groupBy("month", "district", "shift")
+        .agg(F.avg("ratio").alias("benchmark"))
+        .select(
+            F.concat_ws(" - ", F.col("district"), F.col("shift")).alias("key"),
+            "month",
+            "benchmark",
+        )
     )
+    flags = _flag_improved(benchmarks, direction="higher")  # key, month, improved, counted
 
-    # Benchmark units carry the agent's roster attribution (legacy occupancy_benchmark
-    # carries squad/squad_district/shift per agent). The unit key is the slot's
-    # district-shift; the benchmark value comes from the (month, district, shift) mean.
-    keys = productive.select(
+    # Attribution: distinct (district-shift key, xforce, xplead, month, squad,
+    # district) over the productive slots (legacy occupancy_benchmark carries
+    # squad/squad_district per agent).
+    attribution = productive.select(
         F.concat_ws(" - ", F.col("district"), F.col("shift")).alias("key"),
         "xforce",
         "xplead",
@@ -290,22 +292,9 @@ def _occupancy_benchmark_units(occ: DataFrame) -> DataFrame:
         F.lower(F.col("team")).alias("team"),
         "squad",
         "district",
-        "shift",
     ).distinct()
 
-    units = keys.join(
-        bench, on=["month", "district", "shift"], how="inner"
-    ).select(
-        "key",
-        "xforce",
-        "xplead",
-        "month",
-        "team",
-        "squad",
-        "district",
-        "benchmark",
-    )
-    return _flag_improved(units, direction="higher")
+    return attribution.join(flags, on=["key", "month"], how="inner").select(*_UNIT_COLS)
 
 
 def _ntpj_xforce_months(jobs: DataFrame) -> DataFrame:
@@ -331,39 +320,55 @@ def _ntpj_xforce_months(jobs: DataFrame) -> DataFrame:
     )
 
 
+# The unit columns NOT in a roll-up's grouping key — the tuple whose DISTINCT
+# count gives that roll-up's numerator/denominator. Legacy counts
+# COUNT(DISTINCT job_id) per (xforce, squad, squad_district) and sums into each
+# roll-up, i.e. for any roll-up the count is the number of distinct benchmark
+# units = distinct (key, xforce, squad, district) tuples within the group.
+_ROLLUP_ID_COLS: dict[str, tuple[str, ...]] = {
+    "xforce": ("key", "squad", "district"),    # within (xforce, xplead)
+    "squad": ("key", "xforce", "district"),     # within squad
+    "district": ("key", "xforce", "squad"),     # within district
+}
+
+
+def _masked_unit_id(cols: tuple[str, ...], when: Column) -> Column:
+    """A null-safe string id of ``cols`` (NULL outside ``when``) for countDistinct."""
+    parts = [F.coalesce(F.col(c).cast("string"), F.lit("∅")) for c in cols]
+    return F.when(when, F.concat_ws("", *parts))
+
+
 def _rollup(units: DataFrame, *, level: str, metric_name: str) -> DataFrame:
-    """Sum improved / counted per ``(<level>, month)`` into metric rows.
+    """Count distinct benchmark units per ``(<level>, month)`` into metric rows.
 
     ``level`` is ``squad`` / ``district`` (key sets that column; ``xforce`` /
     ``xplead`` / ``team`` NULL — legacy squad/district views carry no team) or
     ``xforce`` (sets ``xforce`` + ``xplead``, squad/district NULL — legacy
     ``improved_benchmark``).
 
-    Legacy counts ``COUNT(DISTINCT job_id)``; the unit rows are already unique
-    per ``(key, xforce, month, squad, district)``, but a job_id can appear under
-    two xforces, so we count distinct ``(key, xforce)`` of the improved / counted
-    units to stay exactly faithful.
+    Legacy improved_benchmark counts ``COUNT(DISTINCT job_id)`` per ``(xforce,
+    squad, squad_district)`` and sums into the roll-up, so the numerator /
+    denominator is the number of distinct benchmark units — distinct
+    ``(key, xforce, squad, district)`` tuples — within the group (verified
+    against legacy: xforce den 66 ≈ distinct (job_id, squad, district); squad /
+    district den sums 1035 ≈ distinct (job_id, xforce, district) / (job_id,
+    xforce, squad)).
     """
-    # Count DISTINCT (key, xforce) of the improved / counted units (legacy
-    # COUNT(DISTINCT job_id), but a job_id can recur across xforces so we pair it
-    # with xforce). A NULL key (non-improved / non-counted) is ignored by
-    # countDistinct, so the masked keys behave like the legacy CASE-WHEN.
-    improved_key = F.when(F.col("improved") == F.lit(1), F.col("key"))
-    counted_key = F.when(F.col("counted") == F.lit(1), F.col("key"))
+    id_cols = _ROLLUP_ID_COLS[level]
+    numerator = F.countDistinct(
+        _masked_unit_id(id_cols, F.col("improved") == F.lit(1))
+    ).alias("numerator")
+    denominator = F.countDistinct(
+        _masked_unit_id(id_cols, F.col("counted") == F.lit(1))
+    ).alias("denominator")
 
     is_xforce = level == "xforce"
     if is_xforce:
-        grp = units.groupBy("xforce", "xplead", "month").agg(
-            F.countDistinct(improved_key, F.col("xforce")).alias("numerator"),
-            F.countDistinct(counted_key, F.col("xforce")).alias("denominator"),
-        )
+        grp = units.groupBy("xforce", "xplead", "month").agg(numerator, denominator)
     else:
         grp = (
             units.groupBy(level, "month")
-            .agg(
-                F.countDistinct(improved_key, F.col("xforce")).alias("numerator"),
-                F.countDistinct(counted_key, F.col("xforce")).alias("denominator"),
-            )
+            .agg(numerator, denominator)
             .filter(F.col(level).isNotNull())
         )
 
