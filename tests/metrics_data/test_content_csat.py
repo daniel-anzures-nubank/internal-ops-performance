@@ -5,7 +5,8 @@ Small synthetic Spark frames, no warehouse.
 content_csat is a RAW dataset: one row per Content CSAT survey response fanned
 out to each content agent serving the rated ``target_squad``. We verify the
 per-response promoter count / csat_score (>= 4 promoter, NULL not a promoter, the
-8-question denominator), the target_squad normalization (E.M.I./GENERAL ->
+5-question denominator — legacy scores 5 of the survey's 8 columns), the
+target_squad normalization (E.M.I./GENERAL ->
 emi_general, else lower), the target_squad-based fan-out join (one response
 credited to every serving agent), the roster dedup (a duplicated roster row does
 NOT double-count), and the output contract.
@@ -56,7 +57,8 @@ _CSAT_SCHEMA = T.StructType(
 
 
 def make_csat(spark, rows):
-    # Default: all 8 questions = 5 (all promoters).
+    # Default: all questions = 5 (all promoters). Only the first 5 columns are
+    # scored by legacy; the trailing 3 are set too but ignored by the metric.
     defaults = {
         "survey_timestamp": dt.datetime(2026, 4, 9, 15, 14, 11),
         "date_reference": dt.datetime(2026, 3, 9, 15, 14, 11),
@@ -133,8 +135,8 @@ class TestComputeContentCsat:
         rows = _collect(out)
         assert len(rows) == 1
         row = rows[0]
-        assert row["promoters"] == 8
-        assert row["number_of_questions"] == NUMBER_OF_QUESTIONS == 8
+        assert row["promoters"] == 5
+        assert row["number_of_questions"] == NUMBER_OF_QUESTIONS == 5
         assert row["csat_score"] == 1.0
         assert row["agent"] == "alejandra.erazo"
         assert row["team"] == "content"
@@ -164,16 +166,19 @@ class TestComputeContentCsat:
             ),
         )
         row = _collect(out)[0]
-        # promoters: 4,_,5,_,4,_,4,5 -> facilidad,comunicacion,tiempo,expectativas,aportacion = 5
-        assert row["promoters"] == 5
-        assert abs(row["csat_score"] - 5 / 8) < 1e-9
+        # Only the first 5 are scored: facilidad=4(✓), comprension=3(✗),
+        # comunicacion=5(✓), calidad=1(✗), tiempo=4(✓) -> 3 promoters. The
+        # trailing 3 columns (manejo/expectativas/aportacion) are ignored.
+        assert row["promoters"] == 3
+        assert abs(row["csat_score"] - 3 / 5) < 1e-9
 
     def test_null_score_not_promoter(self, spark):
         out = compute_content_csat(
             make_roster(spark, [{}]),
             make_csat(spark, [{"facilidad": None}]),
         )
-        assert _collect(out)[0]["promoters"] == 7
+        # facilidad null (not a promoter); the other 4 scored questions = 5 -> 4.
+        assert _collect(out)[0]["promoters"] == 4
 
     def test_all_null_scores_zero_promoters(self, spark):
         out = compute_content_csat(
@@ -196,7 +201,7 @@ class TestComputeContentCsat:
         )
         row = _collect(out)[0]
         assert row["promoters"] == 0
-        assert row["number_of_questions"] == 8
+        assert row["number_of_questions"] == 5
         assert row["csat_score"] == 0.0
 
     def test_emi_label_normalizes(self, spark):
@@ -349,7 +354,7 @@ class TestComputeContentCsat:
         )
         row = _collect(out)[0]
         assert "nps" not in out.columns
-        assert row["promoters"] == 8  # nps does not affect the promoter count
+        assert row["promoters"] == 5  # nps does not affect the promoter count
 
     def test_output_schema_and_column_order(self, spark):
         out = compute_content_csat(make_roster(spark, [{}]), make_csat(spark, [{}]))

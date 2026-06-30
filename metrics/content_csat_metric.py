@@ -9,7 +9,8 @@ Part of the **metrics layer**: consumes the raw ``io_content_csat_raw`` table
 agent-level metric at day / week / month / quarter / semester / year grain.
 
 CSAT is the share of survey questions answered favourably ("promoter" = answer
-``>= 4`` on the 1-5 scale), across the 8 questions of each monthly Content survey:
+``>= 4`` on the 1-5 scale), across the **5** scored questions of each monthly
+Content survey (the sheet has 8 question columns; legacy scores only 5):
 
     content_csat = SUM(promoters) / SUM(number_of_questions)
 

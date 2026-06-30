@@ -2,8 +2,9 @@
 
 This is a RAW dataset feeding the Content **Quality (CSAT)** metric. Each Content
 CSAT survey response rates how well the Content (enablement) team supported a
-given squad that month, across 8 questions scored 1-5 (a "promoter" is any
-answer >= 4). The per-response score is ``promoters / number_of_questions``.
+given squad that month. The survey sheet has 8 question columns, but legacy
+scores only the **5** CSAT questions (a "promoter" is any answer >= 4 on the 1-5
+scale). The per-response score is ``promoters / number_of_questions``.
 
 CSAT is attributed by **target_squad**, not by individual agent: a single survey
 response is credited to *every* active content agent who supports that squad
@@ -51,8 +52,8 @@ Output schema (one row per survey response × content agent)
     target_squad       STRING   the supported squad the survey is about (join key)
     requested_by       STRING   respondent email prefix
     survey_timestamp   TIMESTAMP when the survey was filled
-    promoters          INT      # of the 8 questions answered >= 4
-    number_of_questions INT     always 8
+    promoters          INT      # of the 5 scored questions answered >= 4
+    number_of_questions INT     always 5 (legacy scores 5 of the survey's 8)
     csat_score         DOUBLE   promoters / number_of_questions (0-1, per response)
 """
 
@@ -65,19 +66,22 @@ from pyspark.sql import functions as F
 # Constants
 # ---------------------------------------------------------------------------
 
-# The 8 CSAT questions (each scored 1-5; promoter if >= 4).
+# The 5 CSAT questions legacy scores (each 1-5; promoter if >= 4). The survey
+# sheet carries 8 question columns, but legacy `[IO] Performance 2026 - Content`
+# (qa_base) scores only these first 5 — the trailing 3 (`manejo_de_cambios`,
+# `expectativas`, `aportacion_estrategica`) are excluded. Verified against the
+# legacy `qa_score_agent` output: first-5 reproduces legacy num/den exactly
+# (denominator is 5/response, not 8). Owner decision: keep legacy's 5-question
+# CSAT for all dates (no cutover correction to 8).
 _QUESTION_COLS: tuple[str, ...] = (
     "facilidad",
     "comprension",
     "comunicacion",
     "calidad",
     "tiempo",
-    "manejo_de_cambios",
-    "expectativas",
-    "aportacion_estrategica",
 )
 
-NUMBER_OF_QUESTIONS: int = len(_QUESTION_COLS)  # 8
+NUMBER_OF_QUESTIONS: int = len(_QUESTION_COLS)  # 5
 PROMOTER_THRESHOLD: int = 4
 
 # Display-form squad labels that map to the 'emi_general' target_squad (legacy).
