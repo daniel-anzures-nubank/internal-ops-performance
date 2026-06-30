@@ -314,9 +314,12 @@ class TestSquadSplitting:
         assert squads["card"]["numerator"] == 1.0
         districts = {r["district"] for r in _by_metric(out, DISTRICT_METRIC)}
         assert districts == {"csi", "ops"}
-        # The xforce roll-up counts the (job_id, xforce) ONCE despite the split.
+        # The xforce roll-up counts distinct (job_id, squad, district) and SUMS
+        # across the split (legacy COUNT(DISTINCT job_id) per (xforce, squad,
+        # squad_district), summed): the one job_id worked in two (squad, district)
+        # combos is TWO benchmark units, not one.
         xf = _one(out, XFORCE_METRIC)
-        assert xf["numerator"] == 1.0 and xf["denominator"] == 1.0
+        assert xf["numerator"] == 2.0 and xf["denominator"] == 2.0
 
 
 # --------------------------------------------------------------------------- #
