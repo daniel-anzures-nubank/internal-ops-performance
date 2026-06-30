@@ -18,10 +18,13 @@ Tables
 * Input:  ``usr.danielanzures.io_content_csat_raw`` (override `--source`).
 * Output: ``usr.danielanzures.io_content_csat_metric`` (override `--target`).
 
-Manual adjustments
-------------------
-None applied here (no adjustments layer yet) — see
-`metrics/content_csat_metric.py`.
+February seed
+-------------
+Legacy carries a seeded February (the CSAT survey sheet has no February
+responses, so the raw/compute path can never produce it). ``--feb-seed``
+(``usr.danielanzures.content_csat_feb_2026``, 17 content agents at month grain)
+is unioned into the metric, scoped to the run window, to reproduce legacy's
+February month rows.
 
 Usage
 -----
@@ -79,6 +82,10 @@ LOGGER = logging.getLogger("cx_metrics.content_csat")
 
 DEFAULT_SOURCE = "usr.danielanzures.io_content_csat_raw"
 DEFAULT_TARGET = "usr.danielanzures.io_content_csat_metric"
+# Static February seed: legacy `qa_score_agent` carries a seeded February (the
+# source CSAT sheet has no February responses). Materialized to this table and
+# unioned into the metric below so the output reproduces legacy's February rows.
+DEFAULT_FEB_SEED = "usr.danielanzures.content_csat_feb_2026"
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -97,6 +104,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--target",
         default=DEFAULT_TARGET,
         help=f"Fully-qualified table to replace (default: {DEFAULT_TARGET}).",
+    )
+    parser.add_argument(
+        "--feb-seed",
+        default=DEFAULT_FEB_SEED,
+        help="Static February seed table to union into the metric "
+        f"(default: {DEFAULT_FEB_SEED}; pass '' to disable).",
     )
     parser.add_argument(
         "--dry-run",
@@ -131,6 +144,34 @@ def _log_step(label: str):
     return _Timer()
 
 
+def _append_feb_seed(spark, result, feb_table, period_start, period_end):
+    """Union the static February seed into the metric, scoped to the window.
+
+    Legacy ``qa_score_agent`` carries a seeded February (17 content agents at
+    month grain) even though the CSAT survey sheet has no February responses, so
+    the raw/compute path can never produce it. We reproduce it from
+    ``content_csat_feb_2026``. Missing / empty / out-of-window -> no-op (never
+    fails the build).
+    """
+    from pyspark.sql import functions as F
+
+    if not feb_table:
+        return result
+    try:
+        seed = spark.table(feb_table)
+    except Exception as exc:  # table absent / unreadable -> skip
+        LOGGER.warning("  February seed %s unavailable (%s) — skipping", feb_table, exc)
+        return result
+    seed = seed.filter(
+        (F.col("date_reference") >= F.lit(period_start))
+        & (F.col("date_reference") <= F.lit(period_end))
+    ).select(*[c for c, _ in IO_CONTENT_CSAT_METRIC_SCHEMA])
+    if len(seed.take(1)) == 0:
+        return result
+    LOGGER.info("  unioning February seed from %s", feb_table)
+    return result.unionByName(seed)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     logging.basicConfig(
@@ -148,6 +189,11 @@ def main(argv: list[str] | None = None) -> int:
 
     with _log_step("compute_content_csat"):
         result = compute_content_csat(csat)
+
+    with _log_step("append February seed"):
+        result = _append_feb_seed(
+            spark, result, args.feb_seed, args.period_start, args.period_end
+        )
 
     if args.dry_run:
         from pyspark.sql import functions as F
