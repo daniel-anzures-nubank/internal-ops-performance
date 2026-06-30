@@ -4,7 +4,7 @@ Metrics-layer script. Thin orchestrator — the math lives in
 ``metrics/content_csat_metric.py`` and is covered by
 ``tests/metrics/test_content_csat_metric.py``. Here we only:
 
-  1. Open a Databricks SQL connection (shared `db.open_connection`).
+  1. Get the ambient SparkSession (shared `db.open_connection`).
   2. Read the raw input table ``io_content_csat_raw`` for the period
      (via `db.read_table`).
   3. Call ``compute_content_csat`` to get the metric rows at all granularities.
@@ -18,19 +18,22 @@ Tables
 * Input:  ``usr.danielanzures.io_content_csat_raw`` (override `--source`).
 * Output: ``usr.danielanzures.io_content_csat_metric`` (override `--target`).
 
-Manual adjustments
-------------------
-None applied here (no adjustments layer yet) — see
-`metrics/content_csat_metric.py`.
+February seed
+-------------
+Legacy carries a seeded February (the CSAT survey sheet has no February
+responses, so the raw/compute path can never produce it). ``--feb-seed``
+(``usr.danielanzures.content_csat_feb_2026``, 17 content agents at month grain)
+is unioned into the metric, scoped to the run window, to reproduce legacy's
+February month rows.
 
 Usage
 -----
-::
+Runs on a Databricks cluster (``spark-submit`` / a Databricks job task)::
 
-    uv run python scripts/metrics_scripts/build_content_csat.py \\
+    python scripts/metrics_scripts/build_content_csat.py \\
         --period-start 2026-05-01 --period-end 2026-05-24 --dry-run
 
-    uv run python scripts/metrics_scripts/build_content_csat.py \\
+    python scripts/metrics_scripts/build_content_csat.py \\
         --period-start 2026-01-01 --period-end 2026-05-24
 """
 
@@ -43,7 +46,28 @@ import time
 from datetime import date
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Locate the repo root (contains `db.py` + `extractors/`) so the sibling
+# top-level modules import. We can't rely on `__file__`: Databricks runs a
+# git-sourced `spark_python_task` via `exec()` with no `__file__` set, so we
+# search upward from every path we can discover (file, argv, cwd).
+def _repo_root() -> Path:
+    starts: list[Path] = []
+    try:
+        starts.append(Path(__file__).resolve())
+    except NameError:
+        pass
+    if sys.argv and sys.argv[0]:
+        starts.append(Path(sys.argv[0]).resolve())
+    starts.append(Path.cwd().resolve())
+    for start in starts:
+        for cand in (start, *start.parents):
+            if (cand / "db.py").is_file() and (cand / "extractors").is_dir():
+                return cand
+    return Path.cwd()
+
+
+REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics"))
 
@@ -58,6 +82,10 @@ LOGGER = logging.getLogger("cx_metrics.content_csat")
 
 DEFAULT_SOURCE = "usr.danielanzures.io_content_csat_raw"
 DEFAULT_TARGET = "usr.danielanzures.io_content_csat_metric"
+# Static February seed: legacy `qa_score_agent` carries a seeded February (the
+# source CSAT sheet has no February responses). Materialized to this table and
+# unioned into the metric below so the output reproduces legacy's February rows.
+DEFAULT_FEB_SEED = "usr.danielanzures.content_csat_feb_2026"
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -76,6 +104,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--target",
         default=DEFAULT_TARGET,
         help=f"Fully-qualified table to replace (default: {DEFAULT_TARGET}).",
+    )
+    parser.add_argument(
+        "--feb-seed",
+        default=DEFAULT_FEB_SEED,
+        help="Static February seed table to union into the metric "
+        f"(default: {DEFAULT_FEB_SEED}; pass '' to disable).",
     )
     parser.add_argument(
         "--dry-run",
@@ -110,6 +144,34 @@ def _log_step(label: str):
     return _Timer()
 
 
+def _append_feb_seed(spark, result, feb_table, period_start, period_end):
+    """Union the static February seed into the metric, scoped to the window.
+
+    Legacy ``qa_score_agent`` carries a seeded February (17 content agents at
+    month grain) even though the CSAT survey sheet has no February responses, so
+    the raw/compute path can never produce it. We reproduce it from
+    ``content_csat_feb_2026``. Missing / empty / out-of-window -> no-op (never
+    fails the build).
+    """
+    from pyspark.sql import functions as F
+
+    if not feb_table:
+        return result
+    try:
+        seed = spark.table(feb_table)
+    except Exception as exc:  # table absent / unreadable -> skip
+        LOGGER.warning("  February seed %s unavailable (%s) — skipping", feb_table, exc)
+        return result
+    seed = seed.filter(
+        (F.col("date_reference") >= F.lit(period_start))
+        & (F.col("date_reference") <= F.lit(period_end))
+    ).select(*[c for c, _ in IO_CONTENT_CSAT_METRIC_SCHEMA])
+    if len(seed.take(1)) == 0:
+        return result
+    LOGGER.info("  unioning February seed from %s", feb_table)
+    return result.unionByName(seed)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     logging.basicConfig(
@@ -120,59 +182,77 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
-    conn = open_connection()
-    try:
-        with _log_step(f"read {args.source}"):
-            csat = read_table(conn, args.source, args.period_start, args.period_end)
-            LOGGER.info("  %s raw CSAT rows", f"{len(csat):,}")
+    spark = open_connection()
 
-        with _log_step("compute_content_csat"):
-            result = compute_content_csat(csat)
-            LOGGER.info("  %s metric rows", f"{len(result):,}")
+    with _log_step(f"read {args.source}"):
+        csat = read_table(spark, args.source, args.period_start, args.period_end)
 
-        expected_cols = [c for c, _ in IO_CONTENT_CSAT_METRIC_SCHEMA]
-        result = result[expected_cols]
+    with _log_step("compute_content_csat"):
+        result = compute_content_csat(csat)
 
-        if args.dry_run:
-            LOGGER.info("Dry run — not writing. Summary:")
-            print()
-            for g in GRANULARITIES:
-                sub = result[result["date_granularity"] == g]
-                print(f"{g:>9}: {len(sub):,} rows, {sub['agent'].nunique():,} agents")
-            print(f"\nAgents: {result['agent'].nunique():,}   "
-                  f"Teams: {', '.join(sorted(result['team'].dropna().unique()))}")
-            if not result.empty:
-                mv = result["metric_value"].dropna()
-                print(f"metric_value (%): min={mv.min():.1f}  "
-                      f"max={mv.max():.1f}  mean={mv.mean():.1f}")
-            print("\nHead (month grain):")
+    with _log_step("append February seed"):
+        result = _append_feb_seed(
+            spark, result, args.feb_seed, args.period_start, args.period_end
+        )
+
+    if args.dry_run:
+        from pyspark.sql import functions as F
+
+        result = result.persist()
+        LOGGER.info("Dry run — not writing. Summary:")
+        print()
+        by_gran = {
+            r["date_granularity"]: (r["rows"], r["agents"])
+            for r in result.groupBy("date_granularity")
+            .agg(
+                F.count(F.lit(1)).alias("rows"),
+                F.countDistinct("agent").alias("agents"),
+            )
+            .collect()
+        }
+        for g in GRANULARITIES:
+            rows, agents = by_gran.get(g, (0, 0))
+            print(f"{g:>9}: {rows:,} rows, {agents:,} agents")
+        teams = sorted(
+            r["team"]
+            for r in result.select("team").distinct().collect()
+            if r["team"] is not None
+        )
+        stats = result.agg(
+            F.countDistinct("agent").alias("agents"),
+            F.min("metric_value").alias("mv_min"),
+            F.max("metric_value").alias("mv_max"),
+            F.avg("metric_value").alias("mv_mean"),
+        ).collect()[0]
+        print(f"\nAgents: {stats['agents']:,}   Teams: {', '.join(teams)}")
+        if stats["mv_min"] is not None:
             print(
-                result[result["date_granularity"] == "month"]
-                .head(10)
-                .to_string(index=False)
+                f"metric_value (%): min={stats['mv_min']:.1f}  "
+                f"max={stats['mv_max']:.1f}  mean={stats['mv_mean']:.1f}"
             )
-            return 0
+        print("\nHead (month grain):")
+        result.filter(F.col("date_granularity") == "month").show(10, truncate=False)
+        result.unpersist()
+        return 0
 
-        with _log_step(f"write {args.target}"):
-            run = publish(
-                conn,
-                result,
-                args.target,
-                IO_CONTENT_CSAT_METRIC_SCHEMA,
-                layer="metrics",
-                period_start=args.period_start,
-                period_end=args.period_end,
-                run_id=args.run_id,
-                snapshot=not args.no_snapshot,
-            )
-            LOGGER.info(
-                "  wrote %s rows to %s (run_id=%s)",
-                f"{run.row_count:,}", args.target, run.run_id,
-            )
-            if run.snapshot_table:
-                LOGGER.info("  snapshot -> %s", run.snapshot_table)
-    finally:
-        conn.close()
+    with _log_step(f"write {args.target}"):
+        run = publish(
+            spark,
+            result,
+            args.target,
+            IO_CONTENT_CSAT_METRIC_SCHEMA,
+            layer="metrics",
+            period_start=args.period_start,
+            period_end=args.period_end,
+            run_id=args.run_id,
+            snapshot=not args.no_snapshot,
+        )
+        LOGGER.info(
+            "  wrote %s rows to %s (run_id=%s)",
+            f"{run.row_count:,}", args.target, run.run_id,
+        )
+        if run.snapshot_table:
+            LOGGER.info("  snapshot -> %s", run.snapshot_table)
 
     return 0
 
