@@ -634,12 +634,57 @@ cross-deck split). main + SM are at parity (avg abs diff < 1.0, base propagation
 
 ---
 
+## Xpeers In Target — `io_xpeers_in_target_metric` vs `xpeers_in_target_*` in `internal_ops_performance_2026` (main) + `_social_media`
+
+**Status:** shipped (logic-correct; SM + main Apr–Jun at parity); **Jan–Mar
+deferred** (bounded by the NTPJ early-month base gap + an un-reproduced legacy
+fan-out bug). Per XForce/XPLead, the share of its Xpeers' metric targets met
+(adherence ≥ 95, ntpj ≤ 100, NO ≥ 100, quality ≥ 95 for the main deck; SM swaps
+ntpj for tnps ≥ 88 + wows ≥ 5). Reads the finished agent-level `io_*_metric`
+tables, so its parity is bounded by them — chiefly **NTPJ**.
+
+**Six metric names** (new → legacy): `xpeers_in_target` → `xpeers_in_target_xforce`;
+`xpeers_in_target_xplead` → same; SM-only `xpeers_in_target_squad` /
+`_district` / `_xplead_squad` / `_xplead_district` → legacy
+`xpeers_in_target_xforce_squad` / `_xforce_district` / `_xplead_squad` /
+`_xplead_district`. XForce-grain stays `xpeers_in_target` (consumed by
+`xforce_index`, which joins on `xforce` alone).
+
+**Deck grouping (parity):** group by a synthetic deck (core/fraud/NULL → `main`;
+social media → `sm`), **not** team — legacy's main deck merges Core + Fraud with
+no team column. `team` is NULL on output.
+
+**Parity (week + month, ≤ 2026-06-15):**
+| Deck / grain | window | avg abs diff | notes |
+| --- | --- | --- | --- |
+| main XForce (single-xplead) | Apr–May | **0.5** | at parity (~78–81% exact) |
+| main XForce (single-xplead) | Jan→Mar | 10.9 → 3.4 | NTPJ early-month base gap |
+| main XForce (multi-xplead) | Jan | 17.1 | legacy xplead fan-out bug (not reproduced) |
+| main XPLead | week/month | 4.8 / 8.8 | same two bounds |
+| social media (all 6 grains) | Jan–Jun | **~2.2** | at parity (SM base-metric propagation); 4 degenerate squad/district roll-ups match exactly |
+
+### Divergences
+| Divergence | Cause | Class |
+| --- | --- | --- |
+| Jan–Mar main off (single-xplead) | inherits the **NTPJ early-month base gap** (binding every month; tightest in Jan). NTPJ is the deferred improved_benchmark / early-month-benchmark work | open (deferred) |
+| Jan multi-xplead xforces way off | legacy **xplead fan-out bug**: `xpeers_in_target_base` LEFT JOINs components to adherence on `xforce` only, cross-producting multi-xplead xforces (e.g. `jennifer.guerrero` = 100% on den 78). We compute the correct per-`(xforce,xplead)` value; intentionally not reproduced | by-design / open |
+| SM matched off by avg ~2 | SM base-metric propagation (quality Sprinklr, tnps, wows) | by-design |
+
+### Verdict
+**Shipped (logic-correct).** SM (all grains) and the main deck Apr–Jun are at
+parity. Jan–Mar are bounded by the **deferred NTPJ early-months** (the binding
+constraint) and a legacy xplead fan-out bug; both peak in January. Revisit
+byte-for-byte when NTPJ's early months land — bundling the fan-out reproduction
+with that work, since both target the same months.
+
+---
+
 ## Other metrics — not yet parity-checked
 
 The remaining composites (XForce Index, Average XForce Index, Improved
-Benchmarks, XPeers-in-Target, Nuvinhos Performance) are **not** validated against
-legacy in this doc yet. (Improved Benchmarks is ported + logic-fixed on a branch
-but deferred — it needs 2025 `io_jobs_raw` history + a real `ntpj_xforce` rollup;
-it feeds XForce Index, so both wait.) Check for the same phantom-adherence
-cutover, meeting/leave filter, and DIME-squad filter as Adherence / Normalized
-Occupancy / NTPJ before assuming parity, plus the week+month-only restriction.
+Benchmarks, Nuvinhos Performance) are **not** validated against legacy in this
+doc yet. (Improved Benchmarks is ported + logic-fixed on a branch but deferred —
+it needs 2025 `io_jobs_raw` history + a real `ntpj_xforce` rollup; it feeds
+XForce Index, so both wait.) Check for the same phantom-adherence cutover,
+meeting/leave filter, and DIME-squad filter as Adherence / Normalized Occupancy /
+NTPJ before assuming parity, plus the week+month-only restriction.
