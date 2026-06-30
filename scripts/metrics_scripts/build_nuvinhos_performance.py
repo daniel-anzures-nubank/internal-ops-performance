@@ -4,38 +4,40 @@ Metrics-layer script. Thin orchestrator — the math lives in
 ``metrics/nuvinhos_performance.py`` and is covered by
 ``tests/metrics/test_nuvinhos_performance.py``. Here we only:
 
-  1. Open a Databricks SQL connection (shared `db.open_connection`).
-  2. Read the finished Xpeer Index table ``io_xpeer_index_metric`` for the
-     period (via `db.read_table`, scoped on ``date_reference``).
-  3. Read the ``agent_information`` extractor for the period (for the tenure
-     ``last_change_date`` used to classify Nuvinhos).
-  4. Call ``compute_nuvinhos_performance`` to get the XForce / squad / district
-     roll-ups at all granularities.
-  5. Either print a summary (`--dry-run`) or replace the target Delta table.
+  1. Get the ambient SparkSession (shared ``db.open_connection``).
+  2. Read the finished agent-level Xpeer Index table (``io_xpeer_index_metric``)
+     for the period (via ``db.read_table``, scoped on ``date_reference``).
+  3. Run the ``agent_information`` extractor for the roster tenure
+     (``last_change_date`` / ``snapshot_month``) used to classify Nuvinhos.
+  4. Call ``compute_nuvinhos_performance`` to get the per-deck XForce / squad /
+     district roll-ups (week + month only before the 2026-07-01 cutover).
+  5. Either print a summary (``--dry-run``) or replace the target Delta table.
 
-The Nuvinho classification is **monthly** (hire/change month + 2), so prefer
-running with whole-month periods.
+The Nuvinho classification is **monthly** (hire/change month + 2 months), and
+the tenure join is monthly even for weekly rows, so prefer running with whole-
+month periods.
 
 Tables
 ------
 * Inputs:
-    - ``usr.danielanzures.io_xpeer_index_metric`` (override `--index-source`).
-    - the ``agent_information`` extractor (roster tenure).
-* Output: ``usr.danielanzures.io_nuvinhos_performance_metric`` (override `--target`).
+    - ``usr.danielanzures.io_xpeer_index_metric`` (override ``--index-source``).
+    - the ``agent_information`` extractor (roster tenure; reads its own sources).
+* Output: ``usr.danielanzures.io_nuvinhos_performance_metric`` (override ``--target``).
 
 Manual adjustments
 ------------------
-None applied here (no adjustments layer yet). Content yields a degenerate result
-(no Nuvinhos) until the real Content roster with hire dates lands.
+None applied here (no Adjustments layer yet). Content yields a degenerate result
+(no Nuvinhos → NULL XForce metric_value, one NULL-keyed squad/district row each)
+until the real Content roster with hire dates lands.
 
 Usage
 -----
-::
+Runs on a Databricks cluster (``spark-submit`` / a Databricks job task)::
 
-    uv run python scripts/metrics_scripts/build_nuvinhos_performance.py \\
+    python scripts/metrics_scripts/build_nuvinhos_performance.py \\
         --period-start 2026-05-01 --period-end 2026-05-31 --dry-run
 
-    uv run python scripts/metrics_scripts/build_nuvinhos_performance.py \\
+    python scripts/metrics_scripts/build_nuvinhos_performance.py \\
         --period-start 2026-01-01 --period-end 2026-05-31
 """
 
@@ -48,13 +50,38 @@ import time
 from datetime import date
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Locate the repo root (contains `db.py` + `extractors/`) so the sibling
+# top-level modules import. We can't rely on `__file__`: Databricks runs a
+# git-sourced `spark_python_task` via `exec()` with no `__file__` set, so we
+# search upward from every path we can discover (file, argv, cwd).
+def _repo_root() -> Path:
+    starts: list[Path] = []
+    try:
+        starts.append(Path(__file__).resolve())
+    except NameError:
+        pass
+    if sys.argv and sys.argv[0]:
+        starts.append(Path(sys.argv[0]).resolve())
+    starts.append(Path.cwd().resolve())
+    for start in starts:
+        for cand in (start, *start.parents):
+            if (cand / "db.py").is_file() and (cand / "extractors").is_dir():
+                return cand
+    return Path.cwd()
+
+
+REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics"))
 
 from db import open_connection, read_table, run_extractor, publish  # noqa: E402
+from metric_utils import GRANULARITIES  # noqa: E402
 from nuvinhos_performance import (  # noqa: E402
     IO_NUVINHOS_PERFORMANCE_METRIC_SCHEMA,
+    METRIC_XFORCE,
+    METRIC_SQUAD,
+    METRIC_DISTRICT,
     compute_nuvinhos_performance,
 )
 
@@ -62,8 +89,6 @@ LOGGER = logging.getLogger("cx_metrics.nuvinhos_performance")
 
 DEFAULT_INDEX_SOURCE = "usr.danielanzures.io_xpeer_index_metric"
 DEFAULT_TARGET = "usr.danielanzures.io_nuvinhos_performance_metric"
-
-GRANULARITIES = ("day", "week", "month", "quarter", "semester", "year")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -76,7 +101,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--index-source",
         default=DEFAULT_INDEX_SOURCE,
-        help=f"Xpeer Index metric table (default: {DEFAULT_INDEX_SOURCE}).",
+        help=f"Agent-level Xpeer Index table (default: {DEFAULT_INDEX_SOURCE}).",
     )
     parser.add_argument(
         "--target",
@@ -126,86 +151,84 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
-    conn = open_connection()
-    try:
-        with _log_step(f"read {args.index_source}"):
-            xpeer_index = read_table(
-                conn,
-                args.index_source,
-                args.period_start,
-                args.period_end,
-                date_col="date_reference",
-            )
-            LOGGER.info("  %s index rows", f"{len(xpeer_index):,}")
+    spark = open_connection()
 
-        with _log_step("agent_information"):
-            tenure = run_extractor(
-                conn, "agent_information", args.period_start, args.period_end
-            )
-            LOGGER.info("  %s roster rows", f"{len(tenure):,}")
+    with _log_step(f"read {args.index_source}"):
+        idx = read_table(
+            spark, args.index_source, args.period_start, args.period_end,
+            date_col="date_reference",
+        )
 
-        with _log_step("compute_nuvinhos_performance"):
-            result = compute_nuvinhos_performance(xpeer_index, tenure)
-            LOGGER.info("  %s metric rows", f"{len(result):,}")
+    with _log_step("agent_information extractor"):
+        tenure = run_extractor(
+            spark, "agent_information", args.period_start, args.period_end
+        )
 
-        expected_cols = [c for c, _ in IO_NUVINHOS_PERFORMANCE_METRIC_SCHEMA]
-        result = result[expected_cols]
+    with _log_step("compute_nuvinhos_performance"):
+        result = compute_nuvinhos_performance(idx, tenure)
 
-        if args.dry_run:
-            LOGGER.info("Dry run — not writing. Summary:")
-            print()
-            for m in (
-                "nuvinhos_performance",
-                "nuvinhos_performance_squad",
-                "nuvinhos_performance_district",
-            ):
-                sub = result[result["metric"] == m]
-                print(f"{m:>30}: {len(sub):,} rows")
-            print("\nPer granularity (XForce roll-up):")
-            xf = result[result["metric"] == "nuvinhos_performance"]
-            for g in GRANULARITIES:
-                sub = xf[xf["date_granularity"] == g]
-                print(f"  {g:>9}: {len(sub):,} rows")
+    if args.dry_run:
+        from pyspark.sql import functions as F
+
+        result = result.persist()
+        LOGGER.info("Dry run — not writing. Summary:")
+        print()
+        counts = {
+            r["metric"]: r["rows"]
+            for r in result.groupBy("metric")
+            .agg(F.count(F.lit(1)).alias("rows"))
+            .collect()
+        }
+        for m in (METRIC_XFORCE, METRIC_SQUAD, METRIC_DISTRICT):
+            print(f"{m:>30}: {counts.get(m, 0):,} rows")
+
+        print("\nPer granularity (XForce roll-up):")
+        by_gran = {
+            r["date_granularity"]: r["rows"]
+            for r in result.filter(F.col("metric") == F.lit(METRIC_XFORCE))
+            .groupBy("date_granularity")
+            .agg(F.count(F.lit(1)).alias("rows"))
+            .collect()
+        }
+        for g in GRANULARITIES:
+            print(f"  {g:>9}: {by_gran.get(g, 0):,} rows")
+
+        stats = result.agg(
+            F.min("metric_value").alias("mv_min"),
+            F.max("metric_value").alias("mv_max"),
+            F.avg("metric_value").alias("mv_mean"),
+        ).collect()[0]
+        if stats["mv_min"] is not None:
             print(
-                f"\nTeams: {', '.join(sorted(result['team'].dropna().unique()))}"
+                f"\nmetric_value (%): min={stats['mv_min']:.1f}  "
+                f"max={stats['mv_max']:.1f}  mean={stats['mv_mean']:.1f}"
             )
-            if not result.empty:
-                mv = result["metric_value"].dropna()
-                print(
-                    f"metric_value (%): min={mv.min():.1f}  max={mv.max():.1f}  "
-                    f"mean={mv.mean():.1f}"
-                )
-            print("\nHead (XForce roll-up, month grain):")
-            print(
-                result[
-                    (result["metric"] == "nuvinhos_performance")
-                    & (result["date_granularity"] == "month")
-                ]
-                .head(10)
-                .to_string(index=False)
-            )
-            return 0
+        print("\nHead (XForce roll-up, month grain):")
+        result.filter(
+            (F.col("metric") == F.lit(METRIC_XFORCE))
+            & (F.col("date_granularity") == F.lit("month"))
+        ).show(10, truncate=False)
+        result.unpersist()
+        return 0
 
-        with _log_step(f"write {args.target}"):
-            run = publish(
-                conn,
-                result,
-                args.target,
-                IO_NUVINHOS_PERFORMANCE_METRIC_SCHEMA,
-                layer="metrics",
-                period_start=args.period_start,
-                period_end=args.period_end,
-                run_id=args.run_id,
-                snapshot=not args.no_snapshot,
-            )
-            LOGGER.info(
-                "  wrote %s rows to %s (run_id=%s)",
-                f"{run.row_count:,}", args.target, run.run_id,
-            )
-            if run.snapshot_table:
-                LOGGER.info("  snapshot -> %s", run.snapshot_table)
-    finally:
-        conn.close()
+    with _log_step(f"write {args.target}"):
+        run = publish(
+            spark,
+            result,
+            args.target,
+            IO_NUVINHOS_PERFORMANCE_METRIC_SCHEMA,
+            layer="metrics",
+            period_start=args.period_start,
+            period_end=args.period_end,
+            run_id=args.run_id,
+            snapshot=not args.no_snapshot,
+        )
+        LOGGER.info(
+            "  wrote %s rows to %s (run_id=%s)",
+            f"{run.row_count:,}", args.target, run.run_id,
+        )
+        if run.snapshot_table:
+            LOGGER.info("  snapshot -> %s", run.snapshot_table)
 
     return 0
 
