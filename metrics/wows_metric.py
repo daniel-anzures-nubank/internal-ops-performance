@@ -1,4 +1,4 @@
-"""wows — the WoWs performance metric (Social Media only).
+"""wows — the WoWs performance metric (Social Media only), PySpark.
 
 (Module file is ``wows_metric.py`` — not ``wows.py`` — because the raw-layer
 module is already ``metrics_data/wows.py``; the two share a name and would
@@ -13,13 +13,15 @@ an agent delivered in the period:
 
     wows = COUNT(DISTINCT case_id)
 
-**Monthly target ≥ 5.** Only **Social Media** has WoWs (the source sheet only
+**Monthly target >= 5.** Only **Social Media** has WoWs (the source sheet only
 contains social agents' WoWs — see ``docs/metrics_definitions.md``).
 
 Output convention (differs from the ratio metrics)
 --------------------------------------------------
 Because WoWs is a raw count, ``metric_value`` is the **count itself** (it is
-*not* ``numerator / denominator * 100``):
+*not* ``numerator / denominator * 100``), so this module does NOT use
+``aggregate_long`` (that sums + computes a ratio). It runs a small custom
+``countDistinct(case_id)`` aggregation per (agent, bucket) instead:
 * ``numerator``   = the WoW count (same as ``metric_value``);
 * ``denominator`` = the monthly target (``5``), carried for reference only
   (legacy ``MAX(monthly_target)``);
@@ -34,12 +36,14 @@ case_id``.
 Filters / rules applied here (deferred by the raw layer)
 --------------------------------------------------------
 * **Team scope** — keep ``team = 'social media'`` (defensive; source is social-only).
+* **Outage-date exclusion** — drop ``date = 2026-03-27`` for ``date < WOWS_CUTOVER``
+  (2026-07-01). Legacy DROPS the 2026-03-27 "general access problems" day for
+  WoWs (the legacy ``wows_agent`` day grain carries no 2026-03-27 row). The drop
+  happens on the raw rows BEFORE bucketing, so week/month/etc. counts exclude the
+  outage WoWs too (same idiom as ``metrics/tnps.py``). WoWs is SM-only, so only
+  03-27 is dropped (not the Core/Fraud 04-09). From the cutover onward the day is
+  kept (correction era).
 * **Count** — ``COUNT(DISTINCT case_id)`` per ``(agent, period)``.
-
-NOT applied here (future Adjustments layer)
--------------------------------------------
-* The outage-date exclusion ``date = 2026-03-27`` (legacy drops it for "general
-  access problems") — deferred to match the other metric modules.
 
 Output — one row per (agent, date_reference, granularity)
 ---------------------------------------------------------
@@ -49,12 +53,15 @@ date_granularity, metric, numerator, denominator, metric_value``.
 
 from __future__ import annotations
 
-import pandas as pd
+from datetime import date
+
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
 from metric_utils import (
     GRANULARITIES,
     METRIC_COLUMNS,
-    bucket_dates,
+    bucket_date,
     empty_metric_frame,
     latest_dims,
 )
@@ -67,30 +74,40 @@ WOWS_TEAM = "social media"
 # Monthly target (legacy ``monthly_target`` constant), carried in ``denominator``.
 MONTHLY_TARGET = 5
 
+# Cutover before which the legacy quirks (the outage-date drop) apply. From this
+# date onward the correction takes effect (the outage day is kept).
+WOWS_CUTOVER: date = date(2026, 7, 1)
 
-def _aggregate(work: pd.DataFrame, granularity: str) -> pd.DataFrame:
-    """One WoWs row per (agent, bucket) for a single granularity."""
-    work = work.copy()
-    work["_date"] = pd.to_datetime(work["date"])
-    if getattr(work["_date"].dt, "tz", None) is not None:
-        work["_date"] = work["_date"].dt.tz_localize(None)
-    work["date_reference"] = bucket_dates(work["_date"], granularity)
+# Legacy SM-only outage-date drop (general access problems). The legacy WoWs day
+# grain has no 2026-03-27 row at all. SM-only — the Core/Fraud 2026-04-09 outage
+# does not apply to the social WoWs source.
+OUTAGE_DATES: set[date] = {date(2026, 3, 27)}
 
-    sums = work.groupby(["agent", "date_reference"], as_index=False, dropna=False).agg(
-        numerator=("case_id", "nunique")
+
+def _aggregate(work: DataFrame, granularity: str) -> DataFrame:
+    """One WoWs row per (agent, bucket) for a single granularity.
+
+    ``countDistinct(case_id)`` within the bucket — NOT ``aggregate_long`` (which
+    sums + ratios). ``metric_value`` is the count itself.
+    """
+    work = work.withColumn("date_reference", bucket_date(F.col("date"), granularity))
+
+    counts = work.groupBy("agent", "date_reference").agg(
+        F.countDistinct("case_id").cast("double").alias("numerator")
     )
-    sums["numerator"] = sums["numerator"].astype("float64")
-    sums["denominator"] = float(MONTHLY_TARGET)
-    sums["metric_value"] = sums["numerator"]
+    latest = latest_dims(work, order_col="date")
 
-    out = sums.merge(latest_dims(work), on=["agent", "date_reference"], how="left")
-    out["date_granularity"] = granularity
-    out["metric"] = METRIC_NAME
-    out["date_reference"] = out["date_reference"].dt.date
-    return out[list(METRIC_COLUMNS)]
+    return (
+        counts.join(latest, on=["agent", "date_reference"], how="left")
+        .withColumn("date_granularity", F.lit(granularity))
+        .withColumn("metric", F.lit(METRIC_NAME))
+        .withColumn("denominator", F.lit(float(MONTHLY_TARGET)))
+        .withColumn("metric_value", F.col("numerator"))
+        .select(*METRIC_COLUMNS)
+    )
 
 
-def compute_wows(wows: pd.DataFrame) -> pd.DataFrame:
+def compute_wows(wows: DataFrame) -> DataFrame:
     """Compute the WoWs metric at all granularities.
 
     Args:
@@ -99,18 +116,25 @@ def compute_wows(wows: pd.DataFrame) -> pd.DataFrame:
     Returns:
         Tidy long-format metric rows (see module docstring / schema).
     """
-    if wows.empty:
-        return empty_metric_frame()
+    spark = wows.sparkSession
 
-    work = wows[wows["team"].astype("string").str.lower() == WOWS_TEAM].copy()
-    if work.empty:
-        return empty_metric_frame()
+    work = wows.filter(F.lower(F.col("team")) == F.lit(WOWS_TEAM))
+
+    # --- outage-date exclusion (pre-cutover, SM-only) -----------------------
+    # Drop the outage rows on the RAW grain, BEFORE bucketing, so the week /
+    # month / quarter / ... counts also exclude the outage WoWs (matches tnps).
+    cal = F.to_date(F.col("date"))
+    outage_drop = (cal < F.lit(WOWS_CUTOVER)) & cal.isin(list(OUTAGE_DATES))
+    work = work.filter(~outage_drop)
+
+    if len(work.take(1)) == 0:
+        return empty_metric_frame(spark)
 
     parts = [_aggregate(work, g) for g in GRANULARITIES]
-    result = pd.concat(parts, ignore_index=True)
-    return result.sort_values(
-        ["date_granularity", "date_reference", "agent"]
-    ).reset_index(drop=True)
+    result = parts[0]
+    for extra in parts[1:]:
+        result = result.unionByName(extra)
+    return result
 
 
 IO_WOWS_METRIC_SCHEMA: tuple[tuple[str, str], ...] = (

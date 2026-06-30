@@ -4,9 +4,11 @@ Metrics-layer script. Thin orchestrator — the math lives in
 ``metrics/wows_metric.py`` and is covered by
 ``tests/metrics/test_wows_metric.py``. Here we only:
 
-  1. Open a Databricks SQL connection (shared `db.open_connection`).
+  1. Get the ambient SparkSession (shared `db.open_connection`).
   2. Read the raw input table ``io_wows_raw`` for the period (via `db.read_table`).
-  3. Call ``compute_wows`` to get the metric rows at all granularities.
+  3. Call ``compute_wows`` to get the metric rows at all granularities
+     (team scope, the pre-cutover 2026-03-27 outage-date drop, the
+     COUNT(DISTINCT case_id) per agent/period).
   4. Either print a summary (`--dry-run`) or replace the target Delta table.
 
 WoWs only apply to **Social Media** and the metric is a **count** (not a ratio):
@@ -20,17 +22,18 @@ Tables
 
 Manual adjustments
 ------------------
-None applied here (no adjustments layer yet) — see `metrics/wows_metric.py` for
-the deferred outage-date carve-out (`2026-03-27`).
+None read from sheets. The pre-cutover 2026-03-27 outage-date exclusion is a
+hardcoded, cutover-gated constant applied inside ``compute_wows`` (legacy SM WoWs
+artifact, date < 2026-07-01).
 
 Usage
 -----
-::
+Runs on a Databricks cluster (``spark-submit`` / a Databricks job task)::
 
-    uv run python scripts/metrics_scripts/build_wows.py \\
+    python scripts/metrics_scripts/build_wows.py \\
         --period-start 2026-05-01 --period-end 2026-05-24 --dry-run
 
-    uv run python scripts/metrics_scripts/build_wows.py \\
+    python scripts/metrics_scripts/build_wows.py \\
         --period-start 2026-01-01 --period-end 2026-05-24
 """
 
@@ -43,13 +46,34 @@ import time
 from datetime import date
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Locate the repo root (contains `db.py` + `extractors/`) so the sibling
+# top-level modules import. We can't rely on `__file__`: Databricks runs a
+# git-sourced `spark_python_task` via `exec()` with no `__file__` set, so we
+# search upward from every path we can discover (file, argv, cwd).
+def _repo_root() -> Path:
+    starts: list[Path] = []
+    try:
+        starts.append(Path(__file__).resolve())
+    except NameError:
+        pass
+    if sys.argv and sys.argv[0]:
+        starts.append(Path(sys.argv[0]).resolve())
+    starts.append(Path.cwd().resolve())
+    for start in starts:
+        for cand in (start, *start.parents):
+            if (cand / "db.py").is_file() and (cand / "extractors").is_dir():
+                return cand
+    return Path.cwd()
+
+
+REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics"))
 
 from db import open_connection, read_table, publish  # noqa: E402
 from metric_utils import GRANULARITIES  # noqa: E402
-from wows_metric import IO_WOWS_METRIC_SCHEMA, compute_wows  # noqa: E402
+from wows_metric import IO_WOWS_METRIC_SCHEMA, MONTHLY_TARGET, compute_wows  # noqa: E402
 
 LOGGER = logging.getLogger("cx_metrics.wows")
 
@@ -117,57 +141,76 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
-    conn = open_connection()
-    try:
-        with _log_step(f"read {args.source}"):
-            wows = read_table(conn, args.source, args.period_start, args.period_end)
-            LOGGER.info("  %s raw WoW rows", f"{len(wows):,}")
+    spark = open_connection()
 
-        with _log_step("compute_wows"):
-            result = compute_wows(wows)
-            LOGGER.info("  %s metric rows", f"{len(result):,}")
+    with _log_step(f"read {args.source}"):
+        wows = read_table(spark, args.source, args.period_start, args.period_end)
 
-        expected_cols = [c for c, _ in IO_WOWS_METRIC_SCHEMA]
-        result = result[expected_cols]
+    with _log_step("compute_wows"):
+        result = compute_wows(wows)
 
-        if args.dry_run:
-            LOGGER.info("Dry run — not writing. Summary:")
-            print()
-            for g in GRANULARITIES:
-                sub = result[result["date_granularity"] == g]
-                print(f"{g:>9}: {len(sub):,} rows, {sub['agent'].nunique():,} agents")
-            print(f"\nAgents: {result['agent'].nunique():,}   "
-                  f"Teams: {', '.join(sorted(result['team'].dropna().unique()))}")
-            mon = result[result["date_granularity"] == "month"]
-            if not mon.empty:
-                mv = mon["metric_value"]
-                print(f"monthly WoWs/agent: min={mv.min():.0f}  "
-                      f"max={mv.max():.0f}  mean={mv.mean():.1f}  "
-                      f"% >= 5: {(mv >= 5).mean() * 100:.0f}%")
-            print("\nHead (month grain):")
-            print(mon.head(10).to_string(index=False))
-            return 0
+    if args.dry_run:
+        from pyspark.sql import functions as F
 
-        with _log_step(f"write {args.target}"):
-            run = publish(
-                conn,
-                result,
-                args.target,
-                IO_WOWS_METRIC_SCHEMA,
-                layer="metrics",
-                period_start=args.period_start,
-                period_end=args.period_end,
-                run_id=args.run_id,
-                snapshot=not args.no_snapshot,
+        result = result.persist()
+        LOGGER.info("Dry run — not writing. Summary:")
+        print()
+        by_gran = {
+            r["date_granularity"]: (r["rows"], r["agents"])
+            for r in result.groupBy("date_granularity")
+            .agg(
+                F.count(F.lit(1)).alias("rows"),
+                F.countDistinct("agent").alias("agents"),
             )
-            LOGGER.info(
-                "  wrote %s rows to %s (run_id=%s)",
-                f"{run.row_count:,}", args.target, run.run_id,
+            .collect()
+        }
+        for g in GRANULARITIES:
+            rows, agents = by_gran.get(g, (0, 0))
+            print(f"{g:>9}: {rows:,} rows, {agents:,} agents")
+        teams = sorted(
+            r["team"]
+            for r in result.select("team").distinct().collect()
+            if r["team"] is not None
+        )
+        stats = result.agg(F.countDistinct("agent").alias("agents")).collect()[0]
+        print(f"\nAgents: {stats['agents']:,}   Teams: {', '.join(teams)}")
+        mon = result.filter(F.col("date_granularity") == "month")
+        if len(mon.take(1)) > 0:
+            mv = mon.agg(
+                F.min("metric_value").alias("mv_min"),
+                F.max("metric_value").alias("mv_max"),
+                F.avg("metric_value").alias("mv_mean"),
+                F.avg((F.col("metric_value") >= F.lit(MONTHLY_TARGET)).cast("double"))
+                .alias("pct_target"),
+            ).collect()[0]
+            print(
+                f"monthly WoWs/agent: min={mv['mv_min']:.0f}  "
+                f"max={mv['mv_max']:.0f}  mean={mv['mv_mean']:.1f}  "
+                f"% >= {MONTHLY_TARGET}: {mv['pct_target'] * 100:.0f}%"
             )
-            if run.snapshot_table:
-                LOGGER.info("  snapshot -> %s", run.snapshot_table)
-    finally:
-        conn.close()
+        print("\nHead (month grain):")
+        mon.show(10, truncate=False)
+        result.unpersist()
+        return 0
+
+    with _log_step(f"write {args.target}"):
+        run = publish(
+            spark,
+            result,
+            args.target,
+            IO_WOWS_METRIC_SCHEMA,
+            layer="metrics",
+            period_start=args.period_start,
+            period_end=args.period_end,
+            run_id=args.run_id,
+            snapshot=not args.no_snapshot,
+        )
+        LOGGER.info(
+            "  wrote %s rows to %s (run_id=%s)",
+            f"{run.row_count:,}", args.target, run.run_id,
+        )
+        if run.snapshot_table:
+            LOGGER.info("  snapshot -> %s", run.snapshot_table)
 
     return 0
 
