@@ -679,12 +679,60 @@ with that work, since both target the same months.
 
 ---
 
+## Nuvinhos Performance — `io_nuvinhos_performance_metric` vs `nuvinhos_performance*` in `internal_ops_performance_2026` (main XForce) + `_sd` (main squad/district) + `_social_media` + `_content`
+
+**Status:** shipped (logic-correct; SM + Content at parity, main bounded by
+xpeer_index). The ratio of the **new-hire (nuvinho) cohort** Xpeer Index to the
+**tenured (old)** cohort, per XForce/squad/district. Reads `io_xpeer_index_metric`
++ the `agent_information` tenure extractor, so its parity is bounded by the agent
+Xpeer Index.
+
+**Three metric names:** `nuvinhos_performance` (XForce), `nuvinhos_performance_squad`,
+`nuvinhos_performance_district`. The main-deck **squad/district** rollups are
+S&D-derived (over the merged Core+Fraud universe, ELSE 0) and live in legacy
+`_sd` keyed by `squad`/`squad_district` (new `district` ↔ legacy `squad_district`);
+SM/Content also emit squad/district (degenerate NULL-key for those decks).
+
+**Legacy-faithful logic:** two-level aggregation (inner `AVG` per
+`(deck, xforce, xplead, squad, district, date, gran, nuvinho)` cohort → outer
+`AVG` per rollup key); per-deck ELSE NULL (main XForce, Content) vs ELSE 0 (main
+squad/district, SM); Content XForce single-level + degenerate squad/district;
+**deck grouping not team**; week+month + `>= 2025-12-01` floor pre-cutover.
+
+**Parity (week + month, ≤ 2026-06-15, legacy-anchored):**
+| Deck / grain | coverage | non-null avg abs diff | notes |
+| --- | --- | --- | --- |
+| social media (XForce) | 65/65 | **0.0** | at parity (within-2 92%) |
+| content (XForce) | 25/26 | **0.0** | degenerate all-NULL (no nuvinho cohort), matches |
+| main XForce | 1071/1152 (93%) | **1.72** | most covered rows both-NULL (agree); bounded by xpeer_index |
+| main squad (vs `_sd`) | 152/198 (77%) | **0.50** | covered values match |
+| main district (vs `_sd`) | 316/414 (76%) | **0.68** | new produces 20/22 districts |
+
+### Divergences
+| Divergence | Cause | Class |
+| --- | --- | --- |
+| main XForce non-null off ~1.7 + 7% only_legacy | the ratio amplifies small `io_xpeer_index_metric` early-month diffs; same xplead coverage residual as `xpeers_in_target` | by-design / open |
+| main squad/district ~23% only_legacy | missing districts `content` (inherits the **deferred** xpeer_index Content base gap), `occ`, `training` (small support districts) + some date coverage; covered values match | open (deferred / minor) |
+| Content all-NULL | Content tenure has no `last_change_date` → everyone tenured → numerator NULL (matches legacy's never-matching `valid_from` window) | by-design |
+
+### Verdict
+**Shipped (logic-correct).** SM and Content XForce are at parity; the two-level
+aggregation, per-deck ELSE NULL/0, and S&D-derived real-key squad/district
+rollups all reproduce legacy (covered values match across every deck/grain). The
+main-deck residuals trace to the deferred `io_xpeer_index_metric` Content base
+gap (the missing `content` district) and the same xplead coverage nuance as
+`xpeers_in_target`; no logic error.
+
+---
+
 ## Other metrics — not yet parity-checked
 
-The remaining composites (XForce Index, Average XForce Index, Improved
-Benchmarks, Nuvinhos Performance) are **not** validated against legacy in this
-doc yet. (Improved Benchmarks is ported + logic-fixed on a branch but deferred —
-it needs 2025 `io_jobs_raw` history + a real `ntpj_xforce` rollup; it feeds
-XForce Index, so both wait.) Check for the same phantom-adherence cutover,
-meeting/leave filter, and DIME-squad filter as Adherence / Normalized Occupancy /
-NTPJ before assuming parity, plus the week+month-only restriction.
+The remaining composites (**XForce Index**, **Average XForce Index**, **Improved
+Benchmarks**) are **not** validated against legacy yet. Improved Benchmarks is
+ported + logic-fixed on a branch but deferred — it needs 2025 `io_jobs_raw`
+history + a real `ntpj_xforce` rollup. XForce Index and Average XForce Index are
+**ported** (PySpark, unit-tested) on branches `port/xforce-index-pyspark` and
+`port/average-xforce-index-pyspark`, but their cluster parity is blocked on
+Improved Benchmarks (the 4th XForce-Index component) — validate + merge once that
+base lands. Check for the same phantom-adherence cutover, meeting/leave filter,
+and DIME-squad filter as the base metrics, plus the week+month-only restriction.
