@@ -1,52 +1,81 @@
-"""improved_benchmarks — the Improved Benchmarks metric (Core / Fraud only).
+"""improved_benchmarks — the Improved Benchmarks metric (Core / Fraud only), PySpark.
 
 Part of the **metrics layer**, but structurally different from the agent-grain
-metrics: Improved Benchmarks is a **squad-level and district-level** roll-up of
-*month-over-month benchmark improvements*. It answers "what share of this
-squad's / district's benchmarks improved vs. the previous month?".
+metrics: Improved Benchmarks is a **squad-level, district-level and XForce-level**
+roll-up of *month-over-month benchmark improvements*. It answers "what share of
+this squad's / district's / XForce's benchmarks improved vs. the previous month?".
 
     improved_benchmarks = COUNT(improved benchmarks) / COUNT(comparable benchmarks)
 
-**Target ≥ 60%.** Output is **month grain only** (benchmarks are monthly).
+**Target >= 60%.** Output is **month grain only** (benchmarks are monthly; legacy
+``improved_benchmark_final`` also emits the week grain, but the new pipeline only
+materializes the month grain — the XForce roll-up that ``xforce_index`` consumes
+is month-only).
 
 Two benchmark families are compared (matches legacy
-`[IO] Performance 2026 - S&D.sql`):
+``[IO] Performance 2026.sql`` + ``[IO] Performance 2026 - S&D.sql``):
 
 * **NTPJ benchmark** — per ``job_id`` (job type): the monthly
   ``exp_duration_job`` (cohort-wide expected seconds, with the NTPJ trailing-
-  window rule). **"Improved" = benchmark ≤ previous month** (faster is better).
+  window rule). **"Improved" = benchmark <= previous month** (faster is better).
 * **Occupancy benchmark** — per ``district + shift``: the monthly NO benchmark
-  (mean of squad occupancy ratios). **"Improved" = benchmark ≥ previous month**
-  (higher occupancy is better). Only from ``2026-02-01`` onward.
+  (mean of squad occupancy ratios). **"Improved" = benchmark >= previous month**
+  (higher occupancy is better). Only from ``2026-03-01`` onward (the legacy
+  occupancy source ``normalized_occupancy_final`` is filtered ``date >=
+  '2026-03-01'`` — there is no February occupancy benchmark, so February cannot
+  become March's previous-month comparator).
+
+Both benchmarks are ``ROUND(..., 5)`` before the month-over-month LAG/compare
+(legacy ``ntpj_benchmark_agg`` / ``occupancy_benchmark`` round to 5 decimals
+before comparing to the previous month, so near-ties cannot flip).
 
 Ties ("stayed the same") count as **improved**. A benchmark's first month (no
 previous month to compare) is **not counted** (numerator or denominator).
 
-Benchmark units are formed per ``(benchmark_key, xforce, month)`` — the set of
-job types / district-shifts that an XForce's agents worked — then rolled up:
-* ``improved_benchmark_squad``    — summed over the XForces in each squad;
-* ``improved_benchmark_district`` — summed over the XForces in each district;
-* ``improved_benchmark_xforce``   — summed over the benchmark units of each
-  XForce (legacy ``improved_benchmark``). This XForce roll-up is what the
-  composite ``xforce_index`` metric consumes.
+Benchmark units carry the agent's ``(xforce, xplead, squad, district)`` directly
+(legacy ``ntpj_benchmark`` / ``occupancy_benchmark`` carry squad/squad_district
+per agent), so a single ``job_id`` can split across multiple squad/district rows.
+They are then rolled up:
+
+* ``improved_benchmark_squad``    — summed (COUNT DISTINCT job_id) per squad;
+* ``improved_benchmark_district`` — summed per district;
+* ``improved_benchmark_xforce``   — summed per ``(xforce, xplead)`` (legacy
+  ``improved_benchmark``; squad/district NULL). This XForce roll-up is what the
+  composite ``xforce_index`` metric consumes (it keys on the metric name
+  ``improved_benchmark_xforce``).
+
+XForce gating (legacy ``improved_benchmark_monthly`` / ``_weekly``)
+-------------------------------------------------------------------
+The XForce roll-up gates to ``date_reference < 2026-05-01`` (flat, for ALL
+teams) PLUS ``NOT (xplead == 'david.fernandez' AND date_reference >=
+2026-04-01)``. There is **no per-team Core/Fraud removal cutover** — non-david
+Core April-2026 xforces survive (4-component for ``xforce_index``).
+
+The squad / district roll-ups (legacy ``improved_benchmark_squad_monthly`` /
+``_district_monthly``, S&D deck) have **NO month gate and NO team cutover** —
+they emit every benchmark month present (pre-cutover).
+
+ntpj_xforce LEFT-JOIN gating
+----------------------------
+Legacy ``improved_benchmark_final`` is driven by the ``ntpj_xforce`` output rows
+(``FROM ntpj_xforces`` / ``internal_ops_performance_2026 WHERE
+metric='ntpj_xforce'`` LEFT JOIN the benchmark units on ``month + xforce``), so a
+benchmark unit for an ``(xforce, month)`` that has **no** ``ntpj_xforce`` output
+row that month is dropped — this changes squad/district AND xforce denominators.
+An ``ntpj_xforce`` row exists for an ``(xforce, month)`` iff at least one of that
+xforce's agents produced an NTPJ agent row that month — i.e. a finished,
+required-activity, **active-roster** job. We reproduce that gate from
+``jobs_raw`` (no separate ``ntpj_xforce`` table is passed in).
 
 Scope (per the SOT + product guidance)
 ---------------------------------------
 * **Core / Fraud only** — Social Media and Content never had Improved Benchmarks.
-* **Removed from each team after its cutover**: Core from **2026-04**, Fraud from
-  **2026-05** (months ≥ the cutover are not emitted).
 
 Inputs
 ------
 * ``io_jobs_raw`` (NTPJ benchmark) — needs a benchmark look-back before the
   output period (the build script reads ~6 extra months).
 * ``io_occupancy_time_raw`` (occupancy benchmark) — needs ~2 extra months.
-
-NOT applied here (future Adjustments layer)
--------------------------------------------
-* Everything the NTPJ / NO raw layers defer (cross-support exclusions, per-agent
-  carve-outs, outage dates, DIME-squad exclusions). Improved Benchmarks inherits
-  whatever those benchmarks are.
 
 Output — tidy long format (squad / district / xforce rows)
 -----------------------------------------------------------
@@ -62,10 +91,16 @@ from __future__ import annotations
 
 from datetime import date
 
-import pandas as pd
+from pyspark.sql import Column, DataFrame, Window
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
 
 from metric_utils import METRIC_COLUMNS, empty_metric_frame
-from ntpj import FINISHED_STATUS, _expected_duration_by_month
+from ntpj import (
+    ACTIVE_ROSTER_STATUS,
+    FINISHED_STATUS,
+    _expected_duration_by_month,
+)
 from adjustments.manual import (
     drop_cross_support_jobs,
     drop_excluded_jobs,
@@ -80,176 +115,295 @@ XFORCE_METRIC = "improved_benchmark_xforce"
 # Improved Benchmarks only ever applied to Core and Fraud.
 IMPROVED_BENCHMARKS_TEAMS: tuple[str, ...] = ("core", "fraud")
 
-# First month each team no longer emits Improved Benchmarks (removed from then on).
-TEAM_REMOVAL_MONTH: dict[str, pd.Period] = {
-    "core": pd.Period("2026-04", freq="M"),
-    "fraud": pd.Period("2026-05", freq="M"),
-}
+# XForce roll-up gating (legacy improved_benchmark_monthly / _weekly):
+#  * flat upper bound for ALL teams;
+#  * plus the david.fernandez Apr-2026 carve-out.
+# NOTE: this gate applies ONLY to the xforce roll-up. The squad / district
+# roll-ups have NO month gate and NO team cutover (legacy S&D deck).
+XFORCE_REMOVAL_MONTH: date = date(2026, 5, 1)
+DAVID_XPLEAD = "david.fernandez"
+DAVID_REMOVAL_MONTH: date = date(2026, 4, 1)
 
-# Occupancy benchmark only exists from this month (legacy `WHERE date >= '2026-02-01'`).
-OCCUPANCY_BENCHMARK_START_MONTH = pd.Period("2026-02", freq="M")
+# Occupancy benchmark only exists from this month. The legacy occupancy source
+# (normalized_occupancy_final, filtered date >= '2026-03-01') has NO February
+# data, so the earliest occupancy benchmark month is March 2026 — February must
+# not become March's previous-month comparator via the LAG.
+OCCUPANCY_BENCHMARK_START_MONTH: date = date(2026, 3, 1)
 
 # Non-productive slots excluded from the occupancy benchmark (same as NO).
 NO_EXCLUDED_ACTIVITY_TYPES: tuple[str, ...] = ("lunch_break", "time_off", "shrinkage")
 
+# Decimals the legacy rounds the benchmark to before the LAG/compare.
+BENCHMARK_ROUND_DECIMALS = 5
 
-def _to_month(series: pd.Series) -> pd.Series:
-    d = pd.to_datetime(series)
-    if getattr(d.dt, "tz", None) is not None:
-        d = d.dt.tz_localize(None)
-    return d.dt.to_period("M")
+# The columns of a benchmark-unit frame (one row per benchmark key per
+# (xforce, xplead, month, squad, district), with improved / counted flags).
+_UNIT_COLS: tuple[str, ...] = (
+    "key", "xforce", "xplead", "month", "team", "squad", "district",
+    "improved", "counted",
+)
 
 
-def _xforce_dims(df: pd.DataFrame) -> pd.DataFrame:
-    """Most-common ``(team, squad, district, xplead)`` per ``(xforce, month)``."""
-    g = (
-        df.groupby(
-            ["xforce", "month", "team", "squad", "district", "xplead"], dropna=False
-        )
-        .size()
-        .reset_index(name="_n")
+def _empty_units(spark) -> DataFrame:
+    schema = T.StructType(
+        [
+            T.StructField("key", T.StringType()),
+            T.StructField("xforce", T.StringType()),
+            T.StructField("xplead", T.StringType()),
+            T.StructField("month", T.DateType()),
+            T.StructField("team", T.StringType()),
+            T.StructField("squad", T.StringType()),
+            T.StructField("district", T.StringType()),
+            T.StructField("improved", T.LongType()),
+            T.StructField("counted", T.LongType()),
+        ]
     )
-    g = g.sort_values("_n").groupby(["xforce", "month"], as_index=False).tail(1)
-    return g[["xforce", "month", "team", "squad", "district", "xplead"]]
+    return spark.createDataFrame([], schema)
 
 
-def _ntpj_benchmark_units(jobs_raw: pd.DataFrame) -> pd.DataFrame:
-    """Per ``(job_id, xforce, month)`` NTPJ benchmark + improvement flag."""
-    finished = jobs_raw[
-        jobs_raw["status"].astype("string").str.lower() == FINISHED_STATUS
-    ].copy()
-    if finished.empty:
-        return _empty_units()
-    finished["month"] = _to_month(finished["date"])
+def _flag_improved(units: DataFrame, *, direction: str) -> DataFrame:
+    """Add ``improved`` / ``counted`` via month-over-month LAG within (key, xforce).
 
-    monthly_totals = finished.groupby(["job_id", "month"], as_index=False).agg(
-        tot_duration=("duration_seconds", "sum"),
-        tot_count=("job_id", "size"),
+    ``units`` carries ``key, xforce, xplead, month, team, squad, district,
+    benchmark``. The benchmark is rounded to :data:`BENCHMARK_ROUND_DECIMALS`
+    before the LAG/compare (legacy parity). Ties count as improved; the first
+    month (NULL previous) is neither improved nor counted.
+    """
+    bench = F.round(F.col("benchmark"), BENCHMARK_ROUND_DECIMALS)
+    # LAG partition is (key, xforce) ORDER BY month — matches legacy
+    # `PARTITION BY job_id, xforce ORDER BY benchmark_month`. The rows carry
+    # squad/district but the partition deliberately does not (legacy parity).
+    w = Window.partitionBy("key", "xforce").orderBy("month")
+    prev = F.lag(bench).over(w)
+
+    if direction == "lower":
+        improved = bench <= prev
+    else:
+        improved = bench >= prev
+
+    counted = prev.isNotNull()
+    return units.select(
+        "key",
+        "xforce",
+        "xplead",
+        "month",
+        "team",
+        "squad",
+        "district",
+        (improved & counted).cast("long").alias("improved"),
+        counted.cast("long").alias("counted"),
+    )
+
+
+def _ntpj_benchmark_units(jobs: DataFrame) -> DataFrame:
+    """Per ``(job_id, xforce, xplead, month, squad, district)`` NTPJ benchmark + flag."""
+    spark = jobs.sparkSession
+    finished = jobs.filter(
+        F.lower(F.col("status")) == F.lit(FINISHED_STATUS)
+    ).withColumn("month", F.trunc(F.to_date(F.col("date")), "month"))
+
+    if len(finished.take(1)) == 0:
+        return _empty_units(spark)
+
+    # Benchmark from ALL finished jobs of that job_id, windowed by month (legacy
+    # NTPJ trailing-window rule), reusing ntpj._expected_duration_by_month.
+    monthly_totals = finished.groupBy("job_id", "month").agg(
+        F.sum("duration_seconds").alias("tot_duration"),
+        F.count(F.lit(1)).alias("tot_count"),
     )
     expected = _expected_duration_by_month(monthly_totals)  # job_id, month, exp_duration_job
 
-    contrib = finished[finished["required_activity_on_day_flag"] == 1]
-    if contrib.empty:
-        return _empty_units()
+    # The benchmark units (squad/district splitting): one row per
+    # (job_id, xforce, xplead, month, squad, district), carrying the agent's
+    # roster attribution. Legacy ntpj_benchmark joins normalized_time_per_job to
+    # agent_information per-agent, then GROUP BY ALL averages exp_duration_job;
+    # here every job already carries its agent's squad/district, so we take the
+    # distinct attribution keys per (job_id, month) and attach the shared
+    # per-job_id benchmark. The agent's contribution rows are required-activity
+    # only (legacy required_hours IS NOT NULL).
+    contrib = finished.filter(F.col("required_activity_on_day_flag") == F.lit(1))
+    if len(contrib.take(1)) == 0:
+        return _empty_units(spark)
 
-    keys = contrib[["job_id", "xforce", "month"]].drop_duplicates()
-    keys = keys.merge(expected, on=["job_id", "month"], how="inner")
-    keys = keys.merge(_xforce_dims(contrib), on=["xforce", "month"], how="left")
-    keys = keys.rename(columns={"job_id": "key", "exp_duration_job": "benchmark"})
-    return _flag_improved(keys, direction="lower")
+    keys = contrib.select(
+        F.col("job_id"),
+        "xforce",
+        "xplead",
+        "month",
+        F.lower(F.col("team")).alias("team"),
+        "squad",
+        "district",
+    ).distinct()
+
+    units = keys.join(
+        expected.select("job_id", "month", "exp_duration_job"),
+        on=["job_id", "month"],
+        how="inner",
+    ).select(
+        F.col("job_id").alias("key"),
+        "xforce",
+        "xplead",
+        "month",
+        "team",
+        "squad",
+        "district",
+        F.col("exp_duration_job").alias("benchmark"),
+    )
+    return _flag_improved(units, direction="lower")
 
 
-def _occupancy_benchmark_units(occupancy_time: pd.DataFrame) -> pd.DataFrame:
-    """Per ``(district-shift, xforce, month)`` occupancy benchmark + flag."""
-    act = occupancy_time["activity_type_required"].astype("string").str.lower()
-    productive = occupancy_time.loc[~act.isin(NO_EXCLUDED_ACTIVITY_TYPES)].copy()
-    if productive.empty:
-        return _empty_units()
-    productive["month"] = _to_month(productive["date"])
-    productive = productive[productive["month"] >= OCCUPANCY_BENCHMARK_START_MONTH]
-    if productive.empty:
-        return _empty_units()
+def _occupancy_benchmark_units(occ: DataFrame) -> DataFrame:
+    """Per ``(district-shift, xforce, xplead, month, squad, district)`` occupancy benchmark + flag."""
+    spark = occ.sparkSession
+    act = F.lower(F.col("activity_type_required"))
+    productive = (
+        occ.filter(~act.isin(list(NO_EXCLUDED_ACTIVITY_TYPES)))
+        .withColumn("month", F.trunc(F.to_date(F.col("date")), "month"))
+        .filter(F.col("month") >= F.lit(OCCUPANCY_BENCHMARK_START_MONTH))
+    )
+    if len(productive.take(1)) == 0:
+        return _empty_units(spark)
 
     # NO benchmark: mean of squad occupancy ratios per (month, district, shift).
-    squad = productive.groupby(
-        ["month", "district", "shift", "squad"], as_index=False, dropna=False
-    ).agg(occ=("occupancy_minutes", "sum"), req=("required_minutes", "sum"))
-    squad["ratio"] = (squad["occ"] / squad["req"]).where(squad["req"] > 0)
-    bench = squad.groupby(
-        ["month", "district", "shift"], as_index=False, dropna=False
-    ).agg(benchmark=("ratio", "mean"))
-
-    keys = productive[["district", "shift", "xforce", "month"]].drop_duplicates()
-    keys["key"] = (
-        keys["district"].astype("string") + " - " + keys["shift"].astype("string")
+    squad = productive.groupBy("month", "district", "shift", "squad").agg(
+        F.sum("occupancy_minutes").alias("occ"),
+        F.sum("required_minutes").alias("req"),
     )
-    keys = keys.merge(bench, on=["month", "district", "shift"], how="inner")
-    # The slot's own district == the xforce's district; take team/squad from the
-    # xforce dims (drop its district to avoid colliding with the key's district).
-    dims = _xforce_dims(productive)[["xforce", "month", "team", "squad", "xplead"]]
-    keys = keys.merge(dims, on=["xforce", "month"], how="left")
-    keys = keys[
-        ["key", "xforce", "xplead", "month", "benchmark", "team", "squad", "district"]
-    ]
-    return _flag_improved(keys, direction="higher")
-
-
-def _flag_improved(units: pd.DataFrame, *, direction: str) -> pd.DataFrame:
-    """Add ``improved`` / ``counted`` via month-over-month LAG within (key, xforce)."""
-    units = units.sort_values(["key", "xforce", "month"]).copy()
-    units["_prev"] = units.groupby(["key", "xforce"], dropna=False)["benchmark"].shift(1)
-    if direction == "lower":
-        improved = units["benchmark"] <= units["_prev"]
-    else:
-        improved = units["benchmark"] >= units["_prev"]
-    units["counted"] = units["_prev"].notna().astype("int64")
-    units["improved"] = (improved & units["_prev"].notna()).astype("int64")
-    return units[
-        ["key", "xforce", "xplead", "month", "team", "squad", "district",
-         "improved", "counted"]
-    ]
-
-
-def _empty_units() -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            c: pd.Series(dtype="object")
-            for c in (
-                "key", "xforce", "xplead", "month", "team", "squad", "district",
-                "improved", "counted",
-            )
-        }
+    squad = squad.withColumn(
+        "ratio",
+        F.when(F.col("req") > 0, F.col("occ") / F.col("req")).otherwise(
+            F.lit(None).cast("double")
+        ),
+    )
+    bench = squad.groupBy("month", "district", "shift").agg(
+        F.avg("ratio").alias("benchmark")
     )
 
+    # Benchmark units carry the agent's roster attribution (legacy occupancy_benchmark
+    # carries squad/squad_district/shift per agent). The unit key is the slot's
+    # district-shift; the benchmark value comes from the (month, district, shift) mean.
+    keys = productive.select(
+        F.concat_ws(" - ", F.col("district"), F.col("shift")).alias("key"),
+        "xforce",
+        "xplead",
+        "month",
+        F.lower(F.col("team")).alias("team"),
+        "squad",
+        "district",
+        "shift",
+    ).distinct()
 
-def _rollup(units: pd.DataFrame, *, level: str, metric_name: str) -> pd.DataFrame:
-    """Sum improved / counted per ``(team, <level>, month)`` into metric rows.
+    units = keys.join(
+        bench, on=["month", "district", "shift"], how="inner"
+    ).select(
+        "key",
+        "xforce",
+        "xplead",
+        "month",
+        "team",
+        "squad",
+        "district",
+        "benchmark",
+    )
+    return _flag_improved(units, direction="higher")
 
-    ``level`` is ``squad`` / ``district`` (key sets that column, ``xforce`` /
-    ``xplead`` NULL) or ``xforce`` (sets ``xforce`` + ``xplead``, squad/district
-    NULL — legacy ``improved_benchmark``).
+
+def _ntpj_xforce_months(jobs: DataFrame) -> DataFrame:
+    """The ``(xforce, month)`` pairs that have an ``ntpj_xforce`` output row.
+
+    An ``ntpj_xforce`` row exists for an ``(xforce, month)`` iff at least one of
+    that xforce's agents produced an NTPJ agent row that month — i.e. a finished,
+    required-activity, **active-roster** job. Legacy ``improved_benchmark_final``
+    LEFT-JOINs the benchmark units onto these rows, dropping any unit for an
+    ``(xforce, month)`` with no ``ntpj_xforce`` row (Fix #5).
+
+    Returns a frame of distinct ``(xforce, month)``.
     """
-    if level == "xforce":
-        keys = ["team", "xforce", "xplead", "month"]
-        key_col = "xforce"
+    return (
+        jobs.filter(
+            (F.lower(F.col("status")) == F.lit(FINISHED_STATUS))
+            & (F.col("required_activity_on_day_flag") == F.lit(1))
+            & (F.lower(F.col("roster_status")) == F.lit(ACTIVE_ROSTER_STATUS))
+        )
+        .withColumn("month", F.trunc(F.to_date(F.col("date")), "month"))
+        .select("xforce", "month")
+        .distinct()
+    )
+
+
+def _rollup(units: DataFrame, *, level: str, metric_name: str) -> DataFrame:
+    """Sum improved / counted per ``(<level>, month)`` into metric rows.
+
+    ``level`` is ``squad`` / ``district`` (key sets that column; ``xforce`` /
+    ``xplead`` / ``team`` NULL — legacy squad/district views carry no team) or
+    ``xforce`` (sets ``xforce`` + ``xplead``, squad/district NULL — legacy
+    ``improved_benchmark``).
+
+    Legacy counts ``COUNT(DISTINCT job_id)``; the unit rows are already unique
+    per ``(key, xforce, month, squad, district)``, but a job_id can appear under
+    two xforces, so we count distinct ``(key, xforce)`` of the improved / counted
+    units to stay exactly faithful.
+    """
+    # Count DISTINCT (key, xforce) of the improved / counted units (legacy
+    # COUNT(DISTINCT job_id), but a job_id can recur across xforces so we pair it
+    # with xforce). A NULL key (non-improved / non-counted) is ignored by
+    # countDistinct, so the masked keys behave like the legacy CASE-WHEN.
+    improved_key = F.when(F.col("improved") == F.lit(1), F.col("key"))
+    counted_key = F.when(F.col("counted") == F.lit(1), F.col("key"))
+
+    is_xforce = level == "xforce"
+    if is_xforce:
+        grp = units.groupBy("xforce", "xplead", "month").agg(
+            F.countDistinct(improved_key, F.col("xforce")).alias("numerator"),
+            F.countDistinct(counted_key, F.col("xforce")).alias("denominator"),
+        )
     else:
-        keys = ["team", level, "month"]
-        key_col = level
-    grp = units.groupby(keys, as_index=False, dropna=False).agg(
-        numerator=("improved", "sum"), denominator=("counted", "sum")
+        grp = (
+            units.groupBy(level, "month")
+            .agg(
+                F.countDistinct(improved_key, F.col("xforce")).alias("numerator"),
+                F.countDistinct(counted_key, F.col("xforce")).alias("denominator"),
+            )
+            .filter(F.col(level).isNotNull())
+        )
+
+    null_str = F.lit(None).cast("string")
+    out = grp.select(
+        F.lit(None).cast("string").alias("agent"),
+        (F.col("xforce") if is_xforce else null_str).alias("xforce"),
+        (F.col("xplead") if is_xforce else null_str).alias("xplead"),
+        null_str.alias("team"),
+        (F.col(level) if level == "squad" else null_str).alias("squad"),
+        (F.col(level) if level == "district" else null_str).alias("district"),
+        null_str.alias("shift"),
+        F.col("month").alias("date_reference"),
+        F.lit("month").alias("date_granularity"),
+        F.lit(metric_name).alias("metric"),
+        F.col("numerator").cast("double").alias("numerator"),
+        F.col("denominator").cast("double").alias("denominator"),
     )
-    grp = grp[grp[key_col].notna()].copy()
-    out = pd.DataFrame(index=grp.index)
-    out["agent"] = None
-    out["xforce"] = grp["xforce"].values if level == "xforce" else None
-    out["xplead"] = grp["xplead"].values if level == "xforce" else None
-    out["team"] = grp["team"].values
-    out["squad"] = grp[level].values if level == "squad" else None
-    out["district"] = grp[level].values if level == "district" else None
-    out["shift"] = None
-    out["date_reference"] = grp["month"].apply(lambda m: m.to_timestamp().date()).values
-    out["date_granularity"] = "month"
-    out["metric"] = metric_name
-    out["numerator"] = grp["numerator"].astype("float64").values
-    out["denominator"] = grp["denominator"].astype("float64").values
-    out["metric_value"] = (
-        (out["numerator"] / out["denominator"]).where(out["denominator"] > 0) * 100
+    out = out.withColumn(
+        "metric_value",
+        F.when(
+            F.col("denominator") > 0,
+            F.col("numerator") / F.col("denominator") * F.lit(100.0),
+        ).otherwise(F.lit(None).cast("double")),
     )
-    return out[list(METRIC_COLUMNS)]
+    return out.select(*METRIC_COLUMNS)
 
 
 def compute_improved_benchmarks(
-    jobs_raw: pd.DataFrame,
-    occupancy_time: pd.DataFrame,
+    jobs_raw: DataFrame,
+    occupancy_time: DataFrame,
     period_start: date,
     period_end: date,
     *,
-    general_exclusions: pd.DataFrame | None = None,
-    dime_inconsistencies: pd.DataFrame | None = None,
-    cross_support: pd.DataFrame | None = None,
-    job_exclusions: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    """Compute Improved Benchmarks (squad + district, month grain, Core/Fraud).
+    general_exclusions: DataFrame | None = None,
+    dime_inconsistencies: DataFrame | None = None,
+    cross_support: DataFrame | None = None,
+    job_exclusions: DataFrame | None = None,
+) -> DataFrame:
+    """Compute Improved Benchmarks (squad + district + xforce, month grain, Core/Fraud).
 
     Args:
         jobs_raw: ``io_jobs_raw`` incl. a benchmark look-back before period_start.
@@ -258,68 +412,99 @@ def compute_improved_benchmarks(
             rows are used only for benchmarks / the previous-month comparison.
 
     Returns:
-        Tidy long-format metric rows (squad + district), month grain.
+        Tidy long-format metric rows (squad + district + xforce), month grain.
     """
-    if jobs_raw.empty and occupancy_time.empty:
-        return empty_metric_frame()
+    spark = jobs_raw.sparkSession
 
-    jobs_source = jobs_raw.copy()
-    if not jobs_source.empty and "start_time" in jobs_source.columns:
-        jobs_source["slot_time"] = pd.to_datetime(jobs_source["start_time"]).dt.strftime(
-            "%H:%M:%S"
+    jobs_empty = len(jobs_raw.take(1)) == 0
+    occ_empty = len(occupancy_time.take(1)) == 0
+    if jobs_empty and occ_empty:
+        return empty_metric_frame(spark)
+
+    # --- manual adjustments (mirror the pandas / NTPJ path) -----------------
+    jobs_source = jobs_raw
+    if not jobs_empty:
+        jobs_source = jobs_raw.withColumn(
+            "slot_time", F.date_format(F.col("start_time"), "HH:mm:ss")
         )
-        jobs_source = drop_slot_windows(jobs_source, general_exclusions).drop(
-            columns=["slot_time"], errors="ignore"
-        )
-    if not jobs_source.empty:
+        jobs_source = drop_slot_windows(jobs_source, general_exclusions)
         jobs_source = drop_cross_support_jobs(jobs_source, cross_support)
         jobs_source = drop_excluded_jobs(jobs_source, job_exclusions)
+        jobs_source = jobs_source.drop("slot_time")
 
-    occ_source = reclassify_dime_slots(occupancy_time, dime_inconsistencies)
-    occ_source = drop_slot_windows(occ_source, general_exclusions)
+    occ_source = occupancy_time
+    if not occ_empty:
+        occ_source = reclassify_dime_slots(occupancy_time, dime_inconsistencies)
+        occ_source = drop_slot_windows(occ_source, general_exclusions)
 
-    jobs = jobs_source[
-        jobs_source["team"].astype("string").str.lower().isin(IMPROVED_BENCHMARKS_TEAMS)
-    ] if not jobs_source.empty else jobs_source
-    occ = occ_source[
-        occ_source["team"].astype("string").str.lower().isin(IMPROVED_BENCHMARKS_TEAMS)
-    ] if not occ_source.empty else occ_source
-
-    parts = []
-    if not jobs.empty:
-        parts.append(_ntpj_benchmark_units(jobs))
-    if not occ.empty:
-        parts.append(_occupancy_benchmark_units(occ))
-    parts = [p for p in parts if not p.empty]
-    if not parts:
-        return empty_metric_frame()
-
-    units = pd.concat(parts, ignore_index=True)
-    units["team"] = units["team"].astype("string").str.lower()
-
-    # Suppress months at/after each team's removal cutover.
-    keep = pd.Series(True, index=units.index)
-    for team, cutover in TEAM_REMOVAL_MONTH.items():
-        keep &= ~((units["team"] == team) & (units["month"] >= cutover))
-    units = units[keep]
-
-    # Restrict OUTPUT to the requested period (look-back months drop out).
-    start_m = pd.Period(period_start, freq="M")
-    end_m = pd.Period(period_end, freq="M")
-    units = units[(units["month"] >= start_m) & (units["month"] <= end_m)]
-    if units.empty:
-        return empty_metric_frame()
-
-    squad_rows = _rollup(units, level="squad", metric_name=SQUAD_METRIC)
-    district_rows = _rollup(units, level="district", metric_name=DISTRICT_METRIC)
-    xforce_rows = _rollup(units, level="xforce", metric_name=XFORCE_METRIC)
-
-    result = pd.concat(
-        [squad_rows, district_rows, xforce_rows], ignore_index=True
+    # --- Core / Fraud only ---------------------------------------------------
+    teams = list(IMPROVED_BENCHMARKS_TEAMS)
+    jobs = (
+        jobs_source.filter(F.lower(F.col("team")).isin(teams))
+        if not jobs_empty
+        else jobs_source
     )
-    return result.sort_values(
-        ["metric", "date_reference", "team"], na_position="last"
-    ).reset_index(drop=True)
+    occ = (
+        occ_source.filter(F.lower(F.col("team")).isin(teams))
+        if not occ_empty
+        else occ_source
+    )
+
+    parts: list[DataFrame] = []
+    if not jobs_empty:
+        parts.append(_ntpj_benchmark_units(jobs))
+    if not occ_empty:
+        parts.append(_occupancy_benchmark_units(occ))
+    parts = [p for p in parts if len(p.take(1)) > 0]
+    if not parts:
+        return empty_metric_frame(spark)
+
+    units = parts[0]
+    for extra in parts[1:]:
+        units = units.unionByName(extra)
+
+    # --- Fix #5: ntpj_xforce LEFT-JOIN gating --------------------------------
+    # Drop benchmark units for an (xforce, month) with no ntpj_xforce output row
+    # that month. The ntpj_xforce rows come from the NTPJ agent contribution
+    # (finished + required-activity + active roster) — see _ntpj_xforce_months.
+    if not jobs_empty:
+        xforce_months = _ntpj_xforce_months(jobs)
+        units = units.join(xforce_months, on=["xforce", "month"], how="left_semi")
+    else:
+        # No jobs => no ntpj_xforce rows => no benchmark units survive the gate.
+        return empty_metric_frame(spark)
+
+    # --- restrict to the OUTPUT period (look-back months drop out) ----------
+    start_m = date(period_start.year, period_start.month, 1)
+    end_m = date(period_end.year, period_end.month, 1)
+    units = units.filter(
+        (F.col("month") >= F.lit(start_m)) & (F.col("month") <= F.lit(end_m))
+    )
+    if len(units.take(1)) == 0:
+        return empty_metric_frame(spark)
+
+    units = units.persist()
+    try:
+        # Squad / district roll-ups: NO month gate, NO team cutover (Fix #1).
+        squad_rows = _rollup(units, level="squad", metric_name=SQUAD_METRIC)
+        district_rows = _rollup(units, level="district", metric_name=DISTRICT_METRIC)
+
+        # XForce roll-up: flat < 2026-05 for all teams + david carve-out (Fix #2).
+        xforce_units = units.filter(
+            (F.col("month") < F.lit(XFORCE_REMOVAL_MONTH))
+            & ~(
+                (F.col("xplead") == F.lit(DAVID_XPLEAD))
+                & (F.col("month") >= F.lit(DAVID_REMOVAL_MONTH))
+            )
+        )
+        xforce_rows = _rollup(xforce_units, level="xforce", metric_name=XFORCE_METRIC)
+
+        result = squad_rows.unionByName(district_rows).unionByName(xforce_rows)
+        result = result.select(*METRIC_COLUMNS).persist()
+        result.count()  # materialize before unpersisting `units`
+    finally:
+        units.unpersist()
+    return result
 
 
 IO_IMPROVED_BENCHMARKS_METRIC_SCHEMA: tuple[tuple[str, str], ...] = (
