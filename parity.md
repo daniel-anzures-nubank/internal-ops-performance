@@ -412,6 +412,77 @@ reproduced. June's only divergence is the trailing-week freshness gap
 
 ---
 
+## WoWs — `io_wows_metric` vs the `wows_agent` rows of `usr.mx__cx.internal_ops_performance_2026_social_media` (Social Media only)
+
+**Status:** validated over the legacy comparable window **`2026-01-01 … 06-10`**.
+WoWs is a **count** metric, not a ratio: `numerator = metric_value =
+COUNT(DISTINCT case_id)` per `(agent, bucket)`; `denominator` is the constant
+monthly target **5** (reference only). The legacy
+`internal_ops_performance_2026_social_media` table is a **stale snapshot frozen at
+`2026-06-10`** (its max day-grain `date_reference`), while the new run extends to
+`2026-06-21` — so the gate is dates **≤ 06-10**; everything after is the expected
+snapshot-freshness tail. Comparison is outer-joined on
+`(agent, date_granularity, date_reference)`, `metric='wows'` (new) vs
+`metric='wows_agent'` (legacy, `date_reference` cast to DATE). The source is the
+**live** WoWs Google Sheet (`gsheets.sheets.mx_wows_daniel_temp`), which keeps
+accreting entries, so the new side is a moving target relative to the frozen
+snapshot.
+
+**The port is a strict superset of legacy — it never drops, misses, or
+undercounts a WoW.** Across all overlapping granularities, **0** `only_legacy` and
+**0** rows where new < legacy; every divergence is additive (new ≥ legacy) and
+traces to the 06-10 snapshot freeze + live-sheet growth.
+
+| granularity | matched keys | exact | new > legacy (additive) | new < legacy | only_legacy |
+| --- | --- | --- | --- | --- | --- |
+| day | 1,466 | 1,457 | 9 | 0 | 0 |
+| week | 530 | 509 | 21 | 0 | 0 |
+| month | 157 | 135 | 22 | 0 | 0 |
+
+Day-agent value parity within the gate: **1,457 / 1,466 = 99.4% bit-exact**.
+
+### Divergences
+
+| Divergence | Rows | Cause | Class |
+| --- | --- | --- | --- |
+| Day rows after `2026-06-10` | 34 `only_new` days | Legacy snapshot frozen 06-10; new run to 06-21. | freshness/snapshot |
+| Early-June additive deltas (≤ 06-10) | 7 `only_new` + 9 value (day) | **14 of 16 land exactly on 06-10** (legacy's frozen last day = partial capture) + 2 on 06-01/06-02 for one agent; all new > legacy as the live sheet gained entries since the snapshot. | freshness/snapshot |
+| June month / trailing weeks partial | 22 month + 21 week, all new > legacy | Same 06-10 freeze: legacy June (and weeks spanning the boundary) are partial. | freshness/snapshot |
+| `quarter` / `semester` / `year` grains | 54 / 28 / 28 `only_new` | New pipeline emits the standard 6-granularity superset; **all** legacy SM metrics (`nocc/qa/tnps/wows_agent`) emit only day/week/month. | by-design |
+
+### Reproduced and matching (not divergences)
+- **Count semantics** — `numerator = metric_value = COUNT(DISTINCT case_id)`,
+  `denominator = 5` (constant monthly target). Verified: `metric_value ==
+  numerator` on every row, `denominator = 5` at every grain — matches legacy.
+- **`2026-03-27` outage drop** — legacy `wows_agent` carries **no** 03-27 row; the
+  new metric drops 03-27 on the raw rows *before* bucketing for `date < 2026-07-01`
+  (SM-only; the Core/Fraud 04-09 does not apply to the social source). Verified: 0
+  rows on 03-27 on both sides. Same DROP call as Quality/TNPS, opposite the
+  Shrinkage KEEP (see the cutover rule).
+- **`COUNT(DISTINCT)` per bucket vs sum-of-daily** — for coarser grains the new
+  metric counts distinct `case_id` over the whole bucket. Verified against legacy
+  that monthly value equals the sum of daily values on every matched agent-month
+  (no `case_id` recurs across days), so the two formulations are numerically
+  identical on current data.
+- **Agent grain only** — the org rollups (`wows_xforce / wows_xplead /
+  wows_squad / wows_district`, `wows_agents_team_quartile`) are produced by the
+  downstream composite layer, not this base metric (same scoping as TNPS).
+- **Roster join** — `status='active'` + non-null `squad`, deduped to one row per
+  `(agent, snapshot_month)` before the inner join (mirrors `tnps_responses`),
+  preventing the content-branch fan-out double-count.
+
+### Verdict
+**At parity (strict superset). No open items.** Within the comparable window
+(≤ the legacy snapshot of `2026-06-10`): **0 `only_legacy`, 0 rows where new <
+legacy on any granularity**, and 99.4% of day-agent values bit-exact. The 52
+non-exact matched rows and all `only_new` rows are additive (new ≥ legacy),
+explained entirely by the legacy table being a frozen 06-10 snapshot read against a
+live Google Sheet that has since gained entries — not a logic difference. The 03-27
+outage drop, count semantics, distinct-per-bucket aggregation, and roster dedup are
+all reproduced. quarter/semester/year are the by-design 6-granularity superset.
+
+---
+
 ## Other metrics — not yet parity-checked
 
 The composite indices (Xpeer/XForce Index, etc.) have **not** been
