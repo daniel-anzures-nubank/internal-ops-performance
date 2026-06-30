@@ -595,10 +595,51 @@ composite now and fix the Content base metrics separately.
 
 ---
 
+## Average Xpeer Index — `io_average_xpeer_index_metric` (metric `average_xpeer_index`) vs `average_index_agent` in the three legacy decks
+
+**Status:** shipped (main + SM at parity); **Content deferred** (inherits the
+xpeer_index Content base-metric gap). The mean of the agent-level Xpeer Index
+rolled up to the XForce. Reads `io_xpeer_index_metric`, so its parity is bounded
+by that metric's.
+
+**Deck grouping (legacy parity):** legacy runs a separate notebook per deck, so
+the rollup groups by a synthetic **deck** — `core` / `fraud` / NULL-team →
+`main`; `social media` → `sm`; `content` → `content` — **not** by team and **not**
+by xforce alone. This MERGES the core+fraud cross-team case into one `main` row
+(e.g. `brenda.aguilar`, both core and fraud agents → one main row) AND KEEPS a
+cross-deck xforce split (verified: `marcela.garduno` has core AND social-media
+agents → legacy emits a separate main row ≈84–99 and SM row 49; merging on xforce
+alone corrupts both). `team` is NULL on output (legacy carries none). Week + month
+only pre-cutover.
+
+**Parity (week + month):**
+| Deck | grain | avg abs diff | notes |
+| --- | --- | --- | --- |
+| main | month | **0.93** | ±2.0 match ~72%; only_legacy ~11/grain |
+| main | week | **0.97** | ±2.0 match ~72% |
+| social media | week+month | **0.53** | new ⊃ legacy (06-10 snapshot) |
+| content | — | 25.4 | **off** — inherited base-metric gap |
+
+### Divergences
+| Divergence | Cause | Class |
+| --- | --- | --- |
+| main/SM matched rows off by avg < 1.0 | base-metric propagation from the agent Xpeer Index (the by-design enhancements roll up) | by-design |
+| ~11/grain `only_legacy` (main) | upstream xplead-attribution nuances in `io_xpeer_index_metric` + the NULL-xforce xplead-rollups legacy emits, which we drop by design (legacy xforce-grain gotcha) | by-design / open |
+| Content off by ~25 | averages the not-yet-at-parity Content xpeer_index (NTPJ/NOcc base gap) | open (deferred) |
+
+### Verdict
+**Shipped.** The deck-grouping logic is byte-for-byte faithful (core+fraud merge;
+cross-deck split). main + SM are at parity (avg abs diff < 1.0, base propagation).
+**Content is deferred** — it inherits the xpeer_index Content base-metric gap.
+
+---
+
 ## Other metrics — not yet parity-checked
 
-The remaining composite indices (Average Xpeer Index, XForce Index, Average
-XForce Index, Improved Benchmarks, XPeers-in-Target, Nuvinhos Performance) have
-**not** been validated against legacy yet. Check for the same phantom-adherence
+The remaining composites (XForce Index, Average XForce Index, Improved
+Benchmarks, XPeers-in-Target, Nuvinhos Performance) are **not** validated against
+legacy in this doc yet. (Improved Benchmarks is ported + logic-fixed on a branch
+but deferred — it needs 2025 `io_jobs_raw` history + a real `ntpj_xforce` rollup;
+it feeds XForce Index, so both wait.) Check for the same phantom-adherence
 cutover, meeting/leave filter, and DIME-squad filter as Adherence / Normalized
 Occupancy / NTPJ before assuming parity, plus the week+month-only restriction.
