@@ -1,4 +1,4 @@
-"""average_xpeer_index — the XForce-level Average Xpeer Index (all teams).
+"""average_xpeer_index — the XForce-level Average Xpeer Index (all teams), PySpark.
 
 Legacy ``average_index_agent``: the simple mean of the **agent-level Xpeer
 Index** rolled up to the XForce.
@@ -6,18 +6,31 @@ Index** rolled up to the XForce.
     Average Xpeer Index = AVG(agent Xpeer Index) per (xforce, xplead)
 
 It reads the finished agent-level index table (``io_xpeer_index_metric``) and
-averages ``metric_value`` per ``(team, xforce, xplead, date_reference,
-date_granularity)``. Applies to **all four teams** (Core / Fraud / Social Media
-/ Content) — the agent index already encodes each team's era-specific
-composition, so this layer is a pure average over whatever agents have an index.
+averages ``metric_value`` per ``(deck, xforce, xplead, date_reference,
+date_granularity)``.
 
-Output grain
-------------
-One row per ``(team, xforce, xplead)`` per period. ``agent``, ``squad``,
-``district``, ``shift`` are NULL. All six granularities (``day`` / ``week`` /
-``month`` / ``quarter`` / ``semester`` / ``year``) — the legacy notebook only
-materialized week + month, but our metric layer emits whatever the agent index
-provides.
+Deck grouping (legacy parity)
+-----------------------------
+Legacy runs a **separate notebook per deck** and each groups its own
+``average_index_agent`` by ``(xforce, xplead)`` (GROUP BY ALL, no team column).
+To reproduce that in the unified pipeline we group by a synthetic **deck**:
+
+* ``core`` / ``fraud`` / NULL-team (the main-deck support squads) → ``main``;
+* ``social media`` → ``sm``;
+* ``content`` → ``content``.
+
+This MERGES the core+fraud cross-team case into one ``main`` row (e.g.
+``brenda.aguilar``, who has both core and fraud agents — legacy emits one main
+row, not two), while KEEPING a cross-deck xforce split across decks as legacy
+does (e.g. ``marcela.garduno`` has core AND social-media agents — legacy emits a
+separate main row and SM row, with very different values, so they must NOT be
+averaged together). ``team`` is left NULL on output (legacy carries none); the
+deck is a grouping device only.
+
+Granularity
+-----------
+Legacy materialized only **week + month**. For ``date_reference < 2026-07-01`` we
+emit only those two grains (the broader set is allowed from the cutover onward).
 
 Numerator / denominator convention
 -----------------------------------
@@ -29,66 +42,89 @@ mean.
 
 from __future__ import annotations
 
-import pandas as pd
+from datetime import date
+
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
 from metric_utils import METRIC_COLUMNS, empty_metric_frame
 
 METRIC_NAME = "average_xpeer_index"
 
+# Legacy-parity cutover: before it, emit only the week + month grain legacy
+# materialized (average_index_agent unions only *_monthly + *_weekly).
+LEGACY_CUTOVER: date = date(2026, 7, 1)
 
-def compute_average_xpeer_index(xpeer_index: pd.DataFrame) -> pd.DataFrame:
-    """Average the agent-level Xpeer Index to the XForce level.
+CORE = "core"
+FRAUD = "fraud"
+SOCIAL_MEDIA = "social media"
+CONTENT = "content"
+
+
+def compute_average_xpeer_index(xpeer_index: DataFrame) -> DataFrame:
+    """Average the agent-level Xpeer Index to the XForce level (per deck).
 
     Args:
         xpeer_index: ``io_xpeer_index_metric`` — agent-level index rows
-            (``metric_value`` is each agent's index, all six granularities).
+            (``metric_value`` is each agent's index).
 
     Returns:
-        Tidy long-format metric rows (XForce grain), all granularities present
-        in the input.
+        Tidy long-format metric rows (XForce grain); week + month only before the
+        2026-07-01 cutover.
     """
-    if xpeer_index is None or xpeer_index.empty:
-        return empty_metric_frame()
+    spark = xpeer_index.sparkSession
+    if len(xpeer_index.take(1)) == 0:
+        return empty_metric_frame(spark)
 
-    work = xpeer_index.copy()
-    work["metric_value"] = pd.to_numeric(work["metric_value"], errors="coerce")
-    # Agents with no computable index are dropped from the average (AVG ignores
-    # NULLs in SQL).
-    work = work[work["metric_value"].notna()]
-    if work.empty:
-        return empty_metric_frame()
+    work = xpeer_index.withColumn(
+        "_mv", F.col("metric_value").cast("double")
+    ).filter(F.col("_mv").isNotNull())
 
-    keys = ["team", "xforce", "xplead", "date_reference", "date_granularity"]
-    grp = work.groupby(keys, as_index=False, dropna=False).agg(
-        numerator=("metric_value", "sum"),
-        denominator=("metric_value", "size"),
+    # Pre-cutover: legacy only materialized week + month.
+    pre_cutover = F.col("date_reference") < F.lit(LEGACY_CUTOVER)
+    work = work.filter(
+        (~pre_cutover) | F.col("date_granularity").isin("week", "month")
+    )
+    if len(work.take(1)) == 0:
+        return empty_metric_frame(spark)
+
+    team = F.lower(F.col("team"))
+    deck = (
+        F.when(team.isin(CORE, FRAUD) | team.isNull(), F.lit("main"))
+        .when(team == F.lit(SOCIAL_MEDIA), F.lit("sm"))
+        .when(team == F.lit(CONTENT), F.lit("content"))
+        .otherwise(F.lit("other"))
+    )
+    work = work.withColumn("_deck", deck)
+
+    grp = work.groupBy(
+        "_deck", "xforce", "xplead", "date_reference", "date_granularity"
+    ).agg(
+        F.sum("_mv").alias("numerator"),
+        F.count(F.lit(1)).alias("denominator"),
     )
 
-    out = pd.DataFrame(index=grp.index)
-    out["agent"] = None
-    out["xforce"] = grp["xforce"].values
-    out["xplead"] = grp["xplead"].values
-    out["team"] = grp["team"].values
-    out["squad"] = None
-    out["district"] = None
-    out["shift"] = None
-    out["date_reference"] = grp["date_reference"].values
-    out["date_granularity"] = grp["date_granularity"].values
-    out["metric"] = METRIC_NAME
-    out["numerator"] = grp["numerator"].astype(float).values
-    out["denominator"] = grp["denominator"].astype(float).values
-    out["metric_value"] = (
-        (grp["numerator"] / grp["denominator"]).where(grp["denominator"] > 0).values
-    )
-
-    return (
-        out[list(METRIC_COLUMNS)]
-        .sort_values(
-            ["date_granularity", "date_reference", "team", "xforce"],
-            na_position="last",
+    out = grp.select(
+        F.lit(None).cast("string").alias("agent"),
+        F.col("xforce"),
+        F.col("xplead"),
+        F.lit(None).cast("string").alias("team"),
+        F.lit(None).cast("string").alias("squad"),
+        F.lit(None).cast("string").alias("district"),
+        F.lit(None).cast("string").alias("shift"),
+        F.col("date_reference"),
+        F.col("date_granularity"),
+        F.lit(METRIC_NAME).alias("metric"),
+        F.col("numerator").cast("double").alias("numerator"),
+        F.col("denominator").cast("double").alias("denominator"),
+        F.when(
+            F.col("denominator") > 0,
+            F.col("numerator") / F.col("denominator"),
         )
-        .reset_index(drop=True)
+        .otherwise(F.lit(None).cast("double"))
+        .alias("metric_value"),
     )
+    return out.select(*METRIC_COLUMNS)
 
 
 IO_AVERAGE_XPEER_INDEX_METRIC_SCHEMA: tuple[tuple[str, str], ...] = (
