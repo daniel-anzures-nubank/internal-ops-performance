@@ -31,18 +31,25 @@ Composition — which terms enter the average, by team and **era**
 The index is a simple mean of the included components. The roster of components
 grew over the 2026 rollout, so it is **anchored on the bucket's month**:
 
-* **Core / Fraud**: Adherence + NTPJ always; ``+ Quality`` from **Feb 2026**
-  (when present); ``+ NO`` from **March 2026**, except the approved
-  ``nitza.zarza`` Apr-May 2026 carve-out. SM-only WoWs/tNPS never apply.
-* **Content**:      Adherence + NTPJ always; ``+ NO`` and ``+ CSAT`` (when
-  present) from **March 2026** (Jan & Feb are Adherence + NTPJ only).
+* **Core / Fraud**: Adherence + NTPJ always (NTPJ is a **fixed** divisor term —
+  a missing NTPJ row folds to 0 but still counts; legacy den 200/300/400 never
+  100); ``+ Quality`` from **Feb 2026** (when present); ``+ NO`` from **March
+  2026**, except the approved ``nitza.zarza`` Apr-May 2026 carve-out. SM-only
+  WoWs/tNPS never apply. The main-deck **support squads** (``quality`` /
+  ``planning`` / ``enablement`` / ``idsec``) that legacy keeps with ``team =
+  NULL`` get this same Core/Fraud roster.
+* **Content**:      Adherence always; ``+ NTPJ`` **present-only** (drops from
+  sum AND divisor when the agent has no NTPJ row); ``+ NO`` and ``+ CSAT`` (when
+  present) from **March 2026**. Jan & Feb are therefore Adherence-only (Content
+  has no NTPJ rows before March → legacy den 100, not 200).
 * **Social Media**: Adherence + WoWs always; ``+ tNPS`` whenever present;
   ``+ Quality`` from **Feb 2026** (when present); ``+ NO`` from **March 2026**.
   SM **excludes NTPJ**.
 
-Quality / CSAT / tNPS terms drop out of both the sum **and** the divisor when
-the agent has no value for the bucket. NO is always counted in the divisor once
-its era starts (a missing NO contributes 0).
+Quality / CSAT / tNPS — and NTPJ for **Content** — drop out of both the sum
+**and** the divisor when the agent has no value for the bucket. NTPJ for
+**Core/Fraud** and NO (once its era starts) are always counted in the divisor (a
+missing value contributes 0).
 
 Era classification (parity with legacy ``index_agents_*``)
 ----------------------------------------------------------
@@ -111,10 +118,9 @@ SOCIAL_MEDIA = "social media"
 CONTENT = "content"
 CORE = "core"
 FRAUD = "fraud"
-# The only teams that get the Core/Fraud (NTPJ + NO + Quality) composition.
+# The teams that get the Core/Fraud (NTPJ + NO + Quality) composition. A NULL
+# team (main-deck support squad) is folded in at the predicate (`is_cf`), not here.
 CORE_FRAUD_TEAMS = (CORE, FRAUD)
-# Every team in scope for the Index.
-KNOWN_TEAMS = (CORE, FRAUD, SOCIAL_MEDIA, CONTENT)
 
 NITZA_NO_SUPPRESSION_AGENT = "nitza.zarza"
 NITZA_NO_SUPPRESSION_MONTHS = (date(2026, 4, 1), date(2026, 5, 1))
@@ -279,12 +285,16 @@ def compute_xpeer_index(
     nz = lambda cond: F.coalesce(cond, F.lit(False))  # noqa: E731
     is_sm = nz(team == F.lit(SOCIAL_MEDIA))
     is_content = nz(team == F.lit(CONTENT))
-    # --- Fix #5: is_cf only fires for an explicit core/fraud team, and the
-    # cross-team terms (NO, Quality) only apply to a KNOWN team. An
-    # out-of-scope / NULL team therefore gets NO composition beyond Adherence
-    # (it never gets the Core/Fraud NTPJ+NO+Quality roster).
-    is_cf = nz(team.isin(list(CORE_FRAUD_TEAMS)))
-    is_known = nz(team.isin(list(KNOWN_TEAMS)))
+    # is_cf covers explicit core/fraud AND a NULL team. Legacy keeps the main-deck
+    # support squads (quality / planning / enablement / idsec) with team = NULL
+    # (extractors/agent_information.sql, matching legacy adherence_io), and the
+    # legacy CF index still gives them the full Core/Fraud roster (denominators
+    # 200/300/400, never 100). In the unified adherence driver a NULL team is, by
+    # construction, a main-deck agent: verified that every NULL-team adherence
+    # agent is in the legacy CF deck (40/40), none in SM/Content. A genuinely
+    # unexpected NON-NULL team still falls through to Adherence-only.
+    is_cf = nz(team.isin(list(CORE_FRAUD_TEAMS))) | team.isNull()
+    is_known = is_sm | is_content | is_cf
 
     mar_plus = era >= F.lit(NO_CUTOVER)
     qual_cutover = F.when(is_content, F.lit(QUALITY_CUTOVER_CONTENT)).otherwise(
@@ -306,7 +316,12 @@ def compute_xpeer_index(
     num = adh
     cnt = F.lit(1)  # Adherence is always in.
 
-    use_ntpj = is_cf | is_content
+    # Core/Fraud carry NTPJ as a FIXED denominator term (counted even when the
+    # agent has no NTPJ row — it then folds to 0; verified: Jan CF agents with no
+    # ntpj row still have den=200). Content carries NTPJ present-only: it drops
+    # from BOTH numerator and denominator when absent (verified: Feb Content has
+    # no ntpj rows -> den=100, Adherence-only; Mar+ Content has ntpj for all).
+    use_ntpj = is_cf | (is_content & F.col("ntpj").isNotNull())
     num = num + F.when(use_ntpj, ntpj_t).otherwise(F.lit(0.0))
     cnt = cnt + use_ntpj.cast("int")
 

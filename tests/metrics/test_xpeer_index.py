@@ -3,8 +3,9 @@
 Small synthetic ``io_*_metric`` frames (no warehouse). We verify the component
 transforms (NTPJ fold, NO truncation, WoWs fold), the team- and era-dependent
 composition (Core/Fraud vs Content vs Social Media; Jan/Feb/March cutovers), the
-adherence-as-driver rule, the team guard (unknown/NULL team gets NO Core/Fraud
-composition), and the output contract — plus the two parity fixes:
+adherence-as-driver rule, the team guard (a NULL team is a main-deck support
+squad and gets the Core/Fraud roster; only an unexpected NON-NULL team falls
+through to Adherence-only), and the output contract — plus the two parity fixes:
 
 * **Fix #1** — pre-cutover output is restricted to week + month grain.
 * **Fix #2** — the December-2025 ISO weekly bucket (Monday 2025-12-29) is KEPT
@@ -207,17 +208,31 @@ class TestContent:
         assert abs(r["denominator"] - 400.0) < 1e-9
         assert abs(r["metric_value"] - 85.0) < 1e-9
 
-    def test_february_excludes_csat_and_nocc(self, spark):
-        # Content Jan & Feb = (adh + ntpj) / 2 only.
+    def test_february_is_adherence_only(self, spark):
+        # Real Content has NO ntpj rows before March, so legacy Feb Content is
+        # Adherence-only (den 100, not 200). nocc & csat are also era-gated out.
+        # (Verified: legacy _content index_agent Feb = 17 rows, all den=100.)
         out = compute_xpeer_index(
             adherence=frame(spark, [_row("adherence", "a", 90, dref=FEB, team="content")]),
-            ntpj=frame(spark, [_row("ntpj", "a", 100, dref=FEB, team="content")]),
             normalized_occupancy=frame(spark, [_row("normalized_occupancy", "a", 100, dref=FEB, team="content")]),
             content_csat=frame(spark, [_row("content_csat", "a", 50, dref=FEB, team="content")]),
         )
         r = only(out, "a")
-        assert abs(r["denominator"] - 200.0) < 1e-9
-        assert abs(r["metric_value"] - 95.0) < 1e-9  # (90 + 100) / 2
+        assert abs(r["denominator"] - 100.0) < 1e-9
+        assert abs(r["metric_value"] - 90.0) < 1e-9
+
+    def test_content_ntpj_present_only_drops_when_absent(self, spark):
+        # Content NTPJ is present-only: a March Content agent with no ntpj row
+        # drops it from BOTH numerator and denominator (den 300 = adh+nocc+csat),
+        # unlike Core/Fraud where NTPJ is a fixed divisor term.
+        out = compute_xpeer_index(
+            adherence=frame(spark, [_row("adherence", "a", 90, team="content")]),
+            normalized_occupancy=frame(spark, [_row("normalized_occupancy", "a", 100, team="content")]),
+            content_csat=frame(spark, [_row("content_csat", "a", 80, team="content")]),
+        )
+        r = only(out, "a")
+        assert abs(r["denominator"] - 300.0) < 1e-9
+        assert abs(r["metric_value"] - (90 + 100 + 80) / 3) < 1e-9
 
     def test_content_ignores_playvox_quality(self, spark):
         # A stray Playvox quality row must NOT feed Content (it uses CSAT).
@@ -394,9 +409,10 @@ class TestGeneral:
         )
         assert len(out.take(1)) == 0
 
-    def test_unknown_team_gets_no_core_fraud_composition(self, spark):
-        # Fix #5: an unrecognized team must NOT get NTPJ/NO/Quality; only the
-        # always-on Adherence term -> denominator 100.
+    def test_unknown_non_null_team_gets_no_core_fraud_composition(self, spark):
+        # An unexpected NON-NULL team must NOT get NTPJ/NO/Quality; only the
+        # always-on Adherence term -> denominator 100. (NULL is handled
+        # separately — it is a known main-deck support squad, see below.)
         out = compute_xpeer_index(
             adherence=frame(spark, [_row("adherence", "a", 90, team="mystery")]),
             ntpj=frame(spark, [_row("ntpj", "a", 0, team="mystery")]),
@@ -407,13 +423,29 @@ class TestGeneral:
         assert abs(r["denominator"] - 100.0) < 1e-9
         assert abs(r["metric_value"] - 90.0) < 1e-9
 
-    def test_null_team_gets_no_core_fraud_composition(self, spark):
+    def test_null_team_gets_core_fraud_composition(self, spark):
+        # A NULL team is a main-deck support-squad agent (quality / planning /
+        # enablement / idsec) that legacy keeps with team = NULL and scores with
+        # the full Core/Fraud roster. Verified: every NULL-team adherence agent
+        # is in the legacy CF deck (40/40), with den 200/300/400, never 100.
         out = compute_xpeer_index(
             adherence=frame(spark, [_row("adherence", "a", 90, team=None)]),
-            ntpj=frame(spark, [_row("ntpj", "a", 0, team=None)]),
+            ntpj=frame(spark, [_row("ntpj", "a", 100, team=None)]),
+            normalized_occupancy=frame(spark, [_row("normalized_occupancy", "a", 90, team=None)]),
         )
         r = only(out, "a")
-        assert abs(r["denominator"] - 100.0) < 1e-9
+        assert abs(r["denominator"] - 300.0) < 1e-9  # adh + ntpj (fixed) + nocc (Mar)
+        assert abs(r["metric_value"] - (90 + 100 + 90) / 3) < 1e-9
+
+    def test_core_fraud_ntpj_is_a_fixed_divisor(self, spark):
+        # Core/Fraud count NTPJ in the denominator even with no ntpj row (it
+        # folds to 0): a Jan CF agent with only adherence -> den 200, not 100.
+        out = compute_xpeer_index(
+            adherence=frame(spark, [_row("adherence", "a", 90, dref=JAN, team="core")]),
+        )
+        r = only(out, "a")
+        assert abs(r["denominator"] - 200.0) < 1e-9  # adh + ntpj (fixed, folds 0)
+        assert abs(r["metric_value"] - 45.0) < 1e-9  # (90 + 0) / 2
 
     def test_fraud_team_gets_core_fraud_composition(self, spark):
         out = compute_xpeer_index(
