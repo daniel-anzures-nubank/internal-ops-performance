@@ -124,6 +124,49 @@ def empty_occ(spark):
     return spark.createDataFrame([], _OCC_SCHEMA)
 
 
+# io_ntpj_xforce_metric rows — the exact gate driver. The gate reads only
+# xforce / date_reference / date_granularity (month rows), so other columns are
+# null placeholders.
+_NTPJX_SCHEMA = T.StructType(
+    [
+        T.StructField("agent", T.StringType()),
+        T.StructField("xforce", T.StringType()),
+        T.StructField("xplead", T.StringType()),
+        T.StructField("team", T.StringType()),
+        T.StructField("squad", T.StringType()),
+        T.StructField("district", T.StringType()),
+        T.StructField("shift", T.StringType()),
+        T.StructField("date_reference", T.DateType()),
+        T.StructField("date_granularity", T.StringType()),
+        T.StructField("metric", T.StringType()),
+        T.StructField("numerator", T.DoubleType()),
+        T.StructField("denominator", T.DoubleType()),
+        T.StructField("metric_value", T.DoubleType()),
+    ]
+)
+
+
+def make_ntpj_xforce(spark, pairs):
+    """Build ntpj_xforce gate rows from ``(xforce, date_reference, granularity)``.
+
+    ``pairs`` items are ``(xforce, date_reference)`` (month grain) or
+    ``(xforce, date_reference, granularity)``.
+    """
+    rows = []
+    for p in pairs:
+        xforce, dref = p[0], p[1]
+        gran = p[2] if len(p) > 2 else "month"
+        rows.append((
+            None, xforce, "p.one", "fraud", None, None, None,
+            dref, gran, "ntpj_xforce", 1.0, 1.0, 100.0,
+        ))
+    return spark.createDataFrame(rows, _NTPJX_SCHEMA)
+
+
+def empty_ntpj_xforce(spark):
+    return spark.createDataFrame([], _NTPJX_SCHEMA)
+
+
 def _run(spark, jobs=None, occ=None,
          start=dt.date(2026, 4, 1), end=dt.date(2026, 4, 30)):
     return compute_improved_benchmarks(
@@ -288,6 +331,49 @@ class TestNtpjXforceGating:
             {"date": CUR, "occupancy_minutes": 20.0},
         ]))
         # No jobs at all -> no ntpj_xforce rows -> everything gated out.
+        assert len(out.take(1)) == 0
+
+
+# --------------------------------------------------------------------------- #
+# ntpj_xforce gating via the REAL metric (exact gate, Fix #5)
+# --------------------------------------------------------------------------- #
+class TestNtpjXforceMetricGate:
+    def _improving_jobs(self, spark):
+        return make_jobs(spark, [
+            {"date": PREV, "duration_seconds": 200},
+            {"date": CUR, "duration_seconds": 100},
+        ])
+
+    def test_metric_present_keeps_unit(self, spark):
+        # (x.one, Apr) present in ntpj_xforce -> the improving unit survives.
+        out = compute_improved_benchmarks(
+            self._improving_jobs(spark), empty_occ(spark),
+            dt.date(2026, 4, 1), dt.date(2026, 4, 30),
+            ntpj_xforce=make_ntpj_xforce(spark, [("x.one", dt.date(2026, 4, 1))]),
+        )
+        assert _one(out, SQUAD_METRIC)["metric_value"] == 100.0
+
+    def test_metric_absent_drops_unit_even_with_active_jobs(self, spark):
+        # The jobs ARE finished + required + active-roster (the fallback would
+        # keep them), but the real ntpj_xforce metric has NO (x.one, Apr) row ->
+        # the exact gate drops every unit. This is what makes the gate exact.
+        out = compute_improved_benchmarks(
+            self._improving_jobs(spark), empty_occ(spark),
+            dt.date(2026, 4, 1), dt.date(2026, 4, 30),
+            ntpj_xforce=empty_ntpj_xforce(spark),
+        )
+        assert len(out.take(1)) == 0
+
+    def test_week_only_metric_row_does_not_gate_month_unit(self, spark):
+        # Only a WEEK ntpj_xforce row exists for (x.one, Apr) -> the month gate
+        # finds no month row -> the unit is dropped (legacy joins month grain).
+        out = compute_improved_benchmarks(
+            self._improving_jobs(spark), empty_occ(spark),
+            dt.date(2026, 4, 1), dt.date(2026, 4, 30),
+            ntpj_xforce=make_ntpj_xforce(
+                spark, [("x.one", dt.date(2026, 4, 6), "week")]
+            ),
+        )
         assert len(out.take(1)) == 0
 
 

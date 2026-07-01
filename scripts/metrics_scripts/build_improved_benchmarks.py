@@ -15,13 +15,19 @@ What we do here:
      period (month-over-month comparison + the NTPJ trailing window):
        * ``io_jobs_raw``            — 6-month look-back.
        * ``io_occupancy_time_raw``  — 2-month look-back.
+     plus the ``io_ntpj_xforce_metric`` gate driver (output period only — the
+     gate keys on the emitted month).
   3. Call ``compute_improved_benchmarks`` (emits only the requested months).
   4. Either print a summary (``--dry-run``) or replace the target Delta table.
 
 Tables
 ------
-* Inputs:  ``usr.danielanzures.io_jobs_raw``, ``usr.danielanzures.io_occupancy_time_raw``.
+* Inputs:  ``usr.danielanzures.io_jobs_raw``, ``usr.danielanzures.io_occupancy_time_raw``,
+  ``usr.danielanzures.io_ntpj_xforce_metric`` (the ``ntpj_xforce`` gate).
 * Output:  ``usr.danielanzures.io_improved_benchmarks_metric`` (override ``--target``).
+
+Depends on ``build_ntpj_xforce`` (which depends on ``build_ntpj``) — the gate
+table must be built for the output period first.
 
 Manual adjustments
 ------------------
@@ -86,6 +92,7 @@ LOGGER = logging.getLogger("cx_metrics.improved_benchmarks")
 
 DEFAULT_JOBS_SOURCE = "usr.danielanzures.io_jobs_raw"
 DEFAULT_OCC_SOURCE = "usr.danielanzures.io_occupancy_time_raw"
+DEFAULT_NTPJ_XFORCE_SOURCE = "usr.danielanzures.io_ntpj_xforce_metric"
 DEFAULT_TARGET = "usr.danielanzures.io_improved_benchmarks_metric"
 
 JOBS_LOOKBACK_MONTHS = 6
@@ -108,6 +115,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--period-end", required=True, type=date.fromisoformat)
     parser.add_argument("--jobs-source", default=DEFAULT_JOBS_SOURCE)
     parser.add_argument("--occupancy-source", default=DEFAULT_OCC_SOURCE)
+    parser.add_argument(
+        "--ntpj-xforce-source",
+        default=DEFAULT_NTPJ_XFORCE_SOURCE,
+        help="ntpj_xforce metric table gating the benchmark units "
+        f"(default: {DEFAULT_NTPJ_XFORCE_SOURCE}).",
+    )
     parser.add_argument(
         "--target",
         default=DEFAULT_TARGET,
@@ -167,12 +180,21 @@ def main(argv: list[str] | None = None) -> int:
     with _log_step(f"read {args.occupancy_source} (from {occ_start})"):
         occ = read_table(spark, args.occupancy_source, occ_start, args.period_end)
 
+    # ntpj_xforce gate: only the OUTPUT months' rows are needed (the gate keys on
+    # the emitted month), so scope on the output period, not the look-back.
+    with _log_step(f"read {args.ntpj_xforce_source}"):
+        ntpj_xforce = read_table(
+            spark, args.ntpj_xforce_source, args.period_start, args.period_end,
+            date_col="date_reference",
+        )
+
     with _log_step("compute_improved_benchmarks"):
         result = compute_improved_benchmarks(
             jobs,
             occ,
             args.period_start,
             args.period_end,
+            ntpj_xforce=ntpj_xforce,
             general_exclusions=read_adjustment_table(spark, "exclusiones_generales"),
             dime_inconsistencies=read_adjustment_table(spark, "inconsistencias_dime"),
             cross_support=read_adjustment_table(spark, "cross_support"),

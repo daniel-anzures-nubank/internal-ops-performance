@@ -62,10 +62,12 @@ Legacy ``improved_benchmark_final`` is driven by the ``ntpj_xforce`` output rows
 metric='ntpj_xforce'`` LEFT JOIN the benchmark units on ``month + xforce``), so a
 benchmark unit for an ``(xforce, month)`` that has **no** ``ntpj_xforce`` output
 row that month is dropped — this changes squad/district AND xforce denominators.
-An ``ntpj_xforce`` row exists for an ``(xforce, month)`` iff at least one of that
-xforce's agents produced an NTPJ agent row that month — i.e. a finished,
-required-activity, **active-roster** job. We reproduce that gate from
-``jobs_raw`` (no separate ``ntpj_xforce`` table is passed in).
+We gate on the **real ``ntpj_xforce`` metric** (``io_ntpj_xforce_metric``, the
+month rows) passed in as ``ntpj_xforce``: its ``(xforce, month)`` presence
+already reflects every NTPJ exclusion (outage / hardcode / manual adjustment),
+so the gate is exact. When it is not supplied we fall back to an **approximate**
+reconstruction from ``jobs_raw`` (finished + required-activity + active-roster),
+which misses those exclusions — see ``_ntpj_xforce_months``.
 
 Scope (per the SOT + product guidance)
 ---------------------------------------
@@ -76,6 +78,8 @@ Inputs
 * ``io_jobs_raw`` (NTPJ benchmark) — needs a benchmark look-back before the
   output period (the build script reads ~6 extra months).
 * ``io_occupancy_time_raw`` (occupancy benchmark) — needs ~2 extra months.
+* ``io_ntpj_xforce_metric`` (the gate driver) — the month rows supply the
+  ``(xforce, month)`` presence that survives the LEFT-JOIN gate.
 
 Output — tidy long format (squad / district / xforce rows)
 -----------------------------------------------------------
@@ -297,14 +301,38 @@ def _occupancy_benchmark_units(occ: DataFrame) -> DataFrame:
     return attribution.join(flags, on=["key", "month"], how="inner").select(*_UNIT_COLS)
 
 
-def _ntpj_xforce_months(jobs: DataFrame) -> DataFrame:
-    """The ``(xforce, month)`` pairs that have an ``ntpj_xforce`` output row.
+def _ntpj_xforce_months_from_metric(ntpj_xforce: DataFrame) -> DataFrame:
+    """The ``(xforce, month)`` pairs present in the real ``ntpj_xforce`` metric.
 
-    An ``ntpj_xforce`` row exists for an ``(xforce, month)`` iff at least one of
-    that xforce's agents produced an NTPJ agent row that month — i.e. a finished,
-    required-activity, **active-roster** job. Legacy ``improved_benchmark_final``
-    LEFT-JOINs the benchmark units onto these rows, dropping any unit for an
-    ``(xforce, month)`` with no ``ntpj_xforce`` row (Fix #5).
+    This is the **exact** gate driver (Fix #5): legacy ``improved_benchmark_final``
+    is ``FROM ntpj_xforces`` (the month rows), so a benchmark unit survives only
+    if its ``(xforce, month)`` has an ``ntpj_xforce`` output row. We take the
+    month-grain rows of ``io_ntpj_xforce_metric`` — whose presence already
+    reflects every NTPJ exclusion — and reduce to distinct ``(xforce, month)``
+    (``date_reference`` is already the month start for month rows).
+
+    Returns a frame of distinct ``(xforce, month)``.
+    """
+    return (
+        ntpj_xforce.filter(F.col("date_granularity") == F.lit("month"))
+        .select(
+            F.col("xforce"),
+            F.trunc(F.to_date(F.col("date_reference")), "month").alias("month"),
+        )
+        .distinct()
+    )
+
+
+def _ntpj_xforce_months(jobs: DataFrame) -> DataFrame:
+    """Approximate ``(xforce, month)`` gate reconstructed from raw jobs.
+
+    Fallback for when the real ``ntpj_xforce`` metric is not supplied (tests /
+    ad-hoc). An ``ntpj_xforce`` row exists for an ``(xforce, month)`` iff at least
+    one of that xforce's agents produced an NTPJ agent row that month — i.e. a
+    finished, required-activity, **active-roster** job. This reconstruction
+    **misses** the NTPJ outage / hardcode / manual-adjustment exclusions, so it
+    can keep an ``(xforce, month)`` whose only NTPJ presence was an excluded day.
+    Prefer :func:`_ntpj_xforce_months_from_metric` (the exact gate).
 
     Returns a frame of distinct ``(xforce, month)``.
     """
@@ -403,6 +431,7 @@ def compute_improved_benchmarks(
     period_start: date,
     period_end: date,
     *,
+    ntpj_xforce: DataFrame | None = None,
     general_exclusions: DataFrame | None = None,
     dime_inconsistencies: DataFrame | None = None,
     cross_support: DataFrame | None = None,
@@ -415,6 +444,10 @@ def compute_improved_benchmarks(
         occupancy_time: ``io_occupancy_time_raw`` incl. a short look-back.
         period_start / period_end: inclusive output window (by month). Look-back
             rows are used only for benchmarks / the previous-month comparison.
+        ntpj_xforce: ``io_ntpj_xforce_metric`` rows — the **exact** gate driver
+            (Fix #5). Its month rows supply the ``(xforce, month)`` presence a
+            benchmark unit must have to survive. If ``None``, the gate falls back
+            to an approximate reconstruction from ``jobs_raw``.
 
     Returns:
         Tidy long-format metric rows (squad + district + xforce), month grain.
@@ -470,13 +503,16 @@ def compute_improved_benchmarks(
 
     # --- Fix #5: ntpj_xforce LEFT-JOIN gating --------------------------------
     # Drop benchmark units for an (xforce, month) with no ntpj_xforce output row
-    # that month. The ntpj_xforce rows come from the NTPJ agent contribution
-    # (finished + required-activity + active roster) — see _ntpj_xforce_months.
-    if not jobs_empty:
+    # that month. Prefer the real ntpj_xforce metric (exact — already reflects
+    # every NTPJ exclusion); fall back to the approximate jobs reconstruction.
+    if ntpj_xforce is not None:
+        xforce_months = _ntpj_xforce_months_from_metric(ntpj_xforce)
+        units = units.join(xforce_months, on=["xforce", "month"], how="left_semi")
+    elif not jobs_empty:
         xforce_months = _ntpj_xforce_months(jobs)
         units = units.join(xforce_months, on=["xforce", "month"], how="left_semi")
     else:
-        # No jobs => no ntpj_xforce rows => no benchmark units survive the gate.
+        # No jobs and no ntpj_xforce => no gate rows => nothing survives.
         return empty_metric_frame(spark)
 
     # --- restrict to the OUTPUT period (look-back months drop out) ----------
