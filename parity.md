@@ -93,6 +93,22 @@ benchmarks themselves match legacy to <0.1pp on the complete months.
 - Reproduced and matching: the meeting/leave `dimensioned_activity` filter, the
   wfm/credit_evolution/dote DIME-squad drop, the interval-dedup `prev_max_end`
   running-max, and the monthly district+shift `AVG(squad ratio)` benchmark.
+- **Content benchmark district-only (FIXED).** Content's roster carries a NULL
+  `shift`, so the `district + shift` benchmark join (`NULL != NULL` in Spark)
+  left every Content agent with a NULL `occupancy_exp` → NO% NULL → the NO
+  component folded to 0 in Content `xpeer_index` from March on (off ~25–35pp).
+  Legacy's Content deck (`[IO] Performance 2026 - Content Temp Fix.sql`) keys the
+  benchmark on `squad_district` only — no shift — so the fix forces **Content**
+  onto one shift-agnostic key (district-only), matching legacy, while every other
+  deck keeps `district + shift` (the main deck's own NULL-shift rows stay
+  unmatched, exactly as legacy leaves them under `a.shift = b.shift` — Core/Fraud
+  parity preserved, confirmed on cluster). Content `nocc_agent` now matches
+  `internal_ops_performance_2026_content`: **May 0.0pp, Apr 0.52, Mar 0.98**
+  (residual = the Content-deck date exclusions 03-10 / 03-25–27 / 04-09, deferred
+  to the adjustments layer), Jun 1.4 (in-flight). This unblocked Content
+  `xpeer_index` from ~25–35pp → **~2–3.5pp** (Feb still 0.0); the remaining
+  residual is the separate **Content NTPJ** base gap (Content NTPJ ~1.2× legacy),
+  tracked as a follow-up.
 
 ---
 

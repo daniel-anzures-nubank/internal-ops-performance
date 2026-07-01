@@ -137,6 +137,26 @@ class TestComputeNormalizedOccupancy:
         assert set(day) == {"c.one", "c.two"}
         assert all(abs(r["metric_value"] - 100.0) < 1e-9 for r in day.values())
 
+    def test_core_null_shift_left_unmatched_like_legacy(self, spark):
+        # The MAIN deck joins the benchmark on `a.shift = b.shift` (NULL-unsafe),
+        # so a NULL-shift Core agent gets NO benchmark. Only Content is forced
+        # onto a shift-agnostic key — Core must stay unmatched (no regression).
+        out = compute_normalized_occupancy(
+            make_raw(
+                spark,
+                [
+                    {"agent": "n.core", "team": "core", "district": "csi", "shift": None, "occupancy_minutes": 30.0},
+                    {"agent": "c.one", "team": "content", "squad": "enablement", "district": "content", "shift": None, "occupancy_minutes": 30.0},
+                ],
+            )
+        )
+        day = _by_agent(out)
+        # Content NULL-shift: district-only benchmark resolves.
+        assert abs(day["c.one"]["metric_value"] - 100.0) < 1e-9
+        # Core NULL-shift: benchmark never rejoins -> NULL (matches legacy main).
+        assert day["n.core"]["denominator"] is None
+        assert day["n.core"]["metric_value"] is None
+
     def test_nitza_no_metric_suppressed_but_still_feeds_benchmark(self, spark):
         out = compute_normalized_occupancy(
             make_raw(
