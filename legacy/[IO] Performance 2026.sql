@@ -2202,12 +2202,22 @@ CREATE OR REPLACE TEMPORARY VIEW index_xforces_final AS(
     , squad_district
     , date_reference
     , date_granularity
+    -- Shrinkage target: 23% for May/June 2026, 20% otherwise
+    -- Score: 100 at or below target; drops 1pt per % above (= (100 + target) - actual)
     , CASE
+        WHEN date_reference IN (DATE '2026-05-01', DATE '2026-06-01') AND shrinkage_xforce <= 23 THEN 100
+        WHEN date_reference IN (DATE '2026-05-01', DATE '2026-06-01') AND shrinkage_xforce >  23 THEN (100 + 23) - shrinkage_xforce
         WHEN shrinkage_xforce <= 20 THEN 100
-        WHEN shrinkage_xforce > 20 THEN 120 - shrinkage_xforce
+        WHEN shrinkage_xforce >  20 THEN (100 + 20) - shrinkage_xforce
         ELSE 0
       END AS shrinkage
-    , COALESCE(xpeers_in_target_xforce, 0) AS xpeers_in_target_xforce
+    -- On target (>= 70%): linearly scale from 90 (at threshold) to 100 (at max)
+    -- Off target (< 70%): use actual value as-is
+    , CASE
+        WHEN COALESCE(xpeers_in_target_xforce, 0) >= 70
+          THEN 90 + (COALESCE(xpeers_in_target_xforce, 0) - 70) * (100 - 90) / (100 - 70)
+        ELSE COALESCE(xpeers_in_target_xforce, 0)
+      END AS xpeers_in_target_xforce
     , COALESCE(average_index_agent, 0) AS average_index_agent
     , CASE
         WHEN improved_benchmark >= 60 THEN 100

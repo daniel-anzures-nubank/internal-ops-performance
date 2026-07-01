@@ -1,4 +1,4 @@
-# AGENTS.md - Internal Ops Context
+# CLAUDE.md - Internal Ops Context (legacy)
 
 ## Project Overview
 This workspace contains notebooks for the **Internal Operations (IO) Performance** analysis at Nubank Mexico CX.
@@ -119,5 +119,7 @@ This is the main orchestration pipeline that updates all performance metrics.
 - Metric values stored as percentages (multiplied by 100)
 
 ## How to Use This File
-Tell the assistant: "Read my AGENTS.md" or "Load context from AGENTS.md"
-The assistant will read this file and apply the context to your session.
+This file auto-loads when you work with files under `legacy/`. It documents the
+old monolithic Databricks SQL pipeline — its architecture, team hierarchy, source
+datasets, and SQL conventions. Apply this context whenever reading or porting the
+legacy notebooks (the source of truth for each metric definition until migrated).

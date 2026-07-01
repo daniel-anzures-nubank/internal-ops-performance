@@ -1,43 +1,39 @@
-"""Build the Nuvinhos Performance metric and (optionally) write it to Databricks.
+"""Build the ntpj_xforce metric and (optionally) write it to Databricks.
 
 Metrics-layer script. Thin orchestrator — the math lives in
-``metrics/nuvinhos_performance.py`` and is covered by
-``tests/metrics/test_nuvinhos_performance.py``. Here we only:
+``metrics/ntpj_xforce.py`` and is covered by ``tests/metrics/test_ntpj_xforce.py``.
+``ntpj_xforce`` is a pure **roll-up of the agent-grain NTPJ metric** to the
+XForce grain (share of an XForce's agents with ``ntpj <= 100``), week + month
+only — mirroring legacy ``ntpj_xforces`` (``[IO] Performance 2026.sql`` 560-598).
 
+Here we only:
   1. Get the ambient SparkSession (shared ``db.open_connection``).
-  2. Read the finished agent-level Xpeer Index table (``io_xpeer_index_metric``)
-     for the period (via ``db.read_table``, scoped on ``date_reference``).
-  3. Run the ``agent_information`` extractor for the roster tenure
-     (``last_change_date`` / ``snapshot_month``) used to classify Nuvinhos.
-  4. Call ``compute_nuvinhos_performance`` to get the per-deck XForce / squad /
-     district roll-ups (week + month only before the 2026-07-01 cutover).
-  5. Either print a summary (``--dry-run``) or replace the target Delta table.
-
-The Nuvinho classification is **monthly** (hire/change month + 2 months), and
-the tenure join is monthly even for weekly rows, so prefer running with whole-
-month periods.
+  2. Read the agent-level NTPJ metric for the period (via ``db.read_table``,
+     scoped on ``date_reference`` — no look-back: the roll-up aggregates agents
+     *within* each period bucket).
+  3. Call ``compute_ntpj_xforce``.
+  4. Either print a summary (``--dry-run``) or replace the target Delta table.
 
 Tables
 ------
-* Inputs:
-    - ``usr.danielanzures.io_xpeer_index_metric`` (override ``--index-source``).
-    - the ``agent_information`` extractor (roster tenure; reads its own sources).
-* Output: ``usr.danielanzures.io_nuvinhos_performance_metric`` (override ``--target``).
+* Input:  ``usr.danielanzures.io_ntpj_metric`` (override ``--source``).
+* Output: ``usr.danielanzures.io_ntpj_xforce_metric`` (override ``--target``).
 
-Manual adjustments
-------------------
-None applied here (no Adjustments layer yet). Content yields a degenerate result
-(no Nuvinhos → NULL XForce metric_value, one NULL-keyed squad/district row each)
-until the real Content roster with hire dates lands.
+Consumers
+---------
+``improved_benchmarks`` gates its benchmark units to the ``(xforce, month)``
+pairs present in this table (legacy ``improved_benchmark_final`` is driven by
+``ntpj_xforces``). It is also a standalone output metric legacy emitted but the
+new pipeline previously did not.
 
 Usage
 -----
 Runs on a Databricks cluster (``spark-submit`` / a Databricks job task)::
 
-    python scripts/metrics_scripts/build_nuvinhos_performance.py \\
+    python scripts/metrics_scripts/build_ntpj_xforce.py \\
         --period-start 2026-05-01 --period-end 2026-05-31 --dry-run
 
-    python scripts/metrics_scripts/build_nuvinhos_performance.py \\
+    python scripts/metrics_scripts/build_ntpj_xforce.py \\
         --period-start 2026-01-01 --period-end 2026-05-31
 """
 
@@ -75,20 +71,17 @@ REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics"))
 
-from db import open_connection, read_table, run_extractor, publish  # noqa: E402
-from metric_utils import GRANULARITIES  # noqa: E402
-from nuvinhos_performance import (  # noqa: E402
-    IO_NUVINHOS_PERFORMANCE_METRIC_SCHEMA,
-    METRIC_XFORCE,
-    METRIC_SQUAD,
-    METRIC_DISTRICT,
-    compute_nuvinhos_performance,
+from db import open_connection, read_table, publish  # noqa: E402
+from ntpj_xforce import (  # noqa: E402
+    IO_NTPJ_XFORCE_METRIC_SCHEMA,
+    ROLLUP_GRANULARITIES,
+    compute_ntpj_xforce,
 )
 
-LOGGER = logging.getLogger("cx_metrics.nuvinhos_performance")
+LOGGER = logging.getLogger("cx_metrics.ntpj_xforce")
 
-DEFAULT_INDEX_SOURCE = "usr.danielanzures.io_xpeer_index_metric"
-DEFAULT_TARGET = "usr.danielanzures.io_nuvinhos_performance_metric"
+DEFAULT_SOURCE = "usr.danielanzures.io_ntpj_metric"
+DEFAULT_TARGET = "usr.danielanzures.io_ntpj_xforce_metric"
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -99,9 +92,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--period-start", required=True, type=date.fromisoformat)
     parser.add_argument("--period-end", required=True, type=date.fromisoformat)
     parser.add_argument(
-        "--index-source",
-        default=DEFAULT_INDEX_SOURCE,
-        help=f"Agent-level Xpeer Index table (default: {DEFAULT_INDEX_SOURCE}).",
+        "--source",
+        default=DEFAULT_SOURCE,
+        help=f"Agent-level NTPJ metric table (default: {DEFAULT_SOURCE}).",
     )
     parser.add_argument(
         "--target",
@@ -153,19 +146,14 @@ def main(argv: list[str] | None = None) -> int:
 
     spark = open_connection()
 
-    with _log_step(f"read {args.index_source}"):
-        idx = read_table(
-            spark, args.index_source, args.period_start, args.period_end,
+    with _log_step(f"read {args.source}"):
+        ntpj = read_table(
+            spark, args.source, args.period_start, args.period_end,
             date_col="date_reference",
         )
 
-    with _log_step("agent_information extractor"):
-        tenure = run_extractor(
-            spark, "agent_information", args.period_start, args.period_end
-        )
-
-    with _log_step("compute_nuvinhos_performance"):
-        result = compute_nuvinhos_performance(idx, tenure)
+    with _log_step("compute_ntpj_xforce"):
+        result = compute_ntpj_xforce(ntpj)
 
     if args.dry_run:
         from pyspark.sql import functions as F
@@ -173,26 +161,18 @@ def main(argv: list[str] | None = None) -> int:
         result = result.persist()
         LOGGER.info("Dry run — not writing. Summary:")
         print()
-        counts = {
-            r["metric"]: r["rows"]
-            for r in result.groupBy("metric")
-            .agg(F.count(F.lit(1)).alias("rows"))
-            .collect()
-        }
-        for m in (METRIC_XFORCE, METRIC_SQUAD, METRIC_DISTRICT):
-            print(f"{m:>30}: {counts.get(m, 0):,} rows")
-
-        print("\nPer granularity (XForce roll-up):")
         by_gran = {
-            r["date_granularity"]: r["rows"]
-            for r in result.filter(F.col("metric") == F.lit(METRIC_XFORCE))
-            .groupBy("date_granularity")
-            .agg(F.count(F.lit(1)).alias("rows"))
+            r["date_granularity"]: (r["rows"], r["xforces"])
+            for r in result.groupBy("date_granularity")
+            .agg(
+                F.count(F.lit(1)).alias("rows"),
+                F.countDistinct("xforce").alias("xforces"),
+            )
             .collect()
         }
-        for g in GRANULARITIES:
-            print(f"  {g:>9}: {by_gran.get(g, 0):,} rows")
-
+        for g in ROLLUP_GRANULARITIES:
+            rows, xforces = by_gran.get(g, (0, 0))
+            print(f"{g:>9}: {rows:,} rows, {xforces:,} xforces")
         stats = result.agg(
             F.min("metric_value").alias("mv_min"),
             F.max("metric_value").alias("mv_max"),
@@ -200,14 +180,11 @@ def main(argv: list[str] | None = None) -> int:
         ).collect()[0]
         if stats["mv_min"] is not None:
             print(
-                f"\nmetric_value (%): min={stats['mv_min']:.1f}  "
+                f"\nmetric_value: min={stats['mv_min']:.1f}  "
                 f"max={stats['mv_max']:.1f}  mean={stats['mv_mean']:.1f}"
             )
-        print("\nHead (XForce roll-up, month grain):")
-        result.filter(
-            (F.col("metric") == F.lit(METRIC_XFORCE))
-            & (F.col("date_granularity") == F.lit("month"))
-        ).show(10, truncate=False)
+        print("\nHead (month grain):")
+        result.filter(F.col("date_granularity") == "month").show(10, truncate=False)
         result.unpersist()
         return 0
 
@@ -216,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
             spark,
             result,
             args.target,
-            IO_NUVINHOS_PERFORMANCE_METRIC_SCHEMA,
+            IO_NTPJ_XFORCE_METRIC_SCHEMA,
             layer="metrics",
             period_start=args.period_start,
             period_end=args.period_end,

@@ -254,32 +254,27 @@ def _expected_duration_by_month(monthly_totals: DataFrame) -> DataFrame:
     )
 
 
-def compute_ntpj(
+def _ntpj_base(
     jobs_raw: DataFrame,
-    period_start: date,
-    period_end: date,
     *,
     general_exclusions: DataFrame | None = None,
     cross_support: DataFrame | None = None,
     job_exclusions: DataFrame | None = None,
 ) -> DataFrame:
-    """Compute the NTPJ metric at all granularities.
+    """The row-level NTPJ base — one row per (agent, dims, date, month, job_id).
 
-    Args:
-        jobs_raw: the ``io_jobs_raw`` table, including the benchmark look-back
-            months before ``period_start``.
-        period_start / period_end: inclusive output window (rows outside are
-            used only for benchmarks, not emitted).
-        general_exclusions: ``adj_exclusiones_generales`` slot/date windows to
-            drop (``None`` to skip).
-        cross_support: ``adj_cross_support`` queue exclusions (``None`` to skip).
-        job_exclusions: ``adj_exclusiones_jobs`` job exclusions (``None`` to skip).
+    This is legacy ``normalized_time_per_job``: the agent contribution (finished
+    + required-activity + active-roster + outage/hardcode/manual-adjustment
+    exclusions) LEFT-joined to the **cohort-wide** ``exp_duration_job`` benchmark
+    (computed over ALL finished jobs of that ``job_id``, every team). It is
+    shared by :func:`compute_ntpj` (which aggregates it to the agent metric) and
+    :func:`compute_normalized_time_per_job` (which materializes the benchmark
+    substrate ``improved_benchmarks`` consumes). **No output-period filter is
+    applied here** — the caller restricts.
 
-    Returns:
-        Tidy long-format metric rows (see module docstring).
+    Columns: ``agent, xforce, xplead, team, squad, district, shift, date, month,
+    job_id, count, actual_seconds, exp_duration_job, expected_seconds``.
     """
-    spark = jobs_raw.sparkSession
-
     # Manual adjustments first (before the benchmark groupby), so an excluded
     # job leaves BOTH the benchmark and the contribution (matches legacy, which
     # applies manual_adjustments_ntpj / manual_queue_exclusions_ntpj before the
@@ -301,7 +296,7 @@ def compute_ntpj(
         F.lower(F.col("status")) == F.lit(FINISHED_STATUS)
     ).withColumn("month", F.trunc(F.to_date(F.col("date")), "month"))
 
-    # --- benchmark: from ALL finished jobs, windowed by month ---------------
+    # --- benchmark: from ALL finished jobs (every team), windowed by month ---
     monthly_totals = finished.groupBy("job_id", "month").agg(
         F.sum("duration_seconds").alias("tot_duration"),
         F.count(F.lit(1)).alias("tot_count"),
@@ -350,8 +345,41 @@ def compute_ntpj(
     # (agent, date) bucket skips that NULL in the denominator while still
     # counting actual_seconds in the numerator.
     base = base.join(expected, on=["job_id", "month"], how="left")
-    base = base.withColumn(
+    return base.withColumn(
         "expected_seconds", F.col("exp_duration_job") * F.col("count")
+    )
+
+
+def compute_ntpj(
+    jobs_raw: DataFrame,
+    period_start: date,
+    period_end: date,
+    *,
+    general_exclusions: DataFrame | None = None,
+    cross_support: DataFrame | None = None,
+    job_exclusions: DataFrame | None = None,
+) -> DataFrame:
+    """Compute the NTPJ metric at all granularities.
+
+    Args:
+        jobs_raw: the ``io_jobs_raw`` table, including the benchmark look-back
+            months before ``period_start``.
+        period_start / period_end: inclusive output window (rows outside are
+            used only for benchmarks, not emitted).
+        general_exclusions: ``adj_exclusiones_generales`` slot/date windows to
+            drop (``None`` to skip).
+        cross_support: ``adj_cross_support`` queue exclusions (``None`` to skip).
+        job_exclusions: ``adj_exclusiones_jobs`` job exclusions (``None`` to skip).
+
+    Returns:
+        Tidy long-format metric rows (see module docstring).
+    """
+    spark = jobs_raw.sparkSession
+    base = _ntpj_base(
+        jobs_raw,
+        general_exclusions=general_exclusions,
+        cross_support=cross_support,
+        job_exclusions=job_exclusions,
     )
 
     # --- restrict OUTPUT to the requested period (look-back rows drop out) ---
@@ -371,6 +399,87 @@ def compute_ntpj(
     )
 
 
+# Column order of the materialized ``normalized_time_per_job`` substrate.
+NORMALIZED_TIME_PER_JOB_COLUMNS: tuple[str, ...] = (
+    "agent",
+    "job_id",
+    "benchmark_month",
+    "xforce",
+    "xplead",
+    "team",
+    "squad",
+    "district",
+    "exp_duration_job",
+)
+
+
+def compute_normalized_time_per_job(
+    jobs_raw: DataFrame,
+    period_start: date,
+    period_end: date,
+    *,
+    general_exclusions: DataFrame | None = None,
+    cross_support: DataFrame | None = None,
+    job_exclusions: DataFrame | None = None,
+) -> DataFrame:
+    """Materialize the NTPJ benchmark substrate (legacy ``normalized_time_per_job``).
+
+    One row per ``(agent, job_id, benchmark_month, xforce, xplead, team, squad,
+    district)`` carrying the **cohort-wide** ``exp_duration_job`` — exactly the
+    grain legacy's ``ntpj_benchmark`` view aggregates from ``normalized_time_per_job``
+    (``[IO] Performance 2026.sql`` 1980-1992). ``improved_benchmarks`` consumes it
+    for the NTPJ benchmark family, so the benchmark values and the (xforce, xplead,
+    squad, district) attribution are identical to the shipped NTPJ metric — not
+    re-derived from raw jobs.
+
+    Days within a ``(job_id, month)`` are collapsed (``exp_duration_job`` is a
+    per-(job_id, month) constant). Restricted to ``benchmark_month`` within
+    ``[period_start month, period_end month]`` — the caller must widen the window
+    by one month before an ``improved_benchmarks`` output start so the
+    month-over-month LAG has its previous-month comparator.
+
+    Args:
+        jobs_raw: ``io_jobs_raw`` incl. the NTPJ benchmark look-back.
+        period_start / period_end: inclusive output window (by month).
+        general_exclusions / cross_support / job_exclusions: manual adjustments,
+            applied inside :func:`_ntpj_base` (matching NTPJ).
+
+    Returns:
+        Rows with :data:`NORMALIZED_TIME_PER_JOB_COLUMNS`.
+    """
+    base = _ntpj_base(
+        jobs_raw,
+        general_exclusions=general_exclusions,
+        cross_support=cross_support,
+        job_exclusions=job_exclusions,
+    )
+
+    rows = base.groupBy(
+        "agent", "job_id", "month", "xforce", "xplead", "team", "squad", "district"
+    ).agg(
+        # exp_duration_job is constant within (job_id, month); take any value.
+        F.first("exp_duration_job", ignorenulls=True).alias("exp_duration_job")
+    )
+
+    start_m = date(period_start.year, period_start.month, 1)
+    end_m = date(period_end.year, period_end.month, 1)
+    rows = rows.filter(
+        (F.col("month") >= F.lit(start_m)) & (F.col("month") <= F.lit(end_m))
+    )
+
+    return rows.select(
+        F.col("agent"),
+        F.col("job_id"),
+        F.col("month").alias("benchmark_month"),
+        F.col("xforce"),
+        F.col("xplead"),
+        F.col("team"),
+        F.col("squad"),
+        F.col("district"),
+        F.col("exp_duration_job"),
+    )
+
+
 IO_NTPJ_METRIC_SCHEMA: tuple[tuple[str, str], ...] = (
     ("agent", "STRING"),
     ("xforce", "STRING"),
@@ -385,4 +494,18 @@ IO_NTPJ_METRIC_SCHEMA: tuple[tuple[str, str], ...] = (
     ("numerator", "DOUBLE"),
     ("denominator", "DOUBLE"),
     ("metric_value", "DOUBLE"),
+)
+
+# The materialized ``normalized_time_per_job`` benchmark substrate (consumed by
+# ``improved_benchmarks``). ``benchmark_month`` is the month-start DATE.
+IO_NORMALIZED_TIME_PER_JOB_SCHEMA: tuple[tuple[str, str], ...] = (
+    ("agent", "STRING"),
+    ("job_id", "STRING"),
+    ("benchmark_month", "DATE"),
+    ("xforce", "STRING"),
+    ("xplead", "STRING"),
+    ("team", "STRING"),
+    ("squad", "STRING"),
+    ("district", "STRING"),
+    ("exp_duration_job", "DOUBLE"),
 )

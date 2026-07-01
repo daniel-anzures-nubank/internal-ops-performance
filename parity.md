@@ -4,7 +4,7 @@ Catalog of where the new pipeline's output **diverges** from the legacy SQL
 pipeline, with the cause and classification for each divergence. Companion to the
 migration rule — the new pipeline reproduces legacy **byte-for-byte for dates
 before the `2026-07-01` cutover** (including legacy bugs), with corrections only
-from the cutover onward (see `metrics_data/shift_attribution.py` and `AGENTS.md`).
+from the cutover onward (see `metrics_data/shift_attribution.py` and `CLAUDE.md`).
 
 Update this file as each metric is parity-checked.
 
@@ -679,12 +679,111 @@ with that work, since both target the same months.
 
 ---
 
+## Nuvinhos Performance — `io_nuvinhos_performance_metric` vs `nuvinhos_performance*` in `internal_ops_performance_2026` (main XForce) + `_sd` (main squad/district) + `_social_media` + `_content`
+
+**Status:** shipped (logic-correct; SM + Content at parity, main bounded by
+xpeer_index). The ratio of the **new-hire (nuvinho) cohort** Xpeer Index to the
+**tenured (old)** cohort, per XForce/squad/district. Reads `io_xpeer_index_metric`
++ the `agent_information` tenure extractor, so its parity is bounded by the agent
+Xpeer Index.
+
+**Three metric names:** `nuvinhos_performance` (XForce), `nuvinhos_performance_squad`,
+`nuvinhos_performance_district`. The main-deck **squad/district** rollups are
+S&D-derived (over the merged Core+Fraud universe, ELSE 0) and live in legacy
+`_sd` keyed by `squad`/`squad_district` (new `district` ↔ legacy `squad_district`);
+SM/Content also emit squad/district (degenerate NULL-key for those decks).
+
+**Legacy-faithful logic:** two-level aggregation (inner `AVG` per
+`(deck, xforce, xplead, squad, district, date, gran, nuvinho)` cohort → outer
+`AVG` per rollup key); per-deck ELSE NULL (main XForce, Content) vs ELSE 0 (main
+squad/district, SM); Content XForce single-level + degenerate squad/district;
+**deck grouping not team**; week+month + `>= 2025-12-01` floor pre-cutover.
+
+**Parity (week + month, ≤ 2026-06-15, legacy-anchored):**
+| Deck / grain | coverage | non-null avg abs diff | notes |
+| --- | --- | --- | --- |
+| social media (XForce) | 65/65 | **0.0** | at parity (within-2 92%) |
+| content (XForce) | 25/26 | **0.0** | degenerate all-NULL (no nuvinho cohort), matches |
+| main XForce | 1071/1152 (93%) | **1.72** | most covered rows both-NULL (agree); bounded by xpeer_index |
+| main squad (vs `_sd`) | 152/198 (77%) | **0.50** | covered values match |
+| main district (vs `_sd`) | 316/414 (76%) | **0.68** | new produces 20/22 districts |
+
+### Divergences
+| Divergence | Cause | Class |
+| --- | --- | --- |
+| main XForce non-null off ~1.7 + 7% only_legacy | the ratio amplifies small `io_xpeer_index_metric` early-month diffs; same xplead coverage residual as `xpeers_in_target` | by-design / open |
+| main squad/district ~23% only_legacy | missing districts `content` (inherits the **deferred** xpeer_index Content base gap), `occ`, `training` (small support districts) + some date coverage; covered values match | open (deferred / minor) |
+| Content all-NULL | Content tenure has no `last_change_date` → everyone tenured → numerator NULL (matches legacy's never-matching `valid_from` window) | by-design |
+
+### Verdict
+**Shipped (logic-correct).** SM and Content XForce are at parity; the two-level
+aggregation, per-deck ELSE NULL/0, and S&D-derived real-key squad/district
+rollups all reproduce legacy (covered values match across every deck/grain). The
+main-deck residuals trace to the deferred `io_xpeer_index_metric` Content base
+gap (the missing `content` district) and the same xplead coverage nuance as
+`xpeers_in_target`; no logic error.
+
+---
+
+## Improved Benchmarks — `io_improved_benchmarks_metric` (metric `improved_benchmark_xforce`) vs `improved_benchmark` in `usr.mx__cx.internal_ops_performance_2026` (main deck, Core/Fraud)
+
+**Status:** validated over the month grain **`2026-01 … 2026-04`** — the only
+months legacy emits (`improved_benchmark_monthly` is gated `date_reference <
+2026-05-01`). Comparison joins on `(xforce, xplead, month)`.
+
+**Scope — XForce metric only.** This build emits **`improved_benchmark_xforce`**
+(legacy main-deck `improved_benchmark`) — the component `xforce_index` consumes.
+The legacy **S&D-deck** `improved_benchmark_squad` / `_district`
+(`[IO] Performance 2026 - S&D.sql`) are **out of scope**: the S&D notebook is not
+a documented pipeline component (`legacy/CLAUDE.md`), and it attributes each
+benchmark via a separate `agent_information` snapshot join rather than the roster.
+
+**Value parity (avg abs diff, pp):** **Apr 0.96**, **Mar 1.8**, **Feb 7.7**,
+**Jan 13.6**. Mar/Apr are near-parity; Jan/Feb are bounded by the shared NTPJ
+early-month benchmark gap (below), not a logic error. The benchmark-unit
+population is bit-exact to legacy (March: 768 vs 769 distinct
+`job_id × xforce × district`).
+
+### Reproduced and matching (the parity fixes)
+- **Consumes the NTPJ substrate** `io_normalized_time_per_job` (legacy
+  `normalized_time_per_job`), so the benchmark `exp_duration_job` is cohort-wide
+  (all teams) and the `(xforce, xplead, squad, district)` attribution is the NTPJ
+  contribution — not re-derived from Core/Fraud-filtered raw jobs.
+- **`(job_id, xforce)` LAG** (legacy `ntpj_benchmark_base` /
+  `occupancy_benchmark_base` `PARTITION BY job_id, xforce`): a `(job_id, xforce)`
+  new this month is a first month (not counted) even if the `job_id` appeared
+  last month under a different xforce. `ROUND(…,5)` before the compare; ties
+  count as improved.
+- **`ntpj_xforce` gate** (legacy `improved_benchmark_final FROM ntpj_xforces`):
+  units are dropped for an `(xforce, month)` with no `ntpj_xforce` row. A no-op
+  for NTPJ units; drops NTPJ-absent occupancy units.
+- **XForce gating**: flat `date_reference < 2026-05-01` for all teams + the
+  `david.fernandez` April carve-out (non-david Core April survives → 4-component
+  for `xforce_index`).
+
+### Divergences
+| Divergence | Cause | Class |
+| --- | --- | --- |
+| **Jan/Feb off (13.6 / 7.7)** | inherits the NTPJ early-month benchmark gap — the trailing-window `exp_duration_job` for Jan-Mar depends on 2025 history the production NTPJ run doesn't fully validate; the `ntpj_xforce` metric itself diffs Jan 22 → Apr 1.4 | open (shared NTPJ base gap) |
+| **April `only_legacy` xforces (~7)** | gate/coverage tied to NTPJ (legacy `ntpj_xforces` keeps xforces the substrate presence doesn't) | open (NTPJ-bound) |
+| Occupancy benchmark not substrate-backed | still recomputed from `io_occupancy_time_raw` (legacy reads `normalized_occupancy`); footprint on the xforce metric is small (occupancy only counts from April, ~5-6pp) | minor / deferred |
+
+### Verdict
+**Shipped (XForce metric).** `improved_benchmark_xforce` is at parity for Mar/Apr
+and bounded only by the deferred NTPJ early-month gap for Jan/Feb. Also ships a
+new **`ntpj_xforce`** metric (`io_ntpj_xforce_metric`, roll-up of `io_ntpj_metric`
+= legacy `ntpj_xforces`) that filled a real output-table gap, and the NTPJ
+substrate table `io_normalized_time_per_job`.
+
+---
+
 ## Other metrics — not yet parity-checked
 
-The remaining composites (XForce Index, Average XForce Index, Improved
-Benchmarks, Nuvinhos Performance) are **not** validated against legacy in this
-doc yet. (Improved Benchmarks is ported + logic-fixed on a branch but deferred —
-it needs 2025 `io_jobs_raw` history + a real `ntpj_xforce` rollup; it feeds
-XForce Index, so both wait.) Check for the same phantom-adherence cutover,
-meeting/leave filter, and DIME-squad filter as Adherence / Normalized Occupancy /
-NTPJ before assuming parity, plus the week+month-only restriction.
+**XForce Index** and **Average XForce Index** are **ported** (PySpark,
+unit-tested) on branches `port/xforce-index-pyspark` and
+`port/average-xforce-index-pyspark`. With Improved Benchmarks' XForce component
+now landed, they can be validated against legacy — reconcile the `xforce_index`
+component gating to the flat `date_reference < 2026-05-01` + david-April rule
+(non-david Core April is **4-component**, not 3), and check the same
+phantom-adherence cutover, meeting/leave filter, and DIME-squad filter as the
+base metrics, plus the week+month-only restriction.

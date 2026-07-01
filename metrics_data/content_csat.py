@@ -59,6 +59,8 @@ Output schema (one row per survey response × content agent)
 
 from __future__ import annotations
 
+from datetime import date
+
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
@@ -83,6 +85,16 @@ _QUESTION_COLS: tuple[str, ...] = (
 
 NUMBER_OF_QUESTIONS: int = len(_QUESTION_COLS)  # 5
 PROMOTER_THRESHOLD: int = 4
+
+# [Manual Fix] Content Temp Fix (2026-06-30 legacy re-export): exclude the
+# 'tiempo de entrega' question (`tiempo`, the 5th scored question) for these
+# agents in May 2026 — promoters drop that question's flag and
+# number_of_questions goes 5 -> 4. Applied after the roster join because legacy
+# keys it on the joined agent. Tracked in the adjustments sheet under
+# 'exclusiones generales'.
+TIEMPO_QUESTION_COL: str = "tiempo"
+TIEMPO_EXCLUSION_AGENTS: tuple[str, ...] = ("jesus.morales", "luis.contreras")
+TIEMPO_EXCLUSION_MONTH: date = date(2026, 5, 1)
 
 # Display-form squad labels that map to the 'emi_general' target_squad (legacy).
 _EMI_GENERAL_LABELS: tuple[str, ...] = (
@@ -184,6 +196,39 @@ def compute_content_csat(
     # This is the intentional fan-out: one response -> many agents serving the
     # squad that month.
     enriched = rows.join(roster, on=["target_squad", "snapshot_month"], how="inner")
+
+    # --- [Manual Fix] 'tiempo de entrega' exclusion --------------------------
+    # For jesus.morales + luis.contreras in May 2026, drop the `tiempo` question:
+    # promoters lose that question's promoter flag and number_of_questions goes
+    # 5 -> 4 (legacy Content Temp Fix, keyed on the joined agent). Recompute the
+    # per-response csat_score from the adjusted counts.
+    tiempo_excluded = F.col("agent").isin(*TIEMPO_EXCLUSION_AGENTS) & (
+        F.col("snapshot_month") == F.lit(TIEMPO_EXCLUSION_MONTH)
+    )
+    tiempo_promoter = F.when(
+        F.col(TIEMPO_QUESTION_COL).cast("double") >= F.lit(PROMOTER_THRESHOLD), F.lit(1)
+    ).otherwise(F.lit(0))
+    enriched = (
+        enriched.withColumn(
+            "promoters",
+            F.when(tiempo_excluded, F.col("promoters") - tiempo_promoter)
+            .otherwise(F.col("promoters"))
+            .cast("int"),
+        )
+        .withColumn(
+            "number_of_questions",
+            F.when(tiempo_excluded, F.col("number_of_questions") - F.lit(1))
+            .otherwise(F.col("number_of_questions"))
+            .cast("int"),
+        )
+        .withColumn(
+            "csat_score",
+            F.when(
+                F.col("number_of_questions") > F.lit(0),
+                F.col("promoters").cast("double") / F.col("number_of_questions"),
+            ).otherwise(F.lit(None).cast("double")),
+        )
+    )
 
     out = enriched.select(
         "agent",

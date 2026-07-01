@@ -512,7 +512,7 @@ Same metrics and logic as Core & Fraud → [XPLead (Core & Fraud)](#xplead-core-
 
   `CSAT = (7 + 4 + 8 + 7 + 6) / (8 * 5) = 80%`
 
-- **Edge Cases / Legacy Quirks:** _TBD — confirm the canonical `mx_content_csat` sheet schema (this dataset is not yet documented in `AGENTS_LEGACY.md`)._
+- **Edge Cases / Legacy Quirks:** _TBD — confirm the canonical `mx_content_csat` sheet schema (this dataset is not yet documented in `legacy/CLAUDE.md`)._
 
 #### 5. Xpeer Index
 
