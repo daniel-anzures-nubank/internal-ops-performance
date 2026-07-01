@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import secrets
 import subprocess
 from dataclasses import dataclass
@@ -232,6 +233,11 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+# run_id is interpolated into SQL and used as a partition value, so restrict its
+# alphabet. \Z (not $) so a trailing newline can't slip through.
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._:\-]+\Z")
+
+
 def new_run_id(run_ts: datetime | None = None) -> str:
     """Generate a lexicographically-sortable run id, e.g. ``20260616T201500Z-a1b2``."""
     run_ts = run_ts or utc_now()
@@ -239,11 +245,28 @@ def new_run_id(run_ts: datetime | None = None) -> str:
 
 
 def resolve_run_id(run_id: str | None, run_ts: datetime) -> str:
-    """Pick the run id: explicit arg > ``PIPELINE_RUN_ID`` env var > generated."""
+    """Pick the run id: explicit arg > ``PIPELINE_RUN_ID`` env var > generated.
+
+    Operator-supplied ids (the explicit ``--run-id`` argument and the
+    ``PIPELINE_RUN_ID`` env var) must match ``[A-Za-z0-9._:-]+`` — the id is
+    interpolated into the snapshot DELETE statement and used as a Delta
+    partition value, so anything else raises ``ValueError``. Generated ids are
+    safe by construction and pass through unvalidated.
+    """
     if run_id:
+        if not _RUN_ID_RE.match(run_id):
+            raise ValueError(
+                f"invalid run_id from --run-id: {run_id!r}, "
+                "must match [A-Za-z0-9._:-]+"
+            )
         return run_id
     env_run_id = os.environ.get(RUN_ID_ENV_VAR)
     if env_run_id:
+        if not _RUN_ID_RE.match(env_run_id):
+            raise ValueError(
+                f"invalid run_id from {RUN_ID_ENV_VAR} env var: {env_run_id!r}, "
+                "must match [A-Za-z0-9._:-]+"
+            )
         return env_run_id
     return new_run_id(run_ts)
 
@@ -287,6 +310,8 @@ def _append_snapshot(
     )
 
     # Idempotent rerun: clear any prior rows for this run_id (no-op if new).
+    # run_id is safe to interpolate: operator-supplied values are validated
+    # against _RUN_ID_RE in resolve_run_id.
     if spark.catalog.tableExists(snapshot_table):
         spark.sql(
             f"DELETE FROM {snapshot_table} WHERE run_id = '{run_id}'"
