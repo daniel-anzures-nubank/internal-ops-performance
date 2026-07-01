@@ -1,11 +1,13 @@
 """ntpj_xforce — the XForce-grain roll-up of NTPJ, PySpark.
 
 ``ntpj_xforce`` answers "what share of this XForce's agents hit the NTPJ target
-(``ntpj <= 100``) this period?":
+this period?":
 
-    ntpj_xforce = COUNT(DISTINCT agents with ntpj <= 100) / COUNT(DISTINCT agents)
+    ntpj_xforce = COUNT(DISTINCT on-target agents) / COUNT(DISTINCT agents)
 
-per ``(xforce, xplead)`` per period. It is a **roll-up of the agent-grain NTPJ
+per ``(xforce, xplead)`` per period. "On target" is **team-aware**: Core/Fraud use
+the duration target ``ntpj <= 100`` (lower-is-better); Content uses the SLA
+target ``ntpj >= 95`` (its NTPJ is SLA-weighted compliance, higher-is-better). It is a **roll-up of the agent-grain NTPJ
 metric** (``io_ntpj_metric``), not a fresh computation — exactly like legacy
 ``ntpj_xforces_monthly`` / ``ntpj_xforces_weekly`` which ``GROUP BY`` the
 ``ntpj_agents_monthly`` / ``ntpj_agents_weekly`` views
@@ -72,9 +74,17 @@ METRIC_NAME = "ntpj_xforce"
 SOURCE_METRIC = "ntpj"
 ROLLUP_GRANULARITIES: tuple[str, ...] = ("week", "month")
 
-# The NTPJ on-target threshold (lower is better): an agent is "on target" when
-# ntpj <= 100. Matches legacy `metric_value <= 100`.
+# The NTPJ on-target threshold (lower is better): a Core/Fraud agent is "on
+# target" when ntpj <= 100. Matches legacy `metric_value <= 100`.
 NTPJ_TARGET = 100.0
+
+# Content NTPJ is SLA-weighted compliance (higher is better), so its target is a
+# floor, not a ceiling: on-target = metric_value >= 95. This reproduces legacy
+# `ntpj_sla_old_xforces` (`>= 95`); note legacy is internally inconsistent — its
+# xplead roll-up `ntpj_sla_old_xpleads` uses `>= 100` — so the XForce-level 95 is
+# the one we match here (documented in parity.md).
+CONTENT_TEAM = "content"
+CONTENT_SLA_TARGET = 95.0
 
 
 def compute_ntpj_xforce(ntpj_metric: DataFrame) -> DataFrame:
@@ -98,9 +108,14 @@ def compute_ntpj_xforce(ntpj_metric: DataFrame) -> DataFrame:
     if len(agents.take(1)) == 0:
         return empty_metric_frame(spark)
 
-    on_target_agent = F.when(
-        F.col("metric_value") <= F.lit(NTPJ_TARGET), F.col("agent")
-    )
+    # Team-aware on-target test: Content is SLA compliance (>= 95, higher-better);
+    # Core/Fraud is duration (<= 100, lower-better). A NULL metric_value fails both
+    # (counts in the denominator, not the numerator), matching legacy.
+    is_content = F.lower(F.col("team")) == F.lit(CONTENT_TEAM)
+    on_target = F.when(
+        is_content, F.col("metric_value") >= F.lit(CONTENT_SLA_TARGET)
+    ).otherwise(F.col("metric_value") <= F.lit(NTPJ_TARGET))
+    on_target_agent = F.when(on_target, F.col("agent"))
 
     grouped = agents.groupBy(
         "team", "xforce", "xplead", "date_reference", "date_granularity"

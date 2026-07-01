@@ -196,17 +196,31 @@ class TestCoreFraud:
 # Content (CSAT is the quality term; quality only from March)
 # --------------------------------------------------------------------------- #
 class TestContent:
-    def test_mar_full_uses_csat(self, spark):
-        # adh 90, ntpj 130 -> 70, nocc 120 -> 100, csat 80. mean = 85
+    def test_mar_full_uses_csat_and_ntpj_raw(self, spark):
+        # Content NTPJ is SLA compliance, added RAW (NOT folded around 100).
+        # adh 90, ntpj 76 (raw), nocc 120 -> 100, csat 80. mean = (90+76+100+80)/4 = 86.5
         out = compute_xpeer_index(
             adherence=frame(spark, [_row("adherence", "a", 90, team="content")]),
-            ntpj=frame(spark, [_row("ntpj", "a", 130, team="content")]),
+            ntpj=frame(spark, [_row("ntpj", "a", 76, team="content")]),
             normalized_occupancy=frame(spark, [_row("normalized_occupancy", "a", 120, team="content")]),
             content_csat=frame(spark, [_row("content_csat", "a", 80, team="content")]),
         )
         r = only(out, "a")
         assert abs(r["denominator"] - 400.0) < 1e-9
-        assert abs(r["metric_value"] - 85.0) < 1e-9
+        assert abs(r["numerator"] - (90 + 76 + 100 + 80)) < 1e-9
+        assert abs(r["metric_value"] - 86.5) < 1e-9
+
+    def test_content_ntpj_added_raw_not_folded(self, spark):
+        # A Content NTPJ of 80 enters the index RAW as 80. (A Core/Fraud NTPJ of 80
+        # would FOLD to 100 — see TestCoreFraud.test_full_mar_composition.)
+        out = compute_xpeer_index(
+            adherence=frame(spark, [_row("adherence", "a", 100, team="content")]),
+            ntpj=frame(spark, [_row("ntpj", "a", 80, team="content")]),
+            normalized_occupancy=frame(spark, [_row("normalized_occupancy", "a", 100, team="content")]),
+            content_csat=frame(spark, [_row("content_csat", "a", 100, team="content")]),
+        )
+        r = only(out, "a")
+        assert abs(r["numerator"] - (100 + 80 + 100 + 100)) < 1e-9  # 80 raw, not folded to 100
 
     def test_february_is_adherence_only(self, spark):
         # Real Content has NO ntpj rows before March, so legacy Feb Content is

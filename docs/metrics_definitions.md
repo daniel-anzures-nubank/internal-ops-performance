@@ -444,30 +444,18 @@ Same metrics and logic as Core & Fraud → [XPLead (Core & Fraud)](#xplead-core-
 - **Description:** Same logic and datasets as Core & Fraud → [Adherence](#1-adherence).
 - **Edge Cases / Legacy Quirks:** _TBD — Content agent roster comes from `gsheets.sheets.mx_content_bdx` (with `valid_from`/`valid_to` ranges) instead of `cx_mx_bdx_snapshots`. Confirm Adherence still uses the same datasets and that the roster swap doesn't change the calculation._
 
-#### 2. Normalized Time Per Job (NTPJ)
+#### 2. Normalized Time Per Job (NTPJ) — SLA-weighted compliance
 
-- **Description:** Percentage of time spent on activities compared to the expected time for those activities. The expected-time benchmark is the average time per job over the trailing **4 months** (including the current month).
-- **Formula:** `Time Per Job / Expected Time Per Job`
-- **Target:** `<= 100%`
-- **Datasets:**
-  - `taskmaster_consolidated_registry`
-  - `agent_dimensioned_activities`
-- **Filters & Caveats:**
-  - All jobs are taken from `taskmaster_consolidated_registry`.
-  - Only jobs and time spent on dimensioned activities in DIME.
-  - Only shuffle status in `available`, `oos`.
-  - Started being measured in **March 2026** for Content; jobs only began being tracked in `taskmaster_consolidated_registry` in March 2026.
-  - **Still uses the trailing 4-month benchmark window** for all months — unlike Core & Fraud, which switched to current-month-only in April 2026.
-- **Example (Nuberto, January):**
-
-  | Job | Jobs Done | Total Time | Avg Time / Job | Benchmark |
-  | --- | --- | --- | --- | --- |
-  | Weduka A | 3 | 30 h | 10 h | 8 h |
-  | FAQ | 5 | 4 h | 0.8 h | 0.5 h |
-
-  `NTPJ = (10 + 0.8) / (8 + 0.5) = 127.1%`
-
-- **Edge Cases / Legacy Quirks:** _TBD — confirm Content NTPJ ignores `ops_canonical_time_spent_activities` (unlike Core & Fraud)._
+- **Description:** Despite the name (kept for standardization across teams), Content NTPJ is **not** the duration `actual/expected` ratio Core & Fraud use. It is a **jobs-within-SLA compliance** metric — the share of SLA-weighted work delivered within its SLA. Legacy calls it `ntpj_sla_old` and promotes it to `metric='ntpj_agent'`.
+- **Formula:** `SUM(sla_seconds of on-time jobs) / SUM(sla_seconds) * 100`. A job is "on time" iff `actual_seconds <= sla_seconds`; crediting is **all-or-nothing** (an on-time job credits its full `sla_seconds`, a late job credits 0).
+- **Target:** `>= 95%` (higher is better; bounded ≤ 100).
+- **Job grain:** `macros` / `faq` / `ar` → one job = one source row; every other type → one job = one distinct `content_id` (MOS ticket), summing `net_time_spent_seconds`.
+- **SLA map:** per-job-type OLD-SLA seconds from the **`Content - SLAs`** sheet tab (`adj_content_slas`). An INNER JOIN drops job types with no Content SLA (`mastery_cx`, `sop`, generic `projects`, stray Core/Fraud OOS types).
+- **Datasets:** `taskmaster_consolidated_registry` (OOS only; `content_id` parsed from `comment` / `ticket__id`), `agent_information` (Content roster), `adj_content_slas` (SLA map).
+- **Filters & Caveats:** Content agents only; `date >= 2025-12-01`; outage dates `2026-03-10 / 2026-03-27 / 2026-04-09` dropped (before the `content_id` grouping). Content OOS tracking begins March 2026.
+- **Example (aura.olvera, March 2026):** `358,800 / 471,000 = 76.18%` — cluster-verified byte-for-byte vs legacy `ntpj_sla_old`.
+- **Consumers:** Xpeer Index (Content) adds this **raw** (NOT folded around 100, unlike Core/Fraud duration NTPJ); `ntpj_xforce` (Content) counts agents `>= 95`.
+- **Implementation:** substrate `metrics_data/jobs_within_sla.py` → `io_jobs_within_sla_raw`; metric `metrics/content_sla_ntpj.py`, unioned into `io_ntpj_metric` by `build_ntpj.py`.
 
 #### 3. Normalized Occupancy (NO)
 
