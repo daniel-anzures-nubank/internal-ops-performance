@@ -11,30 +11,35 @@ carve-out.
 
 What we do here:
   1. Get the ambient SparkSession (shared ``db.open_connection``).
-  2. Read the two raw inputs **with a benchmark look-back** before the output
-     period (month-over-month comparison + the NTPJ trailing window):
-       * ``io_jobs_raw``            — 6-month look-back.
-       * ``io_occupancy_time_raw``  — 2-month look-back.
-     plus the ``io_ntpj_xforce_metric`` gate driver (output period only — the
-     gate keys on the emitted month).
+  2. Read the inputs:
+       * ``io_normalized_time_per_job`` — the NTPJ benchmark substrate, read with
+         **one previous month** before the output period (the LAG comparator; the
+         benchmark values are already baked in).
+       * ``io_occupancy_time_raw``      — 2-month look-back (occupancy benchmark).
+       * ``io_ntpj_xforce_metric``      — the gate driver (output period only —
+         the gate keys on the emitted month).
   3. Call ``compute_improved_benchmarks`` (emits only the requested months).
   4. Either print a summary (``--dry-run``) or replace the target Delta table.
 
 Tables
 ------
-* Inputs:  ``usr.danielanzures.io_jobs_raw``, ``usr.danielanzures.io_occupancy_time_raw``,
+* Inputs:  ``usr.danielanzures.io_normalized_time_per_job`` (NTPJ benchmark),
+  ``usr.danielanzures.io_occupancy_time_raw``,
   ``usr.danielanzures.io_ntpj_xforce_metric`` (the ``ntpj_xforce`` gate).
 * Output:  ``usr.danielanzures.io_improved_benchmarks_metric`` (override ``--target``).
 
-Depends on ``build_ntpj_xforce`` (which depends on ``build_ntpj``) — the gate
-table must be built for the output period first.
+Depends on ``build_normalized_time_per_job`` and ``build_ntpj_xforce`` (both
+built from the NTPJ chain) — the substrate must cover [output start − 1 month,
+output end] and the gate table the output months, first.
 
 Manual adjustments
 ------------------
-``exclusiones_generales`` (slot/date windows), ``inconsistencias_dime``
-(DIME reclassification), ``cross_support`` (queue exclusions), and
-``exclusiones_jobs`` (job exclusions) are read from their synced ``adj_*`` Delta
-tables, if present, and applied inside ``compute_improved_benchmarks``.
+The NTPJ-side adjustments (``exclusiones_generales`` slot windows,
+``cross_support`` queue exclusions, ``exclusiones_jobs``) are applied **upstream**
+in ``build_normalized_time_per_job``. Here we apply only the occupancy-side
+adjustments: ``exclusiones_generales`` (slot/date windows) and
+``inconsistencias_dime`` (DIME reclassification), read from their synced ``adj_*``
+Delta tables if present.
 
 Usage
 -----
@@ -90,12 +95,14 @@ from adjustments.manual import read_adjustment_table  # noqa: E402
 
 LOGGER = logging.getLogger("cx_metrics.improved_benchmarks")
 
-DEFAULT_JOBS_SOURCE = "usr.danielanzures.io_jobs_raw"
+DEFAULT_NTPJ_SOURCE = "usr.danielanzures.io_normalized_time_per_job"
 DEFAULT_OCC_SOURCE = "usr.danielanzures.io_occupancy_time_raw"
 DEFAULT_NTPJ_XFORCE_SOURCE = "usr.danielanzures.io_ntpj_xforce_metric"
 DEFAULT_TARGET = "usr.danielanzures.io_improved_benchmarks_metric"
 
-JOBS_LOOKBACK_MONTHS = 6
+# The NTPJ substrate already carries the trailing-window benchmark VALUES; we
+# only need one PREVIOUS month before period_start for the month-over-month LAG.
+NTPJ_LOOKBACK_MONTHS = 1
 OCC_LOOKBACK_MONTHS = 2
 
 
@@ -113,7 +120,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--period-start", required=True, type=date.fromisoformat)
     parser.add_argument("--period-end", required=True, type=date.fromisoformat)
-    parser.add_argument("--jobs-source", default=DEFAULT_JOBS_SOURCE)
+    parser.add_argument(
+        "--ntpj-source",
+        default=DEFAULT_NTPJ_SOURCE,
+        help="NTPJ benchmark substrate (normalized_time_per_job) "
+        f"(default: {DEFAULT_NTPJ_SOURCE}).",
+    )
     parser.add_argument("--occupancy-source", default=DEFAULT_OCC_SOURCE)
     parser.add_argument(
         "--ntpj-xforce-source",
@@ -169,13 +181,18 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
-    jobs_start = _lookback_start(args.period_start, JOBS_LOOKBACK_MONTHS)
+    # The NTPJ substrate needs one PREVIOUS month before period_start for the
+    # month-over-month LAG; the benchmark VALUES are already baked in.
+    ntpj_start = _lookback_start(args.period_start, NTPJ_LOOKBACK_MONTHS)
     occ_start = _lookback_start(args.period_start, OCC_LOOKBACK_MONTHS)
 
     spark = open_connection()
 
-    with _log_step(f"read {args.jobs_source} (from {jobs_start})"):
-        jobs = read_table(spark, args.jobs_source, jobs_start, args.period_end)
+    with _log_step(f"read {args.ntpj_source} (from {ntpj_start})"):
+        ntpj = read_table(
+            spark, args.ntpj_source, ntpj_start, args.period_end,
+            date_col="benchmark_month",
+        )
 
     with _log_step(f"read {args.occupancy_source} (from {occ_start})"):
         occ = read_table(spark, args.occupancy_source, occ_start, args.period_end)
@@ -190,15 +207,13 @@ def main(argv: list[str] | None = None) -> int:
 
     with _log_step("compute_improved_benchmarks"):
         result = compute_improved_benchmarks(
-            jobs,
+            ntpj,
             occ,
             args.period_start,
             args.period_end,
             ntpj_xforce=ntpj_xforce,
             general_exclusions=read_adjustment_table(spark, "exclusiones_generales"),
             dime_inconsistencies=read_adjustment_table(spark, "inconsistencias_dime"),
-            cross_support=read_adjustment_table(spark, "cross_support"),
-            job_exclusions=read_adjustment_table(spark, "exclusiones_jobs"),
         )
 
     if args.dry_run:

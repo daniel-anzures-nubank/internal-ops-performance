@@ -62,12 +62,13 @@ Legacy ``improved_benchmark_final`` is driven by the ``ntpj_xforce`` output rows
 metric='ntpj_xforce'`` LEFT JOIN the benchmark units on ``month + xforce``), so a
 benchmark unit for an ``(xforce, month)`` that has **no** ``ntpj_xforce`` output
 row that month is dropped — this changes squad/district AND xforce denominators.
-We gate on the **real ``ntpj_xforce`` metric** (``io_ntpj_xforce_metric``, the
-month rows) passed in as ``ntpj_xforce``: its ``(xforce, month)`` presence
-already reflects every NTPJ exclusion (outage / hardcode / manual adjustment),
-so the gate is exact. When it is not supplied we fall back to an **approximate**
-reconstruction from ``jobs_raw`` (finished + required-activity + active-roster),
-which misses those exclusions — see ``_ntpj_xforce_months``.
+We gate on the ``ntpj_xforce`` metric (``io_ntpj_xforce_metric``, the month rows)
+passed in as ``ntpj_xforce``. When it is not supplied we derive the **identical**
+presence from ``normalized_time_per_job`` — an ``ntpj_xforce`` row exists for an
+``(xforce, month)`` iff at least one of that xforce's agents has an NTPJ
+contribution (a ``normalized_time_per_job`` row) that month. The gate is a
+**no-op for NTPJ units** (their xforce is self-present); it only drops occupancy
+units for xforces with no NTPJ row that month.
 
 Scope (per the SOT + product guidance)
 ---------------------------------------
@@ -75,8 +76,10 @@ Scope (per the SOT + product guidance)
 
 Inputs
 ------
-* ``io_jobs_raw`` (NTPJ benchmark) — needs a benchmark look-back before the
-  output period (the build script reads ~6 extra months).
+* ``io_normalized_time_per_job`` (NTPJ benchmark + attribution) — legacy's
+  ``normalized_time_per_job``, materialized from the NTPJ build. Needs **one
+  previous month** before the output period for the month-over-month LAG (its
+  own build carries the NTPJ trailing-window look-back for the benchmark values).
 * ``io_occupancy_time_raw`` (occupancy benchmark) — needs ~2 extra months.
 * ``io_ntpj_xforce_metric`` (the gate driver) — the month rows supply the
   ``(xforce, month)`` presence that survives the LEFT-JOIN gate.
@@ -100,14 +103,7 @@ from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
 from metric_utils import METRIC_COLUMNS, empty_metric_frame
-from ntpj import (
-    ACTIVE_ROSTER_STATUS,
-    FINISHED_STATUS,
-    _expected_duration_by_month,
-)
 from adjustments.manual import (
-    drop_cross_support_jobs,
-    drop_excluded_jobs,
     drop_slot_windows,
     reclassify_dime_slots,
 )
@@ -193,46 +189,38 @@ def _flag_improved(benchmarks: DataFrame, *, direction: str) -> DataFrame:
     )
 
 
-def _ntpj_benchmark_units(jobs: DataFrame) -> DataFrame:
-    """NTPJ benchmark units: attribution rows + the per-job_id improvement flag.
+def _ntpj_benchmark_units(ntpj: DataFrame) -> DataFrame:
+    """NTPJ benchmark units from the ``normalized_time_per_job`` substrate.
 
-    The benchmark is per ``(job_id, month)`` (cohort-wide ``exp_duration_job``,
-    legacy trailing-window rule). The improvement flag is computed at that grain
-    (LAG by job_id), then joined onto the distinct ``(job_id, xforce, xplead,
-    month, squad, district)`` attribution rows — so a single job_id splits across
-    every (squad, district) its agents worked, but the improvement decision is
-    made ONCE per job_id (not per split row). Returns the :data:`_UNIT_COLS`.
+    ``ntpj`` is legacy ``normalized_time_per_job``: one row per ``(agent, job_id,
+    benchmark_month, xforce, xplead, team, squad, district)`` with the cohort-wide
+    ``exp_duration_job``. This matches legacy exactly — the benchmark and its
+    (xforce, xplead, squad, district) attribution come from the NTPJ dataset, not
+    re-derived from raw jobs:
+
+    * benchmark per ``(job_id, month)`` = ``AVG(exp_duration_job)`` (a per-job_id
+      constant, so ``AVG`` = the value) — legacy ``ntpj_benchmark_agg``;
+    * the improvement flag is computed once per job_id (``_flag_improved`` LAGs by
+      the key), then joined onto the distinct ``(job_id, xforce, xplead, month,
+      squad, district)`` attribution rows — so a job_id splits across every
+      (squad, district) its agents worked (legacy ``ntpj_benchmark`` GROUP BY).
+
+    Returns the :data:`_UNIT_COLS`.
     """
-    spark = jobs.sparkSession
-    finished = jobs.filter(
-        F.lower(F.col("status")) == F.lit(FINISHED_STATUS)
-    ).withColumn("month", F.trunc(F.to_date(F.col("date")), "month"))
-
-    if len(finished.take(1)) == 0:
+    spark = ntpj.sparkSession
+    rows = ntpj.withColumn("month", F.col("benchmark_month"))
+    if len(rows.take(1)) == 0:
         return _empty_units(spark)
 
-    # Benchmark from ALL finished jobs of that job_id, windowed by month (legacy
-    # NTPJ trailing-window rule), reusing ntpj._expected_duration_by_month.
-    monthly_totals = finished.groupBy("job_id", "month").agg(
-        F.sum("duration_seconds").alias("tot_duration"),
-        F.count(F.lit(1)).alias("tot_count"),
-    )
-    expected = _expected_duration_by_month(monthly_totals)  # job_id, month, exp_duration_job
-    benchmarks = expected.select(
-        F.col("job_id").alias("key"),
-        "month",
-        F.col("exp_duration_job").alias("benchmark"),
-    )
+    # Benchmark per (job_id, month): cohort-wide exp_duration_job, constant across
+    # the attribution rows (legacy ntpj_benchmark_agg = ROUND(AVG(...),5); the
+    # ROUND happens inside _flag_improved before the LAG/compare).
+    benchmarks = rows.groupBy(
+        F.col("job_id").alias("key"), "month"
+    ).agg(F.avg("exp_duration_job").alias("benchmark"))
     flags = _flag_improved(benchmarks, direction="lower")  # key, month, improved, counted
 
-    # Attribution: distinct (job_id, xforce, xplead, month, squad, district) over
-    # the agent contribution rows (required-activity only, legacy required_hours
-    # IS NOT NULL). One row per (squad, district) an xforce's agents worked it in.
-    contrib = finished.filter(F.col("required_activity_on_day_flag") == F.lit(1))
-    if len(contrib.take(1)) == 0:
-        return _empty_units(spark)
-
-    attribution = contrib.select(
+    attribution = rows.select(
         F.col("job_id").alias("key"),
         "xforce",
         "xplead",
@@ -323,29 +311,24 @@ def _ntpj_xforce_months_from_metric(ntpj_xforce: DataFrame) -> DataFrame:
     )
 
 
-def _ntpj_xforce_months(jobs: DataFrame) -> DataFrame:
-    """Approximate ``(xforce, month)`` gate reconstructed from raw jobs.
+def _ntpj_xforce_months_from_substrate(ntpj: DataFrame) -> DataFrame:
+    """The ``(xforce, month)`` gate derived from ``normalized_time_per_job``.
 
-    Fallback for when the real ``ntpj_xforce`` metric is not supplied (tests /
-    ad-hoc). An ``ntpj_xforce`` row exists for an ``(xforce, month)`` iff at least
-    one of that xforce's agents produced an NTPJ agent row that month — i.e. a
-    finished, required-activity, **active-roster** job. This reconstruction
-    **misses** the NTPJ outage / hardcode / manual-adjustment exclusions, so it
-    can keep an ``(xforce, month)`` whose only NTPJ presence was an excluded day.
-    Prefer :func:`_ntpj_xforce_months_from_metric` (the exact gate).
+    Equivalent to :func:`_ntpj_xforce_months_from_metric`: an ``ntpj_xforce`` row
+    exists for an ``(xforce, month)`` iff at least one of that xforce's agents has
+    an NTPJ contribution row that month — i.e. a ``normalized_time_per_job`` row.
+    So the distinct ``(xforce, benchmark_month)`` of the substrate is exactly the
+    monthly ``ntpj_xforce`` presence, and (unlike the separately-built metric) is
+    guaranteed to cover the emitted window. Used when no explicit ``ntpj_xforce``
+    is supplied. Note the gate is a **no-op for NTPJ units** (their xforce is
+    self-present) — it only drops occupancy units for NTPJ-absent xforces.
 
     Returns a frame of distinct ``(xforce, month)``.
     """
-    return (
-        jobs.filter(
-            (F.lower(F.col("status")) == F.lit(FINISHED_STATUS))
-            & (F.col("required_activity_on_day_flag") == F.lit(1))
-            & (F.lower(F.col("roster_status")) == F.lit(ACTIVE_ROSTER_STATUS))
-        )
-        .withColumn("month", F.trunc(F.to_date(F.col("date")), "month"))
-        .select("xforce", "month")
-        .distinct()
-    )
+    return ntpj.select(
+        F.col("xforce"),
+        F.col("benchmark_month").alias("month"),
+    ).distinct()
 
 
 # The unit columns NOT in a roll-up's grouping key — the tuple whose DISTINCT
@@ -426,7 +409,7 @@ def _rollup(units: DataFrame, *, level: str, metric_name: str) -> DataFrame:
 
 
 def compute_improved_benchmarks(
-    jobs_raw: DataFrame,
+    normalized_time_per_job: DataFrame,
     occupancy_time: DataFrame,
     period_start: date,
     period_end: date,
@@ -434,53 +417,53 @@ def compute_improved_benchmarks(
     ntpj_xforce: DataFrame | None = None,
     general_exclusions: DataFrame | None = None,
     dime_inconsistencies: DataFrame | None = None,
-    cross_support: DataFrame | None = None,
-    job_exclusions: DataFrame | None = None,
 ) -> DataFrame:
     """Compute Improved Benchmarks (squad + district + xforce, month grain, Core/Fraud).
 
     Args:
-        jobs_raw: ``io_jobs_raw`` incl. a benchmark look-back before period_start.
+        normalized_time_per_job: the NTPJ benchmark substrate (legacy
+            ``normalized_time_per_job`` / ``io_normalized_time_per_job``), incl.
+            **one previous month** before ``period_start`` for the month-over-month
+            LAG. Its manual adjustments were applied upstream (in the NTPJ build),
+            so none are re-applied here.
         occupancy_time: ``io_occupancy_time_raw`` incl. a short look-back.
         period_start / period_end: inclusive output window (by month). Look-back
             rows are used only for benchmarks / the previous-month comparison.
-        ntpj_xforce: ``io_ntpj_xforce_metric`` rows — the **exact** gate driver
-            (Fix #5). Its month rows supply the ``(xforce, month)`` presence a
-            benchmark unit must have to survive. If ``None``, the gate falls back
-            to an approximate reconstruction from ``jobs_raw``.
+        ntpj_xforce: ``io_ntpj_xforce_metric`` rows — the gate driver (Fix #5),
+            legacy ``FROM ntpj_xforces``. Its month rows supply the
+            ``(xforce, month)`` presence a benchmark unit must have to survive.
+            If ``None``, the gate derives the identical presence from
+            ``normalized_time_per_job`` (which always covers the emitted window).
+        general_exclusions: ``adj_exclusiones_generales`` slot/date windows —
+            applied to the **occupancy** source only (the NTPJ side is already
+            adjusted upstream).
+        dime_inconsistencies: ``adj_inconsistencias_dime`` — occupancy DIME
+            reclassification.
 
     Returns:
         Tidy long-format metric rows (squad + district + xforce), month grain.
     """
-    spark = jobs_raw.sparkSession
+    spark = normalized_time_per_job.sparkSession
 
-    jobs_empty = len(jobs_raw.take(1)) == 0
+    ntpj_empty = len(normalized_time_per_job.take(1)) == 0
     occ_empty = len(occupancy_time.take(1)) == 0
-    if jobs_empty and occ_empty:
+    if ntpj_empty and occ_empty:
         return empty_metric_frame(spark)
 
-    # --- manual adjustments (mirror the pandas / NTPJ path) -----------------
-    jobs_source = jobs_raw
-    if not jobs_empty:
-        jobs_source = jobs_raw.withColumn(
-            "slot_time", F.date_format(F.col("start_time"), "HH:mm:ss")
-        )
-        jobs_source = drop_slot_windows(jobs_source, general_exclusions)
-        jobs_source = drop_cross_support_jobs(jobs_source, cross_support)
-        jobs_source = drop_excluded_jobs(jobs_source, job_exclusions)
-        jobs_source = jobs_source.drop("slot_time")
-
+    # --- occupancy manual adjustments (the NTPJ side is adjusted upstream) ---
     occ_source = occupancy_time
     if not occ_empty:
         occ_source = reclassify_dime_slots(occupancy_time, dime_inconsistencies)
         occ_source = drop_slot_windows(occ_source, general_exclusions)
 
     # --- Core / Fraud only ---------------------------------------------------
+    # Filtering the substrate to Core/Fraud keeps the cohort-wide exp_duration_job
+    # (baked in upstream over ALL teams) while restricting the attribution units.
     teams = list(IMPROVED_BENCHMARKS_TEAMS)
-    jobs = (
-        jobs_source.filter(F.lower(F.col("team")).isin(teams))
-        if not jobs_empty
-        else jobs_source
+    ntpj = (
+        normalized_time_per_job.filter(F.lower(F.col("team")).isin(teams))
+        if not ntpj_empty
+        else normalized_time_per_job
     )
     occ = (
         occ_source.filter(F.lower(F.col("team")).isin(teams))
@@ -489,8 +472,8 @@ def compute_improved_benchmarks(
     )
 
     parts: list[DataFrame] = []
-    if not jobs_empty:
-        parts.append(_ntpj_benchmark_units(jobs))
+    if not ntpj_empty:
+        parts.append(_ntpj_benchmark_units(ntpj))
     if not occ_empty:
         parts.append(_occupancy_benchmark_units(occ))
     parts = [p for p in parts if len(p.take(1)) > 0]
@@ -503,17 +486,18 @@ def compute_improved_benchmarks(
 
     # --- Fix #5: ntpj_xforce LEFT-JOIN gating --------------------------------
     # Drop benchmark units for an (xforce, month) with no ntpj_xforce output row
-    # that month. Prefer the real ntpj_xforce metric (exact — already reflects
-    # every NTPJ exclusion); fall back to the approximate jobs reconstruction.
+    # that month. Prefer the explicit ntpj_xforce metric (legacy FROM ntpj_xforces);
+    # otherwise derive the identical presence from the substrate. The gate is a
+    # no-op for NTPJ units (self-present) — it only drops NTPJ-absent occupancy
+    # units.
     if ntpj_xforce is not None:
         xforce_months = _ntpj_xforce_months_from_metric(ntpj_xforce)
-        units = units.join(xforce_months, on=["xforce", "month"], how="left_semi")
-    elif not jobs_empty:
-        xforce_months = _ntpj_xforce_months(jobs)
-        units = units.join(xforce_months, on=["xforce", "month"], how="left_semi")
+    elif not ntpj_empty:
+        xforce_months = _ntpj_xforce_months_from_substrate(ntpj)
     else:
-        # No jobs and no ntpj_xforce => no gate rows => nothing survives.
+        # No NTPJ substrate and no ntpj_xforce => no gate rows => nothing survives.
         return empty_metric_frame(spark)
+    units = units.join(xforce_months, on=["xforce", "month"], how="left_semi")
 
     # --- restrict to the OUTPUT period (look-back months drop out) ----------
     start_m = date(period_start.year, period_start.month, 1)

@@ -1,10 +1,16 @@
 """Unit tests for ``metrics/improved_benchmarks.py`` (PySpark).
 
-Small synthetic Spark frames mimicking ``io_jobs_raw`` / ``io_occupancy_time_raw``,
-no warehouse. We verify the NTPJ (lower=better) and occupancy (higher=better)
-month-over-month comparisons, the tie rule, first-month exclusion, the squad +
-district + xforce roll-ups, team scope (Core/Fraud only), and the output
-contract — plus the parity fixes:
+Small synthetic Spark frames, no warehouse. The NTPJ benchmark family now
+consumes the ``normalized_time_per_job`` substrate directly (one row per
+``(agent, job_id, benchmark_month, xforce, xplead, team, squad, district)`` with
+``exp_duration_job``), so tests specify the benchmark value directly instead of
+deriving it from raw job durations. The occupancy family still consumes
+``io_occupancy_time_raw``.
+
+We verify the NTPJ (lower=better) and occupancy (higher=better) month-over-month
+comparisons, the tie rule, first-month exclusion, the squad + district + xforce
+roll-ups, team scope (Core/Fraud only), and the output contract — plus the parity
+fixes:
 
 * **Fix #1** — squad / district roll-ups have NO month gate and NO team cutover
   (Core April squad rows are emitted).
@@ -12,12 +18,14 @@ contract — plus the parity fixes:
   plus the ``david.fernandez`` Apr-2026 carve-out (non-david Core April survives).
 * **Fix #3** — the occupancy benchmark starts 2026-03 (no February comparator).
 * **Fix #5** — benchmark units are gated to ``(xforce, month)`` that have an
-  ``ntpj_xforce`` row (a finished + required + active-roster job that month).
+  ``ntpj_xforce`` row (derived from the substrate presence, or an explicit
+  ``ntpj_xforce`` metric). A no-op for NTPJ units; drops NTPJ-absent occ units.
 * **Fix #6** — a job_id splits across squad/district rows by the agent's roster
-  attribution.
+  attribution (carried in the substrate).
 
-Test months avoid the NTPJ trailing-window complication by using 2026-03 (the
-look-back / previous month) and 2026-04 (the compared/emitted month).
+Test months use 2026-03 (the previous month / LAG comparator) and 2026-04 (the
+compared/emitted month). NTPJ ``benchmark_month`` values are month-start dates
+(as materialized); occupancy ``date`` values stay daily.
 """
 
 from __future__ import annotations
@@ -34,31 +42,29 @@ from improved_benchmarks import (
     compute_improved_benchmarks,
 )
 
+# Occupancy daily dates.
 PREV = dt.date(2026, 3, 15)   # previous month
 CUR = dt.date(2026, 4, 15)    # compared month (emitted)
+# NTPJ benchmark_month (month-start, as materialized).
+PREV_M = dt.date(2026, 3, 1)
+CUR_M = dt.date(2026, 4, 1)
 
 
 # --------------------------------------------------------------------------- #
 # Synthetic-frame builders (Spark)
 # --------------------------------------------------------------------------- #
-_JOBS_SCHEMA = T.StructType(
+# normalized_time_per_job — the NTPJ benchmark substrate.
+_NTPJ_SCHEMA = T.StructType(
     [
         T.StructField("agent", T.StringType()),
+        T.StructField("job_id", T.StringType()),
+        T.StructField("benchmark_month", T.DateType()),
         T.StructField("xforce", T.StringType()),
         T.StructField("xplead", T.StringType()),
         T.StructField("team", T.StringType()),
         T.StructField("squad", T.StringType()),
         T.StructField("district", T.StringType()),
-        T.StructField("shift", T.StringType()),
-        T.StructField("roster_status", T.StringType()),
-        T.StructField("date", T.DateType()),
-        T.StructField("start_time", T.TimestampType()),
-        T.StructField("job_type", T.StringType()),
-        T.StructField("activity_type", T.StringType()),
-        T.StructField("status", T.StringType()),
-        T.StructField("job_id", T.StringType()),
-        T.StructField("duration_seconds", T.LongType()),
-        T.StructField("required_activity_on_day_flag", T.IntegerType()),
+        T.StructField("exp_duration_job", T.DoubleType()),
     ]
 )
 
@@ -79,25 +85,24 @@ _OCC_SCHEMA = T.StructType(
 )
 
 
-def _job_defaults() -> dict:
+def _ntpj_defaults() -> dict:
     return {
-        "agent": "a.one", "xforce": "x.one", "xplead": "p.one",
-        "team": "fraud", "squad": "txn", "district": "csi", "shift": "morning",
-        "roster_status": "active",
-        "date": CUR,
-        "start_time": dt.datetime(2026, 4, 15, 9, 0, 0),
-        "job_type": "queue-a",
-        "activity_type": "bko",
-        "status": "finished", "job_id": "jobA", "duration_seconds": 100,
-        "required_activity_on_day_flag": 1,
+        "agent": "a.one", "job_id": "jobA", "benchmark_month": CUR_M,
+        "xforce": "x.one", "xplead": "p.one", "team": "fraud",
+        "squad": "txn", "district": "csi", "exp_duration_job": 100.0,
     }
 
 
-def make_jobs(spark, rows):
-    data = [{**_job_defaults(), **r} for r in rows]
+def make_ntpj(spark, rows):
+    """Build normalized_time_per_job substrate rows (NTPJ benchmark)."""
+    data = [{**_ntpj_defaults(), **r} for r in rows]
     return spark.createDataFrame(
-        [tuple(d[f.name] for f in _JOBS_SCHEMA.fields) for d in data], _JOBS_SCHEMA
+        [tuple(d[f.name] for f in _NTPJ_SCHEMA.fields) for d in data], _NTPJ_SCHEMA
     )
+
+
+def empty_ntpj(spark):
+    return spark.createDataFrame([], _NTPJ_SCHEMA)
 
 
 def _occ_defaults() -> dict:
@@ -116,17 +121,12 @@ def make_occs(spark, rows):
     )
 
 
-def empty_jobs(spark):
-    return spark.createDataFrame([], _JOBS_SCHEMA)
-
-
 def empty_occ(spark):
     return spark.createDataFrame([], _OCC_SCHEMA)
 
 
-# io_ntpj_xforce_metric rows — the exact gate driver. The gate reads only
-# xforce / date_reference / date_granularity (month rows), so other columns are
-# null placeholders.
+# io_ntpj_xforce_metric rows — the explicit gate driver (optional; the gate
+# otherwise derives the identical presence from the substrate).
 _NTPJX_SCHEMA = T.StructType(
     [
         T.StructField("agent", T.StringType()),
@@ -147,11 +147,7 @@ _NTPJX_SCHEMA = T.StructType(
 
 
 def make_ntpj_xforce(spark, pairs):
-    """Build ntpj_xforce gate rows from ``(xforce, date_reference, granularity)``.
-
-    ``pairs`` items are ``(xforce, date_reference)`` (month grain) or
-    ``(xforce, date_reference, granularity)``.
-    """
+    """Build ntpj_xforce gate rows from ``(xforce, date_reference[, granularity])``."""
     rows = []
     for p in pairs:
         xforce, dref = p[0], p[1]
@@ -167,10 +163,10 @@ def empty_ntpj_xforce(spark):
     return spark.createDataFrame([], _NTPJX_SCHEMA)
 
 
-def _run(spark, jobs=None, occ=None,
+def _run(spark, ntpj=None, occ=None,
          start=dt.date(2026, 4, 1), end=dt.date(2026, 4, 30)):
     return compute_improved_benchmarks(
-        jobs if jobs is not None else empty_jobs(spark),
+        ntpj if ntpj is not None else empty_ntpj(spark),
         occ if occ is not None else empty_occ(spark),
         start,
         end,
@@ -178,8 +174,7 @@ def _run(spark, jobs=None, occ=None,
 
 
 def _by_metric(out, metric):
-    rows = [r for r in out.collect() if r["metric"] == metric]
-    return rows
+    return [r for r in out.collect() if r["metric"] == metric]
 
 
 def _one(out, metric):
@@ -193,10 +188,10 @@ def _one(out, metric):
 # --------------------------------------------------------------------------- #
 class TestNtpjBenchmark:
     def test_lower_benchmark_is_improved(self, spark):
-        # jobA: 200s in Mar, 100s in Apr -> benchmark dropped -> improved.
-        out = _run(spark, jobs=make_jobs(spark, [
-            {"date": PREV, "duration_seconds": 200},
-            {"date": CUR, "duration_seconds": 100},
+        # jobA benchmark 200 (Mar) -> 100 (Apr): dropped -> improved.
+        out = _run(spark, ntpj=make_ntpj(spark, [
+            {"benchmark_month": PREV_M, "exp_duration_job": 200.0},
+            {"benchmark_month": CUR_M, "exp_duration_job": 100.0},
         ]))
         squad = _one(out, SQUAD_METRIC)
         assert squad["numerator"] == 1.0
@@ -204,14 +199,14 @@ class TestNtpjBenchmark:
         assert squad["metric_value"] == 100.0
         assert squad["squad"] == "txn"
         assert squad["district"] is None
-        assert squad["date_reference"] == dt.date(2026, 4, 1)
+        assert squad["date_reference"] == CUR_M
         assert squad["date_granularity"] == "month"
 
     def test_higher_benchmark_is_not_improved(self, spark):
-        # 100s -> 200s: benchmark rose -> not improved (counted but 0).
-        out = _run(spark, jobs=make_jobs(spark, [
-            {"date": PREV, "duration_seconds": 100},
-            {"date": CUR, "duration_seconds": 200},
+        # 100 -> 200: benchmark rose -> not improved (counted but 0).
+        out = _run(spark, ntpj=make_ntpj(spark, [
+            {"benchmark_month": PREV_M, "exp_duration_job": 100.0},
+            {"benchmark_month": CUR_M, "exp_duration_job": 200.0},
         ]))
         squad = _one(out, SQUAD_METRIC)
         assert squad["numerator"] == 0.0
@@ -219,9 +214,9 @@ class TestNtpjBenchmark:
         assert squad["metric_value"] == 0.0
 
     def test_tie_counts_as_improved(self, spark):
-        out = _run(spark, jobs=make_jobs(spark, [
-            {"date": PREV, "duration_seconds": 150},
-            {"date": CUR, "duration_seconds": 150},
+        out = _run(spark, ntpj=make_ntpj(spark, [
+            {"benchmark_month": PREV_M, "exp_duration_job": 150.0},
+            {"benchmark_month": CUR_M, "exp_duration_job": 150.0},
         ]))
         squad = _one(out, SQUAD_METRIC)
         assert squad["numerator"] == 1.0
@@ -229,17 +224,17 @@ class TestNtpjBenchmark:
 
     def test_first_month_not_counted(self, spark):
         # Only the compared month present -> no previous -> denominator 0.
-        out = _run(spark, jobs=make_jobs(spark, [
-            {"date": CUR, "duration_seconds": 100},
+        out = _run(spark, ntpj=make_ntpj(spark, [
+            {"benchmark_month": CUR_M, "exp_duration_job": 100.0},
         ]))
         squad = _one(out, SQUAD_METRIC)
         assert squad["denominator"] == 0.0
         assert squad["metric_value"] is None
 
     def test_emits_squad_district_and_xforce_rows(self, spark):
-        out = _run(spark, jobs=make_jobs(spark, [
-            {"date": PREV, "duration_seconds": 200},
-            {"date": CUR, "duration_seconds": 100},
+        out = _run(spark, ntpj=make_ntpj(spark, [
+            {"benchmark_month": PREV_M, "exp_duration_job": 200.0},
+            {"benchmark_month": CUR_M, "exp_duration_job": 100.0},
         ]))
         assert {r["metric"] for r in out.collect()} == {
             SQUAD_METRIC, DISTRICT_METRIC, XFORCE_METRIC,
@@ -250,15 +245,25 @@ class TestNtpjBenchmark:
         assert district["metric_value"] == 100.0
 
     def test_xforce_rollup_sets_xforce_and_xplead(self, spark):
-        out = _run(spark, jobs=make_jobs(spark, [
-            {"date": PREV, "duration_seconds": 200},
-            {"date": CUR, "duration_seconds": 100},
+        out = _run(spark, ntpj=make_ntpj(spark, [
+            {"benchmark_month": PREV_M, "exp_duration_job": 200.0},
+            {"benchmark_month": CUR_M, "exp_duration_job": 100.0},
         ]))
         xf = _one(out, XFORCE_METRIC)
         assert xf["xforce"] == "x.one"
         assert xf["xplead"] == "p.one"
         assert xf["squad"] is None and xf["district"] is None
         assert xf["numerator"] == 1.0 and xf["metric_value"] == 100.0
+
+    def test_benchmark_rounded_before_compare(self, spark):
+        # Two benchmarks differing beyond the 5th decimal are a tie -> improved.
+        out = _run(spark, ntpj=make_ntpj(spark, [
+            {"benchmark_month": PREV_M, "exp_duration_job": 100.000001},
+            {"benchmark_month": CUR_M, "exp_duration_job": 100.000002},
+        ]))
+        # Unrounded 100.000002 > 100.000001 would be 'degraded'; rounded to 5
+        # decimals both are 100.0 -> tie -> improved.
+        assert _one(out, SQUAD_METRIC)["numerator"] == 1.0
 
 
 # --------------------------------------------------------------------------- #
@@ -267,12 +272,13 @@ class TestNtpjBenchmark:
 class TestOccupancyBenchmark:
     def test_higher_occupancy_is_improved(self, spark):
         # occupancy benchmark 0.1 (Mar) -> 0.2 (Apr): rose -> improved.
-        # NTPJ jobs present so the (xforce, month) has an ntpj_xforce row.
+        # NTPJ substrate present so the (xforce, month) has an ntpj_xforce row
+        # and a tie-improved NTPJ unit.
         out = _run(
             spark,
-            jobs=make_jobs(spark, [
-                {"date": PREV, "duration_seconds": 100},
-                {"date": CUR, "duration_seconds": 100},
+            ntpj=make_ntpj(spark, [
+                {"benchmark_month": PREV_M, "exp_duration_job": 100.0},
+                {"benchmark_month": CUR_M, "exp_duration_job": 100.0},
             ]),
             occ=make_occs(spark, [
                 {"date": PREV, "occupancy_minutes": 10.0},
@@ -291,9 +297,9 @@ class TestOccupancyBenchmark:
         # March's previous-month comparator. With only Feb + Mar occupancy, March
         # has NO previous month -> not counted (denominator 0 for the occ unit).
         out = compute_improved_benchmarks(
-            make_jobs(spark, [
-                {"date": dt.date(2026, 2, 15), "duration_seconds": 100},
-                {"date": dt.date(2026, 3, 15), "duration_seconds": 100},
+            make_ntpj(spark, [
+                {"benchmark_month": dt.date(2026, 2, 1), "exp_duration_job": 100.0},
+                {"benchmark_month": dt.date(2026, 3, 1), "exp_duration_job": 100.0},
             ]),
             make_occs(spark, [
                 {"date": dt.date(2026, 2, 15), "occupancy_minutes": 10.0},
@@ -301,78 +307,97 @@ class TestOccupancyBenchmark:
             ]),
             dt.date(2026, 3, 1), dt.date(2026, 3, 31),
         )
-        # Only the NTPJ unit (Feb->Mar) is counted; the occupancy unit is the
-        # March first-month (Feb excluded), contributing 0 to the denominator.
-        district = _one(out, DISTRICT_METRIC)
         # NTPJ: Feb 100 -> Mar 100 tie -> improved & counted. Occupancy March:
-        # no prev -> not counted. So district numerator/denominator = 1/1.
+        # no prev (Feb excluded) -> not counted. So district = 1/1.
+        district = _one(out, DISTRICT_METRIC)
         assert district["denominator"] == 1.0
         assert district["numerator"] == 1.0
 
 
 # --------------------------------------------------------------------------- #
-# ntpj_xforce gating (Fix #5)
+# ntpj_xforce gating via the substrate presence (Fix #5)
 # --------------------------------------------------------------------------- #
 class TestNtpjXforceGating:
-    def test_unit_dropped_without_active_roster_job(self, spark):
-        # The xforce's only job is NOT active roster -> no ntpj_xforce row that
-        # month -> the benchmark unit is dropped, so no metric rows at all.
-        out = _run(spark, jobs=make_jobs(spark, [
-            {"date": PREV, "duration_seconds": 200, "roster_status": "inactive"},
-            {"date": CUR, "duration_seconds": 100, "roster_status": "inactive"},
-        ]))
-        assert len(out.take(1)) == 0
-
-    def test_occupancy_unit_requires_ntpj_xforce_row(self, spark):
-        # An occupancy benchmark unit for an xforce with NO ntpj_xforce row (no
-        # active-roster job that month) is dropped.
+    def test_occupancy_unit_dropped_without_ntpj_presence(self, spark):
+        # An occupancy benchmark unit for an xforce with NO NTPJ substrate row
+        # that month is dropped (no ntpj_xforce presence).
         out = _run(spark, occ=make_occs(spark, [
             {"date": PREV, "occupancy_minutes": 10.0},
             {"date": CUR, "occupancy_minutes": 20.0},
         ]))
-        # No jobs at all -> no ntpj_xforce rows -> everything gated out.
+        # No NTPJ substrate at all -> no ntpj_xforce presence -> gated out.
         assert len(out.take(1)) == 0
 
+    def test_occupancy_unit_kept_with_ntpj_presence(self, spark):
+        # Same xforce has an NTPJ substrate row that month -> occ unit survives.
+        out = _run(
+            spark,
+            ntpj=make_ntpj(spark, [
+                {"benchmark_month": PREV_M, "exp_duration_job": 100.0},
+                {"benchmark_month": CUR_M, "exp_duration_job": 100.0},
+            ]),
+            occ=make_occs(spark, [
+                {"date": PREV, "occupancy_minutes": 10.0},
+                {"date": CUR, "occupancy_minutes": 20.0},
+            ]),
+        )
+        assert len(_by_metric(out, DISTRICT_METRIC)) == 1
+
+    def test_occupancy_unit_dropped_for_unmatched_xforce(self, spark):
+        # NTPJ present for x.one but the occ unit is a DIFFERENT xforce x.two ->
+        # x.two has no ntpj_xforce presence -> its occ unit is dropped.
+        out = _run(
+            spark,
+            ntpj=make_ntpj(spark, [
+                {"benchmark_month": PREV_M, "exp_duration_job": 100.0},
+                {"benchmark_month": CUR_M, "exp_duration_job": 100.0},
+            ]),
+            occ=make_occs(spark, [
+                {"xforce": "x.two", "date": PREV, "occupancy_minutes": 10.0},
+                {"xforce": "x.two", "date": CUR, "occupancy_minutes": 20.0},
+            ]),
+        )
+        # Only the NTPJ (x.one) unit survives; x.two occ unit gated out.
+        xfs = {r["xforce"] for r in _by_metric(out, XFORCE_METRIC)}
+        assert xfs == {"x.one"}
+
 
 # --------------------------------------------------------------------------- #
-# ntpj_xforce gating via the REAL metric (exact gate, Fix #5)
+# ntpj_xforce gating via an explicit metric (legacy FROM ntpj_xforces)
 # --------------------------------------------------------------------------- #
 class TestNtpjXforceMetricGate:
-    def _improving_jobs(self, spark):
-        return make_jobs(spark, [
-            {"date": PREV, "duration_seconds": 200},
-            {"date": CUR, "duration_seconds": 100},
+    def _improving_ntpj(self, spark):
+        return make_ntpj(spark, [
+            {"benchmark_month": PREV_M, "exp_duration_job": 200.0},
+            {"benchmark_month": CUR_M, "exp_duration_job": 100.0},
         ])
 
     def test_metric_present_keeps_unit(self, spark):
-        # (x.one, Apr) present in ntpj_xforce -> the improving unit survives.
         out = compute_improved_benchmarks(
-            self._improving_jobs(spark), empty_occ(spark),
+            self._improving_ntpj(spark), empty_occ(spark),
             dt.date(2026, 4, 1), dt.date(2026, 4, 30),
-            ntpj_xforce=make_ntpj_xforce(spark, [("x.one", dt.date(2026, 4, 1))]),
+            ntpj_xforce=make_ntpj_xforce(spark, [("x.one", CUR_M)]),
         )
         assert _one(out, SQUAD_METRIC)["metric_value"] == 100.0
 
-    def test_metric_absent_drops_unit_even_with_active_jobs(self, spark):
-        # The jobs ARE finished + required + active-roster (the fallback would
-        # keep them), but the real ntpj_xforce metric has NO (x.one, Apr) row ->
-        # the exact gate drops every unit. This is what makes the gate exact.
+    def test_explicit_empty_metric_is_authoritative(self, spark):
+        # When an explicit ntpj_xforce metric is passed and has NO (x.one, Apr)
+        # row, it is authoritative -> even the NTPJ unit is dropped (documents the
+        # legacy FROM ntpj_xforces drive; the substrate-derived gate would keep it).
         out = compute_improved_benchmarks(
-            self._improving_jobs(spark), empty_occ(spark),
+            self._improving_ntpj(spark), empty_occ(spark),
             dt.date(2026, 4, 1), dt.date(2026, 4, 30),
             ntpj_xforce=empty_ntpj_xforce(spark),
         )
         assert len(out.take(1)) == 0
 
     def test_week_only_metric_row_does_not_gate_month_unit(self, spark):
-        # Only a WEEK ntpj_xforce row exists for (x.one, Apr) -> the month gate
-        # finds no month row -> the unit is dropped (legacy joins month grain).
+        # Only a WEEK ntpj_xforce row exists -> the month gate finds no month row
+        # -> the unit is dropped (legacy joins the month grain).
         out = compute_improved_benchmarks(
-            self._improving_jobs(spark), empty_occ(spark),
+            self._improving_ntpj(spark), empty_occ(spark),
             dt.date(2026, 4, 1), dt.date(2026, 4, 30),
-            ntpj_xforce=make_ntpj_xforce(
-                spark, [("x.one", dt.date(2026, 4, 6), "week")]
-            ),
+            ntpj_xforce=make_ntpj_xforce(spark, [("x.one", dt.date(2026, 4, 6), "week")]),
         )
         assert len(out.take(1)) == 0
 
@@ -384,15 +409,15 @@ class TestSquadSplitting:
     def test_job_splits_across_two_squads(self, spark):
         # Same job_id worked by two agents in different squads/districts of the
         # same xforce -> the unit splits into two squad rows and two district rows.
-        out = _run(spark, jobs=make_jobs(spark, [
+        out = _run(spark, ntpj=make_ntpj(spark, [
             {"agent": "a.one", "squad": "txn", "district": "csi",
-             "date": PREV, "duration_seconds": 200},
+             "benchmark_month": PREV_M, "exp_duration_job": 200.0},
             {"agent": "a.one", "squad": "txn", "district": "csi",
-             "date": CUR, "duration_seconds": 100},
+             "benchmark_month": CUR_M, "exp_duration_job": 100.0},
             {"agent": "b.two", "squad": "card", "district": "ops",
-             "date": PREV, "duration_seconds": 200},
+             "benchmark_month": PREV_M, "exp_duration_job": 200.0},
             {"agent": "b.two", "squad": "card", "district": "ops",
-             "date": CUR, "duration_seconds": 100},
+             "benchmark_month": CUR_M, "exp_duration_job": 100.0},
         ]))
         squads = {r["squad"]: r for r in _by_metric(out, SQUAD_METRIC)}
         assert set(squads) == {"txn", "card"}
@@ -401,9 +426,7 @@ class TestSquadSplitting:
         districts = {r["district"] for r in _by_metric(out, DISTRICT_METRIC)}
         assert districts == {"csi", "ops"}
         # The xforce roll-up counts distinct (job_id, squad, district) and SUMS
-        # across the split (legacy COUNT(DISTINCT job_id) per (xforce, squad,
-        # squad_district), summed): the one job_id worked in two (squad, district)
-        # combos is TWO benchmark units, not one.
+        # across the split: one job_id in two (squad, district) combos is TWO units.
         xf = _one(out, XFORCE_METRIC)
         assert xf["numerator"] == 2.0 and xf["denominator"] == 2.0
 
@@ -413,43 +436,42 @@ class TestSquadSplitting:
 # --------------------------------------------------------------------------- #
 class TestScopeAndGating:
     def test_social_media_excluded(self, spark):
-        out = _run(spark, jobs=make_jobs(spark, [
-            {"team": "social media", "date": PREV, "duration_seconds": 200},
-            {"team": "social media", "date": CUR, "duration_seconds": 100},
+        out = _run(spark, ntpj=make_ntpj(spark, [
+            {"team": "social media", "benchmark_month": PREV_M, "exp_duration_job": 200.0},
+            {"team": "social media", "benchmark_month": CUR_M, "exp_duration_job": 100.0},
         ]))
         assert len(out.take(1)) == 0
 
     def test_content_excluded(self, spark):
-        out = _run(spark, jobs=make_jobs(spark, [
-            {"team": "content", "date": PREV, "duration_seconds": 200},
-            {"team": "content", "date": CUR, "duration_seconds": 100},
+        out = _run(spark, ntpj=make_ntpj(spark, [
+            {"team": "content", "benchmark_month": PREV_M, "exp_duration_job": 200.0},
+            {"team": "content", "benchmark_month": CUR_M, "exp_duration_job": 100.0},
         ]))
         assert len(out.take(1)) == 0
 
-    def test_core_april_squad_district_kept_xforce_dropped(self, spark):
-        # Fix #1 + #2: Core April squad/district rows ARE emitted (no team
-        # cutover on the S&D roll-ups); the XForce roll-up keeps non-david Core
-        # April too (flat < 2026-05 gate).
-        out = _run(spark, jobs=make_jobs(spark, [
-            {"team": "core", "squad": "cuenta", "date": PREV,
-             "duration_seconds": 200},
-            {"team": "core", "squad": "cuenta", "date": CUR,
-             "duration_seconds": 100},
+    def test_core_april_squad_district_kept_and_xforce_kept(self, spark):
+        # Fix #1 + #2: Core April squad/district rows ARE emitted (no team cutover
+        # on the S&D roll-ups); the XForce roll-up keeps non-david Core April too
+        # (flat < 2026-05 gate).
+        out = _run(spark, ntpj=make_ntpj(spark, [
+            {"team": "core", "squad": "cuenta", "benchmark_month": PREV_M,
+             "exp_duration_job": 200.0},
+            {"team": "core", "squad": "cuenta", "benchmark_month": CUR_M,
+             "exp_duration_job": 100.0},
         ]))
         squad = _one(out, SQUAD_METRIC)
         assert squad["squad"] == "cuenta"
         assert squad["metric_value"] == 100.0
-        # Non-david Core April survives in the xforce roll-up.
         assert len(_by_metric(out, XFORCE_METRIC)) == 1
 
     def test_david_fernandez_april_dropped_from_xforce_only(self, spark):
         # Fix #2: david.fernandez April is removed from the XForce roll-up, but
         # the squad/district roll-ups still emit his benchmark units.
-        out = _run(spark, jobs=make_jobs(spark, [
-            {"team": "core", "xplead": "david.fernandez", "date": PREV,
-             "duration_seconds": 200},
-            {"team": "core", "xplead": "david.fernandez", "date": CUR,
-             "duration_seconds": 100},
+        out = _run(spark, ntpj=make_ntpj(spark, [
+            {"team": "core", "xplead": "david.fernandez", "benchmark_month": PREV_M,
+             "exp_duration_job": 200.0},
+            {"team": "core", "xplead": "david.fernandez", "benchmark_month": CUR_M,
+             "exp_duration_job": 100.0},
         ]))
         assert len(_by_metric(out, XFORCE_METRIC)) == 0
         assert len(_by_metric(out, SQUAD_METRIC)) == 1
@@ -458,11 +480,11 @@ class TestScopeAndGating:
     def test_xforce_dropped_from_may(self, spark):
         # Fix #2: the XForce roll-up gate is a flat date_reference < 2026-05-01.
         out = compute_improved_benchmarks(
-            make_jobs(spark, [
-                {"team": "fraud", "date": dt.date(2026, 4, 15),
-                 "duration_seconds": 200},
-                {"team": "fraud", "date": dt.date(2026, 5, 15),
-                 "duration_seconds": 100},
+            make_ntpj(spark, [
+                {"team": "fraud", "benchmark_month": dt.date(2026, 4, 1),
+                 "exp_duration_job": 200.0},
+                {"team": "fraud", "benchmark_month": dt.date(2026, 5, 1),
+                 "exp_duration_job": 100.0},
             ]),
             empty_occ(spark),
             dt.date(2026, 5, 1), dt.date(2026, 5, 31),
@@ -476,35 +498,31 @@ class TestScopeAndGating:
 # Output contract
 # --------------------------------------------------------------------------- #
 class TestOutputContract:
+    def _improving(self, spark):
+        return make_ntpj(spark, [
+            {"benchmark_month": PREV_M, "exp_duration_job": 200.0},
+            {"benchmark_month": CUR_M, "exp_duration_job": 100.0},
+        ])
+
     def test_output_schema_and_column_order(self, spark):
-        out = _run(spark, jobs=make_jobs(spark, [
-            {"date": PREV, "duration_seconds": 200},
-            {"date": CUR, "duration_seconds": 100},
-        ]))
+        out = _run(spark, ntpj=self._improving(spark))
         assert out.columns == [c for c, _ in IO_IMPROVED_BENCHMARKS_METRIC_SCHEMA]
 
     def test_agent_always_null_xforce_only_on_xforce_rows(self, spark):
-        out = _run(spark, jobs=make_jobs(spark, [
-            {"date": PREV, "duration_seconds": 200},
-            {"date": CUR, "duration_seconds": 100},
-        ])).collect()
+        out = _run(spark, ntpj=self._improving(spark)).collect()
         assert all(r["agent"] is None for r in out)
-        # xforce populated only on the xforce roll-up rows.
         sd = [r for r in out if r["metric"] in (SQUAD_METRIC, DISTRICT_METRIC)]
         assert all(r["xforce"] is None for r in sd)
         xf = [r for r in out if r["metric"] == XFORCE_METRIC]
         assert all(r["xforce"] is not None for r in xf)
 
     def test_only_month_granularity(self, spark):
-        out = _run(spark, jobs=make_jobs(spark, [
-            {"date": PREV, "duration_seconds": 200},
-            {"date": CUR, "duration_seconds": 100},
-        ]))
+        out = _run(spark, ntpj=self._improving(spark))
         assert {r["date_granularity"] for r in out.collect()} == {"month"}
 
     def test_empty_inputs_yield_empty_frame_with_schema(self, spark):
         out = compute_improved_benchmarks(
-            empty_jobs(spark), empty_occ(spark),
+            empty_ntpj(spark), empty_occ(spark),
             dt.date(2026, 4, 1), dt.date(2026, 4, 30),
         )
         assert len(out.take(1)) == 0
