@@ -1,6 +1,6 @@
-# AGENTS.md — Internal Ops Performance
+# CLAUDE.md — Internal Ops Performance
 
-Persistent guidance for AI agents working in this repository. Read it at the start of every session and apply its conventions throughout your work.
+Persistent guidance for working in this repository. This file auto-loads at the start of every session; apply its conventions throughout your work.
 
 ## Project Overview
 
@@ -39,7 +39,7 @@ Flat layout. No `src/` wrapper, no package directories, no `__init__.py` files.
 - `docs/metrics_definitions.md` — Canonical definitions, formulas, datasets, filters, and worked examples for every IO metric. Source of truth when migrating legacy calculations to Python.
 - `docs/team_squad_mapping.md` — **Official** mapping of performance team → roster squad (used to roll the `squad` column up to Core / Fraud / Social Media / Content).
 - `legacy/` — The old monolithic Databricks SQL pipeline.
-- `legacy/AGENTS_LEGACY.md` — The old `AGENTS.md` from that project. Documents pipeline architecture, team hierarchy, key metrics, source datasets, and SQL conventions. **Read it whenever you work on anything inside `legacy/`** or need historical context about how the metrics are computed.
+- `legacy/CLAUDE.md` — The legacy pipeline's own context doc. Documents pipeline architecture, team hierarchy, key metrics, source datasets, and SQL conventions. It **auto-loads whenever you work on anything inside `legacy/`** (or read it directly for historical context about how the metrics are computed). Note: the documented pipeline is only the **Core & Fraud / Social Media / Content** decks — `[IO] Performance 2026 - S&D.sql` is not a pipeline component.
 
 ## Source-of-Truth (SOT) Tables
 
@@ -195,7 +195,9 @@ All metric tables share the same tidy "long" shape, in this order: `agent, xforc
 | `io_tnps_metric`                 | `tnps` = (promoters − detractors) / valid responses (NPS %, ≥ 88%), **Social Media only**                                                                                 | `io_tnps_responses_raw`                                                                                                                  | one row per agent per day/week/month/quarter/semester/year                       |
 | `io_wows_metric`                 | `wows` = `COUNT(DISTINCT case_id)` (**count**, monthly target ≥ 5), **Social Media only**                                                                                 | `io_wows_raw`                                                                                                                            | one row per agent per day/week/month/quarter/semester/year                       |
 | `io_content_csat_metric`         | `content_csat` = SUM(promoters) / SUM(questions) (≥ 95%), **Content only** (Content's Quality component)                                                                  | `io_content_csat_raw`                                                                                                                    | one row per agent per day/week/month/quarter/semester/year                       |
-| `io_improved_benchmarks_metric`  | `improved_benchmark_squad` / `improved_benchmark_district` / `improved_benchmark_xforce` = improved / comparable monthly benchmarks (≥ 60%), Core / Fraud only            | `io_jobs_raw` + `io_occupancy_time_raw`                                                                                                  | **squad / district / xforce level**, **month only** (`agent`/`shift` NULL)       |
+| `io_ntpj_xforce_metric`          | `ntpj_xforce` = share of an XForce's agents hitting NTPJ (`ntpj ≤ 100`), Core / Fraud / Content — roll-up of `io_ntpj_metric` (legacy `ntpj_xforces`)                     | `io_ntpj_metric`                                                                                                                        | **XForce roll-up**, week + month only                                            |
+| `io_normalized_time_per_job`     | NTPJ benchmark **substrate** (legacy `normalized_time_per_job`): per `(agent, job_id, benchmark_month, xforce, xplead, team, squad, district)` cohort-wide `exp_duration_job` | `io_jobs_raw`                                                                                                                           | one row per agent × job_id × month (not a tidy metric — feeds improved_benchmark) |
+| `io_improved_benchmarks_metric`  | `improved_benchmark_xforce` = improved / comparable monthly benchmarks (≥ 60%), Core / Fraud only                                                                        | `io_normalized_time_per_job` + `io_occupancy_time_raw` + `io_ntpj_xforce_metric`                                                        | **XForce level**, **month only** (`agent`/`squad`/`district`/`shift` NULL)        |
 | `io_xpeer_index_metric`          | `xpeer_index` = mean of an agent's other metrics (≥ 95%), all teams                                                                                                       | the seven `io_*_metric` tables above (**composite**, not a raw table)                                                                    | one row per agent per day/week/month/quarter/semester/year                       |
 | `io_nuvinhos_performance_metric` | `nuvinhos_performance` / `_squad` / `_district` = avg Index(Nuvinhos) / avg Index(Old), all teams                                                                         | `io_xpeer_index_metric` + `agent_information`                                                                                            | **XForce / squad / district roll-ups** (no agent grain), all six granularities   |
 | `io_xpeers_in_target_metric`     | `xpeers_in_target` (per XForce) + `xpeers_in_target_xplead` (per XPLead) = targets achieved / total targets (≥ 70%), Core / Fraud / Social Media                          | the agent-level `io_*_metric` tables (**composite**, not a raw table)                                                                    | **XForce + XPLead roll-ups** (no agent grain), all six granularities             |
@@ -206,7 +208,7 @@ All metric tables share the same tidy "long" shape, in this order: `agent, xforc
 
 The shared bucketing + tidy aggregation lives in `metrics/metric_utils.py` (`aggregate_long`); each metric module only filters its raw rows and names the numerator/denominator columns.
 
-**Improved Benchmarks is the exception** to the agent-grain / six-granularity shape above. It compares each month's NTPJ (`exp_duration_job` per job type; lower = improved) and Normalized Occupancy (`district + shift` benchmark; higher = improved) benchmarks to the previous month, ties counting as improved, and rolls the improved/comparable counts up to squad, district, **and XForce** level (`improved_benchmark_xforce`, month grain only). It is **Core/Fraud only** (never Social Media / Content) and is **suppressed after each team's cutover** — Core from `2026-04`, Fraud from `2026-05` (it was dropped as an XForce-Index component then). The build script reads a benchmark look-back (6 months of `io_jobs_raw`, 2 of `io_occupancy_time_raw`).
+**Improved Benchmarks is the exception** to the agent-grain / six-granularity shape above. It compares each month's NTPJ (`exp_duration_job` per job type; lower = improved) and Normalized Occupancy (`district + shift` benchmark; higher = improved) benchmarks to the previous month, ties counting as improved, and rolls the improved/comparable counts up to **XForce** level (`improved_benchmark_xforce`, month grain only). It is **Core/Fraud only** (never Social Media / Content). The XForce roll-up is gated to `date_reference < 2026-05-01` (flat for all teams) plus a `david.fernandez` April carve-out. The NTPJ benchmark + attribution come from `io_normalized_time_per_job` (legacy `normalized_time_per_job` — cohort-wide `exp_duration_job`, read with one previous month for the month-over-month LAG, which partitions by `(job_id, xforce)`); the occupancy benchmark from `io_occupancy_time_raw`; and units are gated to `(xforce, month)` present in `io_ntpj_xforce_metric`. **Only the XForce metric is in scope** — the S&D-deck squad/district roll-ups (legacy `[IO] Performance 2026 - S&D.sql`, which attribute via an `agent_information` snapshot join) are **not** part of this pipeline.
 
 **XForce Index is the composite headline score** (legacy `index_xforce`, renamed `xforce_index`), **XForce-level** (no agent grain), all four teams: the mean of up to four 0–100 normalized components — shrinkage (`≤20→100`, else `120−shrinkage`), `xpeers_in_target`, `average_xpeer_index`, and `improved_benchmark` (`≥60→100`, else `improved/0.6`). `shrinkage_xforce` is slot-weighted (sum the agent `io_shrinkage_metric` numerator/denominator per XForce, not an average of percentages). The improved_benchmark component is added **only where an `improved_benchmark_xforce` row exists** — i.e. Core/Fraud, month grain, before each team's cutover — so **SM/Content and all non-month grains stay 3-component**. `numerator` = Σ components, `denominator` = `100 × N` (300 or 400), `metric_value` = the mean. (This intentionally drops legacy's SM Mar+/Content Apr+ improved_benchmark addition.)
 
@@ -370,7 +372,7 @@ This project is tracked with git. Follow these practices:
 - `**tests/test_*.py**` — Build synthetic DataFrames in a few lines, exercise one primitive, assert on the `CheckResult`. Fast, no network, no Databricks. Run with `uv run pytest`.
 - `**scripts/*.py**` — Thin orchestrators. argparse + connection setup + a loop that calls into `tests/`. No business logic.
 - `**db.py**` — The single warehouse transport (only file importing `databricks.sql`). Build scripts write via `publish()` (current table + `_snapshots` history + `pipeline_runs` registry; see [Run Snapshots & Registry](#run-snapshots--registry)), not `write_dataframe` directly. When migrating to Databricks-native execution, only this file's body changes.
-- `**legacy/*.sql**` — Databricks SQL notebooks. Follow the conventions documented in `legacy/AGENTS_LEGACY.md` (temp views, `GROUP BY ALL`, `TRY_DIVIDE`, metric naming patterns, percentage scaling, etc.).
+- `**legacy/*.sql**` — Databricks SQL notebooks. Follow the conventions documented in `legacy/CLAUDE.md` (temp views, `GROUP BY ALL`, `TRY_DIVIDE`, metric naming patterns, percentage scaling, etc.).
 
 ## Tooling: Which MCP to Use
 
@@ -392,11 +394,10 @@ If multiple skills apply, read all relevant ones before starting.
 
 ## How to Use This File
 
-At the start of any session in this repo:
+This file (`CLAUDE.md`) auto-loads at the start of every session in this repo. Beyond it:
 
-1. Read this `AGENTS.md` end to end.
-2. If the work touches `legacy/`, also read `legacy/AGENTS_LEGACY.md`.
-3. If the work involves a metric calculation, consult `docs/metrics_definitions.md` for the canonical formula and datasets.
-4. If the work involves data engineering, read the `senior-data-engineer` skill linked above.
-5. Apply the guidance throughout the session.
+1. If the work touches `legacy/`, `legacy/CLAUDE.md` auto-loads too — apply it.
+2. If the work involves a metric calculation, consult `docs/metrics_definitions.md` for the canonical formula and datasets.
+3. If the work involves data engineering, read the `senior-data-engineer` skill linked above.
+4. Apply the guidance throughout the session.
 
