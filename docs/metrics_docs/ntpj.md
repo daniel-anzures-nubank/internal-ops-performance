@@ -9,13 +9,20 @@ benchmark:
 > `ntpj = SUM(actual job duration) / SUM(exp_duration_job * job_count)`.
 > **Target ≤ 100%** (lower = faster than benchmark).
 
-Applies to **Core, Fraud, Content** — **not** Social Media (social jobs aren't
-in the shuffle/OOS sources, so social agents have no input rows). See
+Applies to **Core, Fraud** — **not** Social Media (social jobs aren't in the
+shuffle/OOS sources, so social agents have no input rows). See
 `docs/metrics_definitions.md`.
+
+> **Content is a different metric under the same name.** Content's jobs still
+> feed the cohort-wide benchmark here, but the build script **drops the Content
+> output rows and unions** the SLA-weighted Content NTPJ in their place — see
+> [content_sla_ntpj.md](content_sla_ntpj.md). `io_ntpj_metric` stays one
+> `metric = 'ntpj'` table.
 
 - Module: `metrics/ntpj.py`
 - Build script: `scripts/metrics_scripts/build_ntpj.py`
 - Input: `usr.danielanzures.io_jobs_raw`
+  (+ `usr.danielanzures.io_jobs_within_sla_raw` for the Content union)
 - Default target table: `usr.danielanzures.io_ntpj_metric`
 
 ## Input
@@ -67,17 +74,27 @@ their benchmarks are naturally content-scoped.
    most-recent value in the bucket.
 7. `metric_value = numerator / denominator * 100` (NULL when denominator 0).
 
-## Deferred to the future Adjustments layer (NOT applied here)
+## Adjustments & carve-outs (applied here)
 
-- Cross-support queue exclusions (per-agent / queue / date carve-outs) — so the
-  current output still counts cross-support jobs toward both the benchmark and
-  the agent's NTPJ.
-- Per-agent vacation / maternity / day-control exclusions.
-- Outage-date exclusions (2026-03-27, 2026-04-09).
+- **Manual adjustments** (when the synced `adj_*` tables are present):
+  `exclusiones_generales` (slot/date windows), `cross_support` (queue
+  exclusions), and `exclusiones_jobs` (job exclusions) are applied **before**
+  the benchmark groupby, so an excluded job leaves both the benchmark and the
+  contribution — matching legacy.
+- **Outage dates** (2026-03-27, 2026-04-09) are dropped from the
+  **contribution only** — they stay in the benchmark pool (legacy filters only
+  the self-join target side; reproducing the asymmetry is what makes April's
+  benchmark match).
+- **Hardcoded per-agent date exclusions** (`HARDCODED_AGENT_DATE_EXCLUSIONS` in
+  `metrics/ntpj.py`) — un-ported legacy vacation / leave / holiday / day-off
+  carve-outs, contribution-only, pending migration to the adjustments sheet.
+
+## Deferred (NOT applied here)
+
 - **Content "always 4-month window"**: this module applies the unified legacy
-  cutover (≤2026-03 trailing, ≥2026-04 current month) to all teams. The SOT doc
-  says Content should stay on the trailing window — to be handled when the
-  benchmark/adjustments layer lands.
+  cutover (≤2026-03 trailing, ≥2026-04 current month) to all teams. Moot for
+  the shipped output — Content's duration rows are replaced by the SLA metric —
+  but the Content jobs feeding the cohort benchmark use the unified rule.
 
 ## Output schema (one row per agent per period)
 
