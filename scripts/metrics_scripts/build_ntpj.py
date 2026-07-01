@@ -202,8 +202,6 @@ def main(argv: list[str] | None = None) -> int:
         result = result.filter(not_content).unionByName(content_ntpj)
 
     if args.dry_run:
-        from pyspark.sql import functions as F
-
         result = result.persist()
         LOGGER.info("Dry run — not writing. Summary:")
         print()
