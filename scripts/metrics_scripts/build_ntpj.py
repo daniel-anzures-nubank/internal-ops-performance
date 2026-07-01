@@ -12,9 +12,18 @@ and is covered by ``tests/metrics/test_ntpj.py``. Here we only:
      metric rows for the period.
   4. Either print a summary (``--dry-run``) or replace the target Delta table.
 
+Content is a different metric
+-----------------------------
+Content NTPJ is an **SLA-weighted compliance** metric, not the duration ratio. We
+compute Core/Fraud NTPJ from ``io_jobs_raw`` as usual (Content still feeds the
+cohort-wide benchmark), then **drop the Content output rows and union** the
+SLA-based Content NTPJ from ``io_jobs_within_sla_raw`` (``metrics/content_sla_ntpj.py``)
+— so ``io_ntpj_metric`` stays one standardized ``metric='ntpj'`` table.
+
 Tables
 ------
-* Input:  ``usr.danielanzures.io_jobs_raw`` (override ``--source``).
+* Inputs:  ``usr.danielanzures.io_jobs_raw`` (override ``--source``),
+  ``usr.danielanzures.io_jobs_within_sla_raw`` (override ``--sla-source``).
 * Output: ``usr.danielanzures.io_ntpj_metric`` (override ``--target``).
 
 Manual adjustments
@@ -70,14 +79,18 @@ REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics"))
 
+from pyspark.sql import functions as F  # noqa: E402
+
 from db import open_connection, read_table, publish  # noqa: E402
 from metric_utils import GRANULARITIES  # noqa: E402
 from ntpj import IO_NTPJ_METRIC_SCHEMA, compute_ntpj  # noqa: E402
+from content_sla_ntpj import compute_content_sla_ntpj  # noqa: E402
 from adjustments.manual import read_adjustment_table  # noqa: E402
 
 LOGGER = logging.getLogger("cx_metrics.ntpj")
 
 DEFAULT_SOURCE = "usr.danielanzures.io_jobs_raw"
+DEFAULT_SLA_SOURCE = "usr.danielanzures.io_jobs_within_sla_raw"
 DEFAULT_TARGET = "usr.danielanzures.io_ntpj_metric"
 
 # Extra months read before period_start so the trailing-window benchmark
@@ -103,6 +116,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--source",
         default=DEFAULT_SOURCE,
         help=f"Raw input table to read (default: {DEFAULT_SOURCE}).",
+    )
+    parser.add_argument(
+        "--sla-source",
+        default=DEFAULT_SLA_SOURCE,
+        help="Content jobs-within-SLA raw table, unioned in as Content NTPJ "
+        f"(default: {DEFAULT_SLA_SOURCE}).",
     )
     parser.add_argument(
         "--target",
@@ -167,6 +186,20 @@ def main(argv: list[str] | None = None) -> int:
             cross_support=read_adjustment_table(spark, "cross_support"),
             job_exclusions=read_adjustment_table(spark, "exclusiones_jobs"),
         )
+
+    # Content NTPJ is a DIFFERENT metric — SLA-weighted compliance, not duration.
+    # Replace the duration-based Content rows with the SLA-based ones so
+    # io_ntpj_metric stays one standardized table (metric='ntpj'). Content still
+    # fed the cohort-wide duration benchmark above; we filter the OUTPUT (not the
+    # input), so the Core/Fraud benchmark is unchanged. The `not_content` mask is
+    # NULL-safe: NULL-team (main-deck support squads) survive.
+    with _log_step(f"read {args.sla_source} + union Content SLA NTPJ"):
+        jw = read_table(spark, args.sla_source, args.period_start, args.period_end)
+        content_ntpj = compute_content_sla_ntpj(jw, args.period_start, args.period_end)
+        not_content = ~F.coalesce(
+            F.lower(F.col("team")) == F.lit("content"), F.lit(False)
+        )
+        result = result.filter(not_content).unionByName(content_ntpj)
 
     if args.dry_run:
         from pyspark.sql import functions as F

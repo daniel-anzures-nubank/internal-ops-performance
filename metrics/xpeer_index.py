@@ -303,7 +303,12 @@ def compute_xpeer_index(
     qual_era_ok = era >= qual_cutover
 
     adh = F.coalesce(F.col("adherence").cast("double"), F.lit(0.0))
-    ntpj_t = _fold_ntpj(F.col("ntpj"))
+    # Content NTPJ is SLA-weighted compliance (higher-is-better, already 0-100) and
+    # legacy's Content deck adds it RAW; Core/Fraud NTPJ is the duration ratio
+    # (lower-is-better) and folds around 100. `is_content` is defined above.
+    ntpj_t = F.when(is_content, F.col("ntpj").cast("double")).otherwise(
+        _fold_ntpj(F.col("ntpj"))
+    )
     nocc_t = _truncate_nocc(F.col("nocc"))
     wows_t = _fold_wows(F.col("wows"))
     tnps_v = F.col("tnps").cast("double")

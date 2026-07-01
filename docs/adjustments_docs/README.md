@@ -59,6 +59,7 @@ uv run --group sheets python scripts/adjustments_scripts/download_adjustments.py
 | `Exclusiones Jobs` | individual Shuffle/Taskmaster jobs to exclude (outliers, anomalous records) by agent (or squad), job classification, date range and optionally customer id | one row per exclusion |
 | `Ajustes Index` | index components excluded for an agent or XPLead over a period; the index is recomputed with the remaining components | one row per carve-out |
 | `Correcciones Generales Datos` | raw-data corrections (not exclusions), e.g. timestamps shifted because an agent's laptop clock was behind; the data is fixed before metrics are computed | one row per correction window |
+| `Content - SLAs` | **config map** (not date/agent windows): Content OOS `job_type` → OLD-SLA seconds. Drives Content NTPJ (jobs-within-SLA compliance). See [content_slas.md](content_slas.md). | one row per job type |
 
 ## File-backed adjustments
 
@@ -95,6 +96,7 @@ compute module when implemented.
 | general exclusions (outages etc.) | `Exclusiones Generales` | Carve out specific **date/time windows** (per agent / team / global, e.g. the 2026-03-27 general outage) from the calculations. | `adherence`, `ntpj`, `normalized_occupancy`, `shrinkage`, `improved_benchmarks` | implemented in `adjustments/manual.py` |
 | job-level exclusions | `Exclusiones Jobs` | Drop individual **Shuffle/Taskmaster jobs** (outliers like tasks left open for hours, anomalous carrier-report records) from the job universe. | `ntpj`, `improved_benchmarks` | implemented in `adjustments/manual.py` |
 | index component carve-outs | [`Ajustes Index`](ajustes_index.md) | Exclude an **index component** for an agent (e.g. `nitza.zarza` NO, Apr–May 2026) or an XPLead (e.g. `david.fernandez` Improved Benchmarks, Apr 2026); the index is recomputed over the remaining components. | `xpeer_index`, `xforce_index`, `average_xforce_index`, `normalized_occupancy` | implemented for current approved rows |
+| Content SLA map | [`Content - SLAs`](content_slas.md) | Per-job-type OLD-SLA thresholds that define **Content NTPJ** (SLA-weighted compliance, not duration). INNER-JOINed in `jobs_within_sla`; no-SLA job types are dropped. Mandatory (no hardcoded fallback). | `ntpj` (Content), `xpeer_index` (Content), `ntpj_xforce` (Content) | implemented in `metrics_data/jobs_within_sla.py` |
 | DIME-squad business exclusions | — (code-side) | Exclude certain **DIME squads** (`wfm` / `enablement` / …) from the productivity-based metrics. | `adherence`, `shrinkage` | planned |
 | missing DIME slots | `adjustments/slots_faltantes_dime.csv` | Append manually recovered DIME slots that are absent from the ETL DIME table. | `adherence`, `ntpj`, `normalized_occupancy` | implemented in raw build scripts |
 | data corrections | [`Correcciones Generales Datos`](correcciones_generales_datos.md) | Fix raw data before computing metrics (e.g. `luis.contreras` Taskmaster job timestamps shifted +2 h / +1 h because his laptop clock was behind, Jan–May 2026). | `normalized_occupancy` (Content) | implemented for current approved rows |

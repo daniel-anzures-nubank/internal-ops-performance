@@ -93,3 +93,4 @@ affected.
 | [tnps_responses](tnps_responses.md) | `metrics_data/tnps_responses.py` | `scripts/metrics_data_scripts/build_tnps_responses.py` | `usr.danielanzures.io_tnps_responses_raw` |
 | [wows](wows.md) | `metrics_data/wows.py` | `scripts/metrics_data_scripts/build_wows.py` | `usr.danielanzures.io_wows_raw` |
 | [content_csat](content_csat.md) | `metrics_data/content_csat.py` | `scripts/metrics_data_scripts/build_content_csat.py` | `usr.danielanzures.io_content_csat_raw` |
+| [jobs_within_sla](jobs_within_sla.md) | `metrics_data/jobs_within_sla.py` | `scripts/metrics_data_scripts/build_jobs_within_sla.py` | `usr.danielanzures.io_jobs_within_sla_raw` |

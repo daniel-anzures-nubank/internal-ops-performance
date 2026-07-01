@@ -20,7 +20,7 @@
 --     agents).
 --   * Content-specific `job_classification` cleanup (legacy: when `squad LIKE '%content%'`,
 --     it strips the `(OOS_CONT)` prefix and replaces spaces with underscores).
---   * MOS-NNNN `content_id` extraction from `comment`.
+--   * MOS-NNNN `content_id` extraction from `comment` / `ticket__id`.
 --   * Activity-type matching / aggregation / benchmark / roster join.
 --
 -- Out of scope (handled by the Adjustments layer)
@@ -41,6 +41,7 @@
 --   activity_end_unix       BIGINT     `UNIX_TIMESTAMP(local_stop_date)`
 --   squad                   STRING     squad assigned to the job at log time (raw)
 --   comment                 STRING     free-text `comment` (used by NTPJ for MOS-NNNN parsing)
+--   ticket__id              STRING     raw `ticket__id` (second source for MOS-NNNN parsing)
 --
 -- Timezone notes
 --   * `local_start_date` / `local_stop_date` are stored in **local time**. The unix
@@ -58,7 +59,8 @@ SELECT
   UNIX_TIMESTAMP(local_start_date)                          AS activity_start_unix,
   UNIX_TIMESTAMP(local_stop_date)                           AS activity_end_unix,
   squad,
-  comment
+  comment,
+  ticket__id
 FROM etl.mx__dataset.taskmaster_consolidated_registry
 WHERE local_start_date >= :period_start
   AND local_start_date <= :period_end

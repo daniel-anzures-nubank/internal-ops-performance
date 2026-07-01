@@ -147,6 +147,24 @@ def test_xforce_and_xplead_split(spark):
     assert (xf2["numerator"], xf2["denominator"]) == (1.0, 1.0)
 
 
+def test_content_uses_sla_target_ge_95(spark):
+    # Content NTPJ is SLA-weighted compliance (>= 95 on target), NOT the <= 100
+    # duration rule. 96 and 100 are on target; 94 and 80 (which WOULD pass the
+    # Core/Fraud <= 100 rule) are not.
+    rows = [
+        ntpj("a", 96, team="content", xforce="cxf", xplead="cxp"),
+        ntpj("b", 100, team="content", xforce="cxf", xplead="cxp"),
+        ntpj("c", 94, team="content", xforce="cxf", xplead="cxp"),
+        ntpj("d", 80, team="content", xforce="cxf", xplead="cxp"),
+    ]
+    r = _only(
+        [x.asDict() for x in compute_ntpj_xforce(frame(spark, rows)).collect()],
+        xforce="cxf", date_granularity="month",
+    )
+    assert r["denominator"] == 4.0
+    assert r["numerator"] == 2.0  # only 96 and 100 clear >= 95
+
+
 def test_output_contract(spark):
     rows = [ntpj("a", 90)]
     out = compute_ntpj_xforce(frame(spark, rows))
