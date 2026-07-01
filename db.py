@@ -53,7 +53,7 @@ LOGGER = logging.getLogger("cx_metrics.db")
 # Suffix appended to a base table to hold its append-only run history, and the
 # central registry of every run. Both live alongside the data in the
 # `usr.danielanzures` schema. See `publish()` and the "Run snapshots" section of
-# AGENTS.md.
+# CLAUDE.md.
 SNAPSHOT_SUFFIX = "_snapshots"
 DEFAULT_REGISTRY_TABLE = "usr.danielanzures.pipeline_runs"
 # Env var an orchestrator can export once so every `build_*.py` in the same

@@ -4,7 +4,7 @@ Catalog of where the new pipeline's output **diverges** from the legacy SQL
 pipeline, with the cause and classification for each divergence. Companion to the
 migration rule — the new pipeline reproduces legacy **byte-for-byte for dates
 before the `2026-07-01` cutover** (including legacy bugs), with corrections only
-from the cutover onward (see `metrics_data/shift_attribution.py` and `AGENTS.md`).
+from the cutover onward (see `metrics_data/shift_attribution.py` and `CLAUDE.md`).
 
 Update this file as each metric is parity-checked.
 
