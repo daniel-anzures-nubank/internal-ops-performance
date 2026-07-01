@@ -8,7 +8,7 @@ to a safe alphabet; generated ids are safe by construction.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pytest
 
@@ -69,6 +69,7 @@ def test_valid_explicit_run_id_passes_through(run_id: str) -> None:
         "run id with spaces",
         "x'; DROP TABLE usr.danielanzures.pipeline_runs; --",
         "line\nbreak",
+        "20260701T120000Z-ab12\n",  # trailing newline ($ would let it through)
     ],
 )
 def test_invalid_explicit_run_id_raises(run_id: str) -> None:

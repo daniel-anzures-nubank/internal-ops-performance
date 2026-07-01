@@ -233,8 +233,9 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-# run_id is interpolated into SQL and used as a partition value, so restrict its alphabet.
-_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._:\-]+$")
+# run_id is interpolated into SQL and used as a partition value, so restrict its
+# alphabet. \Z (not $) so a trailing newline can't slip through.
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._:\-]+\Z")
 
 
 def new_run_id(run_ts: datetime | None = None) -> str:
