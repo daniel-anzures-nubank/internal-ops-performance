@@ -20,10 +20,11 @@ Tables
     - ``usr.danielanzures.io_improved_benchmarks_metric``     (xforce roll-up)
 * Output: ``usr.danielanzures.io_xforce_index_metric`` (override ``--target``).
 
-``io_improved_benchmarks_metric`` is currently DEFERRED (not yet at parity). It
-may be **absent or empty**; the build degrades gracefully — the improved
-component folds to 0 and the 4th-component count still follows legacy's date
-rule. Until it lands, this metric cannot be parity-validated on the cluster.
+``io_improved_benchmarks_metric`` (the substrate-backed XForce metric) is now
+built upstream, so the 4th component carries a real numerator. The read still
+degrades gracefully if the table is absent/empty (improved folds to 0), but the
+metric is cluster-validated against legacy ``index_xforce`` — see the module
+docstring for the parity summary.
 
 Usage
 -----
@@ -80,8 +81,9 @@ from xforce_index import (  # noqa: E402
 LOGGER = logging.getLogger("cx_metrics.xforce_index")
 
 # (flag suffix, default table, compute kwarg, optional?)
-# improved-benchmarks is OPTIONAL: the table may not exist yet (deferred). A
-# missing/empty improved input is handled by compute_xforce_index.
+# improved-benchmarks is OPTIONAL: a missing/empty improved input is handled by
+# compute_xforce_index (folds to 0). It is now built upstream, but keeping it
+# optional lets a partial pipeline (or a pre-improved backfill) still run.
 INPUTS: tuple[tuple[str, str, str, bool], ...] = (
     ("shrinkage", "usr.danielanzures.io_shrinkage_metric", "shrinkage", False),
     (

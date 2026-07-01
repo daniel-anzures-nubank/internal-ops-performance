@@ -71,10 +71,9 @@ Content "Temp Fix" notebook each have one; the Social-Media main notebook does
   ``2026-04-01`` (Content improved benchmarks start April).
 
 This port consumes the **all-teams** shrinkage driver but the upstream
-``improved_benchmarks`` metric is Core/Fraud-only and month-only (and is itself
-DEFERRED — not yet at parity). Until Content's April-onward improved component
-and the weekly improved rows land, the date rule here applies uniformly to every
-deck, so:
+``improved_benchmarks`` metric is Core/Fraud-only and month-only. Until
+Content's April-onward improved component and the weekly improved rows land, the
+date rule here applies uniformly to every deck, so:
 
 * **Content** Apr-Jun 2026 buckets are emitted **4-component** (the date rule
   fires) but with the improved term folded to 0 — legacy Content is also
@@ -84,10 +83,21 @@ deck, so:
 * **Social Media** has no legacy ``index_xforce`` in the main notebook, so any
   SM XForce emitted here is extra relative to the main-deck legacy table.
 
-Because ``improved_benchmarks`` is deferred, this metric **cannot be
-parity-validated on the cluster yet**. The port is structured so that once
-improved_benchmarks lands (with the deck-aware component rules) the numerator is
-correct; the component COUNT already follows legacy's date rule.
+Validation (2026-07-01, vs legacy ``index_xforce`` in
+``internal_ops_performance_2026``, month grain)
+--------------------------------------------------------------------------
+Now that ``improved_benchmarks`` has landed, this metric is cluster-validated.
+The ``xforce_index``-specific logic is byte-exact: **denominators match legacy
+in every matched row** (the 3-vs-4 component date rule and the david-April
+carve-out reproduce exactly), and every legacy main-deck XForce is reproduced
+(``legacy_only = 0``). The 3-component clean baseline (May) is **0.53** avg
+abs diff, and the April 4-component unblock is **1.44** (tracking improved
+benchmark's own Apr ~0.96 residual). The remaining value gaps are inherited
+**entirely from the upstream component numerators** — the shrinkage /
+xpeers_in_target / average_xpeer_index tables carry their own documented
+early-month (NTPJ) and just-closed-month bounds — not from anything this module
+computes. The ``new_only`` rows each month are the SM/Content deck XForces, which
+the main-deck legacy table does not carry.
 
 Deck grouping, NOT team (hard-won lesson)
 -----------------------------------------
