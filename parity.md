@@ -725,14 +725,65 @@ gap (the missing `content` district) and the same xplead coverage nuance as
 
 ---
 
+## Improved Benchmarks — `io_improved_benchmarks_metric` (metric `improved_benchmark_xforce`) vs `improved_benchmark` in `usr.mx__cx.internal_ops_performance_2026` (main deck, Core/Fraud)
+
+**Status:** validated over the month grain **`2026-01 … 2026-04`** — the only
+months legacy emits (`improved_benchmark_monthly` is gated `date_reference <
+2026-05-01`). Comparison joins on `(xforce, xplead, month)`.
+
+**Scope — XForce metric only.** This build emits **`improved_benchmark_xforce`**
+(legacy main-deck `improved_benchmark`) — the component `xforce_index` consumes.
+The legacy **S&D-deck** `improved_benchmark_squad` / `_district`
+(`[IO] Performance 2026 - S&D.sql`) are **out of scope**: the S&D notebook is not
+a documented pipeline component (`legacy/CLAUDE.md`), and it attributes each
+benchmark via a separate `agent_information` snapshot join rather than the roster.
+
+**Value parity (avg abs diff, pp):** **Apr 0.96**, **Mar 1.8**, **Feb 7.7**,
+**Jan 13.6**. Mar/Apr are near-parity; Jan/Feb are bounded by the shared NTPJ
+early-month benchmark gap (below), not a logic error. The benchmark-unit
+population is bit-exact to legacy (March: 768 vs 769 distinct
+`job_id × xforce × district`).
+
+### Reproduced and matching (the parity fixes)
+- **Consumes the NTPJ substrate** `io_normalized_time_per_job` (legacy
+  `normalized_time_per_job`), so the benchmark `exp_duration_job` is cohort-wide
+  (all teams) and the `(xforce, xplead, squad, district)` attribution is the NTPJ
+  contribution — not re-derived from Core/Fraud-filtered raw jobs.
+- **`(job_id, xforce)` LAG** (legacy `ntpj_benchmark_base` /
+  `occupancy_benchmark_base` `PARTITION BY job_id, xforce`): a `(job_id, xforce)`
+  new this month is a first month (not counted) even if the `job_id` appeared
+  last month under a different xforce. `ROUND(…,5)` before the compare; ties
+  count as improved.
+- **`ntpj_xforce` gate** (legacy `improved_benchmark_final FROM ntpj_xforces`):
+  units are dropped for an `(xforce, month)` with no `ntpj_xforce` row. A no-op
+  for NTPJ units; drops NTPJ-absent occupancy units.
+- **XForce gating**: flat `date_reference < 2026-05-01` for all teams + the
+  `david.fernandez` April carve-out (non-david Core April survives → 4-component
+  for `xforce_index`).
+
+### Divergences
+| Divergence | Cause | Class |
+| --- | --- | --- |
+| **Jan/Feb off (13.6 / 7.7)** | inherits the NTPJ early-month benchmark gap — the trailing-window `exp_duration_job` for Jan-Mar depends on 2025 history the production NTPJ run doesn't fully validate; the `ntpj_xforce` metric itself diffs Jan 22 → Apr 1.4 | open (shared NTPJ base gap) |
+| **April `only_legacy` xforces (~7)** | gate/coverage tied to NTPJ (legacy `ntpj_xforces` keeps xforces the substrate presence doesn't) | open (NTPJ-bound) |
+| Occupancy benchmark not substrate-backed | still recomputed from `io_occupancy_time_raw` (legacy reads `normalized_occupancy`); footprint on the xforce metric is small (occupancy only counts from April, ~5-6pp) | minor / deferred |
+
+### Verdict
+**Shipped (XForce metric).** `improved_benchmark_xforce` is at parity for Mar/Apr
+and bounded only by the deferred NTPJ early-month gap for Jan/Feb. Also ships a
+new **`ntpj_xforce`** metric (`io_ntpj_xforce_metric`, roll-up of `io_ntpj_metric`
+= legacy `ntpj_xforces`) that filled a real output-table gap, and the NTPJ
+substrate table `io_normalized_time_per_job`.
+
+---
+
 ## Other metrics — not yet parity-checked
 
-The remaining composites (**XForce Index**, **Average XForce Index**, **Improved
-Benchmarks**) are **not** validated against legacy yet. Improved Benchmarks is
-ported + logic-fixed on a branch but deferred — it needs 2025 `io_jobs_raw`
-history + a real `ntpj_xforce` rollup. XForce Index and Average XForce Index are
-**ported** (PySpark, unit-tested) on branches `port/xforce-index-pyspark` and
-`port/average-xforce-index-pyspark`, but their cluster parity is blocked on
-Improved Benchmarks (the 4th XForce-Index component) — validate + merge once that
-base lands. Check for the same phantom-adherence cutover, meeting/leave filter,
-and DIME-squad filter as the base metrics, plus the week+month-only restriction.
+**XForce Index** and **Average XForce Index** are **ported** (PySpark,
+unit-tested) on branches `port/xforce-index-pyspark` and
+`port/average-xforce-index-pyspark`. With Improved Benchmarks' XForce component
+now landed, they can be validated against legacy — reconcile the `xforce_index`
+component gating to the flat `date_reference < 2026-05-01` + david-April rule
+(non-david Core April is **4-component**, not 3), and check the same
+phantom-adherence cutover, meeting/leave filter, and DIME-squad filter as the
+base metrics, plus the week+month-only restriction.
