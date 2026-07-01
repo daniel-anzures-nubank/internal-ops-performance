@@ -30,6 +30,8 @@ from occupancy_time import (
     NOCC_OUT_OF_SCOPE_SQUADS,
     SHUFFLE_OCCUPIED_STATUSES,
     SLOT_DURATION_SECONDS,
+    SM_DIME_SQUADS,
+    SM_FULL_CREDIT_EXCLUDED_ACTIVITY_TYPES,
     build_jobs_union,
     compute_occupancy_time,
     compute_slot_occupancy,
@@ -519,6 +521,113 @@ class TestComputeSlotOccupancy:
             ),
         )
         assert self._occ(slots, jobs) == 600
+
+
+# ---------------------------------------------------------------------------
+# Social-Media empty-slot full credit (pre-cutover parity quirk)
+# ---------------------------------------------------------------------------
+
+
+class TestSmEmptySlotFullCredit:
+    """Legacy SM deck quirk: a pre-cutover SM slot with NO overlapping
+    matching-activity Sprinklr case earns the full 1800 s (legacy
+    ``ELSE 1800`` fall-through, lines 1129 + 1189/1223 of the SM Temp Fix
+    notebook). Corrected (0) from 2026-07-01 onward."""
+
+    def _sm_slot(self, spark, **overrides):
+        row = {"squad": "social", "activity_type_required": "oos", **overrides}
+        return filter_dime(make_dime(spark, [row]))
+
+    def _no_jobs(self, spark):
+        return build_jobs_union(empty_shuffle(spark), empty_oos(spark))
+
+    def _occ(self, slots, jobs):
+        rows = compute_slot_occupancy(slots, jobs).collect()
+        assert len(rows) == 1
+        return int(rows[0]["occupancy_time"])
+
+    @pytest.mark.parametrize("squad", list(SM_DIME_SQUADS))
+    def test_empty_sm_slot_full_credit_before_cutover(self, spark, squad):
+        # (a) Date D is May 2026 (< 2026-07-01): the empty slot falls through
+        # legacy's ELSE 1800 -> fully occupied.
+        slots = self._sm_slot(spark, squad=squad)
+        assert self._occ(slots, self._no_jobs(spark)) == SLOT_DURATION_SECONDS
+
+    def test_empty_sm_slot_zero_on_after_cutover(self, spark):
+        # (b) Corrected behavior from 2026-07-01: an empty slot is 0.
+        slots = self._sm_slot(spark, date=POST_JULY)
+        assert self._occ(slots, self._no_jobs(spark)) == 0
+
+    def test_partial_overlap_keeps_actual_seconds_before_cutover(self, spark):
+        # (c) Legacy's WHEN branch: a matching overlapping case keeps its
+        # actual overlap seconds — the 1800 default only catches slots with NO
+        # matching case (SUM(CASE WHEN activity_occuped = 1 THEN duration END)
+        # is non-NULL as soon as one matching case overlaps).
+        sm = make_sm(
+            spark,
+            [{"activity_start_unix": SLOT_BASE, "activity_end_unix": SLOT_BASE + 600}],
+        )
+        jobs = build_jobs_union(empty_shuffle(spark), empty_oos(spark), sm)
+        assert self._occ(self._sm_slot(spark), jobs) == 600
+
+    def test_non_sm_empty_slot_stays_zero_before_cutover(self, spark):
+        # (d) Non-SM slot (default DIME squad 'core') with no overlap: unchanged.
+        slots = filter_dime(make_dime(spark, [{}]))
+        assert self._occ(slots, self._no_jobs(spark)) == 0
+
+    def test_only_non_matching_overlap_still_gets_full_credit(self, spark):
+        # Legacy's SUM(CASE WHEN activity_occuped = 1 THEN duration END) is
+        # NULL when overlapping jobs exist but none match the slot's activity
+        # type, so that slot ALSO falls through to ELSE 1800.
+        chat_job = make_shuffle(
+            spark,
+            [
+                {
+                    "activity_type": "chat",
+                    "activity_start_unix": SLOT_BASE,
+                    "activity_end_unix": SLOT_BASE + 600,
+                }
+            ],
+        )
+        jobs = build_jobs_union(chat_job, empty_oos(spark))
+        assert self._occ(self._sm_slot(spark), jobs) == SLOT_DURATION_SECONDS
+
+    @pytest.mark.parametrize("act", ["lunch_break", "time_off", "shrinkage"])
+    def test_non_productive_sm_slot_not_credited(self, spark, act):
+        # Legacy's own DIME filter (lines 1064/1079) drops these before the
+        # occupancy CASE, so they never earn the 1800 default.
+        slots = self._sm_slot(spark, activity_type_required=act)
+        assert self._occ(slots, self._no_jobs(spark)) == 0
+
+    def test_reclassified_invalid_notation_sm_slot_not_credited(self, spark):
+        # Legacy drops `dime_invalid_notation` slots outright (line 1064); this
+        # module reclassifies them to 'oos', but eligibility is decided on the
+        # PRE-reclass value, so the reclassified slot stays at 0.
+        slots = self._sm_slot(spark, activity_type_required="dime_invalid_notation")
+        out = slots.collect()
+        assert out[0]["activity_type_required"] == "oos"  # reclass happened
+        assert self._occ(slots, self._no_jobs(spark)) == 0
+
+    def test_excluded_activity_types_constant_matches_legacy_filter(self):
+        assert SM_FULL_CREDIT_EXCLUDED_ACTIVITY_TYPES == (
+            "lunch_break",
+            "dime_invalid_notation",
+            "time_off",
+            "shrinkage",
+        )
+
+    def test_end_to_end_empty_sm_slot_full_credit(self, spark):
+        # Through compute_occupancy_time: a pre-cutover social slot with no SM
+        # case at all lands with the full 30 occupied minutes.
+        roster = make_roster(spark, [{"squad": "social", "team": "social media"}])
+        dime = make_dime(
+            spark, [{"squad": "social", "activity_type_required": "oos"}]
+        )
+        out = compute_occupancy_time(
+            roster, dime, empty_shuffle(spark), empty_oos(spark)
+        ).collect()
+        assert len(out) == 1
+        assert out[0]["occupancy_minutes"] == SLOT_DURATION_SECONDS / 60.0
 
 
 # ---------------------------------------------------------------------------

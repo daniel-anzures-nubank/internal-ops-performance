@@ -73,6 +73,26 @@ byte-for-byte (including legacy's bugs) per the project's legacy-parity decision
 * NOTE this is distinct from the night-shift re-attribution, which still uses its
   own ``shift_attribution.NIGHT_SHIFT_CUTOVER`` (untouched).
 
+* **Social-Media empty-slot full credit (pre-cutover parity quirk).** The legacy
+  SM deck (``legacy/[IO] Performance 2026 - Social Media Temp Fix.sql``) counts a
+  dimensioned SM slot with NO overlapping matching-activity Sprinklr case as
+  FULLY occupied: ``occupancy_agg`` (lines 1123-1135) computes
+  ``SUM(CASE WHEN activity_occuped = 1 THEN duration END)`` — NULL when no
+  overlapping case matches the slot's activity type — and the downstream
+  ``CASE WHEN SUM(occupancy_time) <= 1800 THEN SUM(occupancy_time) ELSE 1800 END``
+  (lines 1189 and 1223) evaluates ``NULL <= 1800`` to NULL, so an empty slot
+  falls through to ``ELSE 1800``. Partially covered slots keep their actual
+  overlap seconds (the ``WHEN`` branch); only slots with zero matching cases get
+  the 1800 default. We reproduce this quirk for SM DIME slots
+  (:data:`SM_DIME_SQUADS`) dated **before**
+  :data:`SM_EMPTY_SLOT_FULL_CREDIT_CUTOVER` (2026-07-01), restricted to the
+  productive slot universe legacy scored (its DIME filter, lines 1064/1079,
+  drops ``lunch_break`` / ``dime_invalid_notation`` / ``time_off`` /
+  ``shrinkage`` — the eligibility flag is decided on the PRE-reclass
+  ``activity_type_required``, since this module relabels ``dime_invalid_notation``
+  to ``'oos'``). On/after the cutover the corrected behavior applies: an empty
+  slot is 0.
+
 The two **fixed** DIME filters (meeting/leave ``dimensioned_activity`` drop and
 the wfm/credit_evolution/dote DIME-squad drop) apply on ALL dates.
 
@@ -151,6 +171,30 @@ SHUFFLE_OCCUPIED_STATUSES: tuple[str, ...] = ("finished", "transferred", "skippe
 # Slot duration — 30 minutes.
 SLOT_DURATION_SECONDS: int = 30 * 60
 
+# --- Social-Media empty-slot full credit (pre-cutover parity quirk) ---------
+# The legacy SM deck scores only these DIME squads
+# (`[IO] Performance 2026 - Social Media Temp Fix.sql` line 1065:
+# `agent_dime_squad IN ('social', 'social_social')`).
+SM_DIME_SQUADS: tuple[str, ...] = ("social", "social_social")
+
+# Slots dated BEFORE this reproduce the legacy quirk (a slot with no
+# matching-activity overlapping Sprinklr case earns the full 1800 s — the
+# `ELSE 1800` fall-through at legacy lines 1189/1223); on/after it the
+# corrected behavior applies (an empty slot is 0). See module docstring.
+SM_EMPTY_SLOT_FULL_CREDIT_CUTOVER: date = date(2026, 7, 1)
+
+# Legacy's SM occupancy DIME filter (lines 1064/1079) drops these activity
+# types outright, so such slots never reach its `ELSE 1800` and must not earn
+# the full-credit default here. `dime_invalid_notation` is in this list even
+# though this module reclassifies it to 'oos' — legacy dropped the slot before
+# any reclassification, so eligibility is decided on the PRE-reclass value.
+SM_FULL_CREDIT_EXCLUDED_ACTIVITY_TYPES: tuple[str, ...] = (
+    "lunch_break",
+    "dime_invalid_notation",
+    "time_off",
+    "shrinkage",
+)
+
 LUIS_CONTRERAS_AGENT = "luis.contreras"
 
 # Per-slot interval-dedup partition / result keys.
@@ -193,6 +237,13 @@ def filter_dime(dime: DataFrame) -> DataFrame:
 
     Activity-type (``lunch_break`` / ``time_off`` / ``shrinkage``) exclusions
     still move to the metrics layer.
+
+    Also tags each slot with the boolean ``sm_empty_slot_full_credit`` —
+    eligibility for the legacy SM empty-slot 1800-second default (see module
+    docstring), consumed by :func:`compute_slot_occupancy`. Decided BEFORE the
+    reclassifications because legacy's SM deck (line 1064) drops
+    ``dime_invalid_notation`` slots outright: a slot reclassified to ``'oos'``
+    here was never scored by legacy and must not earn the default.
     """
     out = dime.filter(F.col("activity_type_required").isNotNull())
 
@@ -211,6 +262,19 @@ def filter_dime(dime: DataFrame) -> DataFrame:
     out = out.filter(
         F.col("squad").isNotNull()
         & ~F.col("squad").isin(list(NOCC_DIME_SQUAD_EXCLUSIONS))
+    )
+
+    # SM empty-slot full-credit eligibility (pre-cutover parity quirk; module
+    # docstring). Computed on the PRE-reclass activity_type_required so slots
+    # legacy's own DIME filter dropped (e.g. `dime_invalid_notation`, which the
+    # step below relabels 'oos') stay ineligible.
+    out = out.withColumn(
+        "sm_empty_slot_full_credit",
+        F.col("squad").isin(list(SM_DIME_SQUADS))
+        & (F.col("date") < F.lit(SM_EMPTY_SLOT_FULL_CREDIT_CUTOVER))
+        & ~F.col("activity_type_required").isin(
+            list(SM_FULL_CREDIT_EXCLUDED_ACTIVITY_TYPES)
+        ),
     )
 
     # Systemic reclassifications → 'oos'.
@@ -364,18 +428,26 @@ def compute_slot_occupancy(dime_filtered: DataFrame, jobs: DataFrame) -> DataFra
          max(cjob_start, prev_max_end))`` where ``activity_occuped = 1`` iff
          ``slot.activity_type_required == job.activity_type``.
       5. Sum contributions per slot. Cap at 1800. LEFT-JOIN semantics: slots
-         with no matching job keep ``occupancy_time = 0``.
+         with no matching job keep ``occupancy_time = 0`` — EXCEPT eligible
+         Social-Media slots (``sm_empty_slot_full_credit``, tagged by
+         :func:`filter_dime`): pre-cutover SM slots with NO overlapping
+         matching-activity job earn the full 1800 s, reproducing legacy's
+         ``ELSE 1800`` fall-through (module docstring). A slot with a matching
+         overlap keeps its actual (capped) seconds.
 
     Returns one row per (agent, squad, date, slot_start, slot_end,
     activity_type_required) with ``occupancy_time`` (long seconds).
     """
     keys = list(SLOT_KEYS)
 
+    # `max` on the eligibility flag (rather than including it in a distinct)
+    # keeps exactly one row per slot even if post-reclass duplicates were to
+    # carry different flags.
     slots = (
         dime_filtered.withColumnRenamed("slot_start_local_unix", "slot_start")
         .withColumnRenamed("slot_end_local_unix", "slot_end")
-        .select(*keys)
-        .distinct()
+        .groupBy(*keys)
+        .agg(F.max("sm_empty_slot_full_credit").alias("sm_empty_slot_full_credit"))
     )
 
     # Half-open overlap, equivalent to legacy's 3-clause OR for positive-duration
@@ -421,17 +493,35 @@ def compute_slot_occupancy(dime_filtered: DataFrame, jobs: DataFrame) -> DataFra
     per_slot = (
         clipped.withColumn("contribution", contribution)
         .groupBy(*keys)
-        .agg(F.sum("contribution").alias("occupancy_time"))
+        .agg(
+            F.sum("contribution").alias("occupancy_time"),
+            F.max("activity_occuped").alias("_matching_overlap"),
+        )
         .withColumn(
             "occupancy_time",
             F.least(F.col("occupancy_time"), F.lit(SLOT_DURATION_SECONDS)),
         )
     )
 
-    # LEFT-JOIN back to keep slots with no matching job (occupancy_time = 0).
-    return slots.join(per_slot, on=keys, how="left").withColumn(
-        "occupancy_time",
-        F.coalesce(F.col("occupancy_time"), F.lit(0)).cast("long"),
+    # LEFT-JOIN back to keep slots with no matching job (occupancy_time = 0)
+    # — except eligible pre-cutover SM slots, which reproduce legacy's
+    # `ELSE 1800`. Legacy's `SUM(CASE WHEN activity_occuped = 1 THEN duration
+    # END)` (line 1129) is NULL whenever NO overlapping job matches the slot's
+    # activity type — both "no overlapping job at all" and "overlapping jobs
+    # but none matching" — so the default keys off `_matching_overlap`, not
+    # merely the absence of a per_slot row.
+    joined_back = slots.join(per_slot, on=keys, how="left")
+    sm_full_credit = F.col("sm_empty_slot_full_credit") & (
+        F.coalesce(F.col("_matching_overlap"), F.lit(0)) == 0
+    )
+    return (
+        joined_back.withColumn(
+            "occupancy_time",
+            F.when(sm_full_credit, F.lit(SLOT_DURATION_SECONDS))
+            .otherwise(F.coalesce(F.col("occupancy_time"), F.lit(0)))
+            .cast("long"),
+        )
+        .drop("sm_empty_slot_full_credit", "_matching_overlap")
     )
 
 
