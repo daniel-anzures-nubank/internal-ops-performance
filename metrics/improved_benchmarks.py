@@ -162,27 +162,31 @@ def _empty_units(spark) -> DataFrame:
 
 
 def _flag_improved(benchmarks: DataFrame, *, direction: str) -> DataFrame:
-    """Per ``(key, month)`` ``improved`` / ``counted`` via month-over-month LAG.
+    """Per ``(key, xforce, month)`` ``improved`` / ``counted`` via month-over-month LAG.
 
-    ``benchmarks`` carries ``key, month, benchmark`` — **one row per
-    ``(key, month)``**. The benchmark is a property of the key (a job_id's
-    expected duration / a district-shift's occupancy), NOT of the
-    xforce/squad/district attribution, so the LAG partitions by ``key`` ONLY
-    (legacy ``PARTITION BY job_id``/``district-shift``). The benchmark is rounded
-    to :data:`BENCHMARK_ROUND_DECIMALS` before the compare. Ties count as
-    improved; the first month (NULL previous) is neither improved nor counted.
+    ``benchmarks`` carries ``key, xforce, month, benchmark`` — **one row per
+    ``(key, xforce, month)``**. Legacy LAGs ``PARTITION BY (job_id, xforce)``
+    (both ``ntpj_benchmark_base`` and ``occupancy_benchmark_base``), so the
+    ``counted`` / first-month determination is **per ``(key, xforce)``**, NOT per
+    key alone: a ``(key, xforce)`` that is new this month is a first month (NULL
+    previous → not counted) even if the ``key`` (job_id / district-shift) itself
+    appeared last month under a different xforce. The benchmark *value* is
+    cohort-wide (identical across xforces), so this does not change the value —
+    only which units are counted. The benchmark is rounded to
+    :data:`BENCHMARK_ROUND_DECIMALS` before the compare. Ties count as improved.
 
-    Returns ``key, month, improved, counted`` — the per-key flag that is then
-    joined onto the xforce/squad/district attribution rows.
+    Returns ``key, xforce, month, improved, counted`` — joined onto the
+    attribution rows by ``(key, xforce, month)``.
     """
     bench = F.round(F.col("benchmark"), BENCHMARK_ROUND_DECIMALS)
-    w = Window.partitionBy("key").orderBy("month")
+    w = Window.partitionBy("key", "xforce").orderBy("month")
     prev = F.lag(bench).over(w)
 
     improved = (bench <= prev) if direction == "lower" else (bench >= prev)
     counted = prev.isNotNull()
     return benchmarks.select(
         "key",
+        "xforce",
         "month",
         (improved & counted).cast("long").alias("improved"),
         counted.cast("long").alias("counted"),
@@ -198,48 +202,57 @@ def _ntpj_benchmark_units(ntpj: DataFrame) -> DataFrame:
     (xforce, xplead, squad, district) attribution come from the NTPJ dataset, not
     re-derived from raw jobs:
 
-    * benchmark per ``(job_id, month)`` = ``AVG(exp_duration_job)`` (a per-job_id
-      constant, so ``AVG`` = the value) — legacy ``ntpj_benchmark_agg``;
-    * the improvement flag is computed once per job_id (``_flag_improved`` LAGs by
-      the key), then joined onto the distinct ``(job_id, xforce, xplead, month,
-      squad, district)`` attribution rows — so a job_id splits across every
-      (squad, district) its agents worked (legacy ``ntpj_benchmark`` GROUP BY).
+    * benchmark per ``(job_id, xforce, month)`` = ``AVG(exp_duration_job)`` (a
+      per-job_id constant, so ``AVG`` = the cohort value) — legacy
+      ``ntpj_benchmark_agg``;
+    * the improvement flag is computed per ``(job_id, xforce)`` (``_flag_improved``
+      LAGs by ``(key, xforce)``), then joined onto the distinct ``(job_id, xforce,
+      xplead, month, squad, district)`` attribution rows — so a job_id splits
+      across every (squad, district) its agents worked (legacy ``ntpj_benchmark``
+      GROUP BY), and a ``(job_id, xforce)`` new this month is not counted.
 
     Returns the :data:`_UNIT_COLS`.
     """
     spark = ntpj.sparkSession
-    rows = ntpj.withColumn("month", F.col("benchmark_month"))
-    if len(rows.take(1)) == 0:
-        return _empty_units(spark)
-
-    # Benchmark per (job_id, month): cohort-wide exp_duration_job, constant across
-    # the attribution rows (legacy ntpj_benchmark_agg = ROUND(AVG(...),5); the
-    # ROUND happens inside _flag_improved before the LAG/compare).
-    benchmarks = rows.groupBy(
-        F.col("job_id").alias("key"), "month"
-    ).agg(F.avg("exp_duration_job").alias("benchmark"))
-    flags = _flag_improved(benchmarks, direction="lower")  # key, month, improved, counted
-
-    attribution = rows.select(
+    rows = ntpj.select(
         F.col("job_id").alias("key"),
         "xforce",
         "xplead",
-        "month",
+        F.col("benchmark_month").alias("month"),
         F.lower(F.col("team")).alias("team"),
         "squad",
         "district",
+        "exp_duration_job",
+    )
+    if len(rows.take(1)) == 0:
+        return _empty_units(spark)
+
+    # Benchmark per (job_id, xforce, month): cohort-wide exp_duration_job, constant
+    # across the attribution rows (legacy ntpj_benchmark_agg = ROUND(AVG(...),5);
+    # the ROUND happens inside _flag_improved before the LAG/compare).
+    benchmarks = rows.groupBy("key", "xforce", "month").agg(
+        F.avg("exp_duration_job").alias("benchmark")
+    )
+    flags = _flag_improved(benchmarks, direction="lower")  # key, xforce, month, improved, counted
+
+    attribution = rows.select(
+        "key", "xforce", "xplead", "month", "team", "squad", "district"
     ).distinct()
 
-    return attribution.join(flags, on=["key", "month"], how="inner").select(*_UNIT_COLS)
+    return attribution.join(
+        flags, on=["key", "xforce", "month"], how="inner"
+    ).select(*_UNIT_COLS)
 
 
 def _occupancy_benchmark_units(occ: DataFrame) -> DataFrame:
     """Occupancy benchmark units: attribution rows + the per-district-shift flag.
 
     The benchmark is per ``(district, shift, month)`` (mean of the squad
-    occupancy ratios). The improvement flag is computed at that grain (LAG by the
-    ``district - shift`` key), then joined onto the distinct ``(key, xforce,
-    xplead, month, squad, district)`` attribution rows. Returns :data:`_UNIT_COLS`.
+    occupancy ratios) — independent of xforce. The improvement flag is computed
+    per ``(key, xforce)`` (LAG by the ``district - shift`` key AND xforce, legacy
+    ``occupancy_benchmark_base`` ``PARTITION BY job_id, xforce``), then joined
+    onto the distinct ``(key, xforce, xplead, month, squad, district)``
+    attribution rows. Returns :data:`_UNIT_COLS`.
     """
     spark = occ.sparkSession
     act = F.lower(F.col("activity_type_required"))
@@ -262,7 +275,7 @@ def _occupancy_benchmark_units(occ: DataFrame) -> DataFrame:
             F.lit(None).cast("double")
         ),
     )
-    benchmarks = (
+    bench_km = (
         squad.groupBy("month", "district", "shift")
         .agg(F.avg("ratio").alias("benchmark"))
         .select(
@@ -271,7 +284,6 @@ def _occupancy_benchmark_units(occ: DataFrame) -> DataFrame:
             "benchmark",
         )
     )
-    flags = _flag_improved(benchmarks, direction="higher")  # key, month, improved, counted
 
     # Attribution: distinct (district-shift key, xforce, xplead, month, squad,
     # district) over the productive slots (legacy occupancy_benchmark carries
@@ -286,7 +298,18 @@ def _occupancy_benchmark_units(occ: DataFrame) -> DataFrame:
         "district",
     ).distinct()
 
-    return attribution.join(flags, on=["key", "month"], how="inner").select(*_UNIT_COLS)
+    # Benchmark per (key, xforce, month): the district-shift value, replicated per
+    # xforce so the LAG partitions by (key, xforce).
+    benchmarks = (
+        attribution.select("key", "xforce", "month")
+        .distinct()
+        .join(bench_km, on=["key", "month"], how="inner")
+    )
+    flags = _flag_improved(benchmarks, direction="higher")  # key, xforce, month, improved, counted
+
+    return attribution.join(
+        flags, on=["key", "xforce", "month"], how="inner"
+    ).select(*_UNIT_COLS)
 
 
 def _ntpj_xforce_months_from_metric(ntpj_xforce: DataFrame) -> DataFrame:

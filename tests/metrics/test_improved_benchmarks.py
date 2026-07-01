@@ -255,6 +255,24 @@ class TestNtpjBenchmark:
         assert xf["squad"] is None and xf["district"] is None
         assert xf["numerator"] == 1.0 and xf["metric_value"] == 100.0
 
+    def test_new_xforce_for_existing_job_is_first_month(self, spark):
+        # jobA exists in Mar (x.one) and Apr (x.one + x.two). For x.two, Apr is
+        # the FIRST month of (jobA, x.two) -> not counted, even though jobA itself
+        # existed in Mar under x.one. Legacy LAGs PARTITION BY (job_id, xforce).
+        out = _run(spark, ntpj=make_ntpj(spark, [
+            {"xforce": "x.one", "xplead": "p1", "squad": "s1", "district": "d1",
+             "benchmark_month": PREV_M, "exp_duration_job": 200.0},
+            {"xforce": "x.one", "xplead": "p1", "squad": "s1", "district": "d1",
+             "benchmark_month": CUR_M, "exp_duration_job": 100.0},
+            {"xforce": "x.two", "xplead": "p2", "squad": "s2", "district": "d2",
+             "benchmark_month": CUR_M, "exp_duration_job": 100.0},
+        ]))
+        xfs = {r["xforce"]: r for r in _by_metric(out, XFORCE_METRIC)}
+        assert xfs["x.one"]["denominator"] == 1.0  # counted (Mar comparator)
+        assert xfs["x.one"]["numerator"] == 1.0    # improved
+        assert xfs["x.two"]["denominator"] == 0.0  # first month for (jobA, x.two)
+        assert xfs["x.two"]["metric_value"] is None
+
     def test_benchmark_rounded_before_compare(self, spark):
         # Two benchmarks differing beyond the 5th decimal are a tie -> improved.
         out = _run(spark, ntpj=make_ntpj(spark, [
