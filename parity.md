@@ -777,6 +777,52 @@ substrate table `io_normalized_time_per_job`.
 
 ---
 
+## XForce Index — `io_xforce_index_metric` (metric `xforce_index`) vs `index_xforce` in `usr.mx__cx.internal_ops_performance_2026` (main deck)
+
+**Status:** validated over the month grain **`2026-01 … 2026-06`** on the fresh
+Improved-Benchmarks base (built 2026-07-01). Comparison joins on
+`(xforce, xplead, month)`; legacy's within-month duplicate rows are collapsed by
+averaging (Jan is especially heavy — 340 rows / 67 pairs).
+
+**The `xforce_index`-specific logic is byte-exact.** In every matched row the
+**denominator matches legacy** (the 3-vs-4 component date rule and the
+`david.fernandez ≥ 2026-04` carve-out reproduce exactly — e.g. April is 32
+four-component + 8 three-component, matching legacy's `400`/`300` split), and
+**every legacy main-deck XForce is reproduced** (`legacy_only = 0` all six
+months). Spot reconstruction is exact: `yuset.elizalde`/`david.fernandez` June =
+`(100 + 96.62 + 97.04)/300 = 97.89`, matching the emitted value.
+
+**Value parity (avg abs diff, pp | matched | ≤0.5 | ≤2.0):**
+
+| month | avg | matched | ≤0.5 | ≤2.0 | comp |
+| --- | --- | --- | --- | --- | --- |
+| Jan | 8.78 | 67 | 4 | 19 | 4 |
+| Feb | 2.89 | 37 | 14 | 25 | 4 |
+| Mar | 2.33 | 33 | 13 | 24 | 4 |
+| **Apr** | **1.44** | 33 | 28 | 30 | 4 |
+| **May** | **0.53** | 35 | 31 | 33 | 3 |
+| Jun | 2.87 | 36 | 14 | 25 | 3 |
+
+May (3-component, no improved) is the clean baseline at **0.53**; April (the
+4-component unblock, improved now present) lands at **1.44**, tracking
+Improved Benchmarks' own Apr **0.96** residual.
+
+### Divergences (all inherited from upstream component numerators — not this module)
+| Divergence | Cause | Class |
+| --- | --- | --- |
+| **Jan/Feb off (8.8 / 2.9)** | the improved + NTPJ early-month benchmark gap propagates through the 4th component (see Improved Benchmarks: Jan 13.6 / Feb 7.7) | open (shared NTPJ base gap) |
+| **Jun off (2.87, one 34pp outlier)** | just-closed month — the shrinkage / average_xpeer_index component tables carry a different June vintage than legacy's `index_xforce` (denominators still byte-exact; May, same 3-component logic, is 0.53) | open (in-flight-month vintage) |
+| **`new_only` 1–7 / month** | SM + Content deck XForces — the main-deck legacy `internal_ops_performance_2026` does not carry them (Content Jan-Mar also 4-component here vs legacy 3, pending Content's deck-specific 2026-04 cutover) | known scope gap |
+
+### Verdict
+**Shipped.** The composite's own logic is byte-exact (denominators + XForce
+coverage), the 3-component baseline is at parity (May 0.53), and the 4-component
+unblock tracks its improved input (Apr 1.44). Residuals are entirely inherited
+from the upstream component tables' documented early-month / just-closed bounds —
+the same bar every prior composite shipped at.
+
+---
+
 ## Average XForce Index — `io_average_xforce_index_metric` (metric `average_xforce_index`) vs `average_index_xforce` in `usr.mx__cx.internal_ops_performance_2026` (main deck)
 
 **Status:** validated over the month grain **`2026-01 … 2026-06`** on the fresh
