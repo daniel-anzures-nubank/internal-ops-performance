@@ -32,6 +32,13 @@ Each slot carries its ``(month, district, shift)`` benchmark; when rolled up to
 a multi-month bucket the benchmark is averaged weighted by required minutes (a
 single-month bucket therefore just keeps that month's benchmark).
 
+**Deck exception (Content):** legacy's Content deck keys this benchmark on
+``squad_district`` only — no shift. Content's roster carries a NULL shift, so we
+force it onto one shift-agnostic key (``district``-only) rather than losing the
+benchmark to the ``NULL != NULL`` equi-join. Every other deck stays on
+``district + shift`` (a NULL-shift main-deck row keeps a NULL benchmark, exactly
+as legacy leaves it). See :data:`CONTENT_BENCH_SHIFT`.
+
 Output convention
 -----------------
 To keep the shared ``metric_value = numerator / denominator * 100`` contract,
@@ -92,6 +99,19 @@ NITZA_NO_SUPPRESSION_AGENT = "nitza.zarza"
 NITZA_NO_SUPPRESSION_START: date = date(2026, 4, 1)
 NITZA_NO_SUPPRESSION_END: date = date(2026, 5, 31)
 
+# Legacy deck split for the NOcc benchmark grain: the main deck
+# (`[IO] Normalized Occupancy Dataset.sql`) keys on district + shift, but the
+# Content deck (`[IO] Performance 2026 - Content Temp Fix.sql`) keys on
+# squad_district ONLY (no shift). Content's roster carries a NULL shift, so under
+# the plain `shift = shift` equi-join its benchmark row never rejoins
+# (NULL != NULL in Spark) — the exact bug that NULLed every Content NO. We force
+# Content onto one shift-agnostic key so its benchmark is district-only (matching
+# legacy Content), while every other deck stays on district + shift — including
+# the NULL-shift rows the main deck ALSO leaves unmatched under `a.shift = b.shift`,
+# preserving Core/Fraud parity.
+CONTENT_TEAM = "content"
+CONTENT_BENCH_SHIFT = "__content_all__"
+
 # Same non-productive activity types excluded from adherence.
 EXCLUDED_ACTIVITY_TYPES: tuple[str, ...] = (
     "lunch_break",
@@ -101,13 +121,18 @@ EXCLUDED_ACTIVITY_TYPES: tuple[str, ...] = (
 
 
 def _occupancy_benchmark(slots: DataFrame) -> DataFrame:
-    """Per ``(month, district, shift)`` benchmark = mean of squad occupancy ratios.
+    """Per ``(month, district, _bench_shift)`` benchmark = mean of squad ratios.
 
-    Step 1: per-``(month, district, shift, squad)`` ratio = SUM(occ)/SUM(req).
-    Step 2: mean of those squad ratios per ``(month, district, shift)``. Both
-    group steps keep NULL keys (Content `shift`/`district` can be NULL).
+    ``_bench_shift`` is ``shift`` for every deck except Content, which is forced
+    onto a single shift-agnostic key (:data:`CONTENT_BENCH_SHIFT`) so its
+    benchmark is district-only, matching legacy Content (see the constant).
+
+    Step 1: per-``(month, district, _bench_shift, squad)`` ratio = SUM(occ)/SUM(req).
+    Step 2: mean of those squad ratios per ``(month, district, _bench_shift)``.
+    Both group steps keep NULL keys (a NULL-shift main-deck row keeps a NULL
+    ``_bench_shift`` and — like legacy — never rejoins).
     """
-    squad = slots.groupBy("month", "district", "shift", "squad").agg(
+    squad = slots.groupBy("month", "district", "_bench_shift", "squad").agg(
         F.sum("occupancy_minutes").alias("occ"),
         F.sum("required_minutes").alias("req"),
     )
@@ -117,7 +142,7 @@ def _occupancy_benchmark(slots: DataFrame) -> DataFrame:
             F.lit(None).cast("double")
         ),
     )
-    bench = squad.groupBy("month", "district", "shift").agg(
+    bench = squad.groupBy("month", "district", "_bench_shift").agg(
         F.avg("ratio").alias("benchmark")
     )
     return bench
@@ -194,10 +219,18 @@ def compute_normalized_occupancy(
         )
     ).withColumn("month", F.trunc(F.to_date(F.col("date")), "month"))
 
+    # Benchmark key: Content is district-only (shift-agnostic); all other decks
+    # keep district + shift. See CONTENT_BENCH_SHIFT.
+    productive = productive.withColumn(
+        "_bench_shift",
+        F.when(
+            F.col("team") == F.lit(CONTENT_TEAM), F.lit(CONTENT_BENCH_SHIFT)
+        ).otherwise(F.col("shift")),
+    )
     bench = _occupancy_benchmark(productive)
     productive = productive.join(
-        bench, on=["month", "district", "shift"], how="left"
-    )
+        bench, on=["month", "district", "_bench_shift"], how="left"
+    ).drop("_bench_shift")
 
     # Approved manual adjustment, captured in the `Ajustes Index` tab:
     # nitza.zarza's NO is excluded from her metric output in Apr-May 2026, but
