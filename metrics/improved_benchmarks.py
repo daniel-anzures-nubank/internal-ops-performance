@@ -1,19 +1,28 @@
 """improved_benchmarks — the Improved Benchmarks metric (Core / Fraud only), PySpark.
 
 Part of the **metrics layer**, but structurally different from the agent-grain
-metrics: Improved Benchmarks is a **squad-level, district-level and XForce-level**
-roll-up of *month-over-month benchmark improvements*. It answers "what share of
-this squad's / district's / XForce's benchmarks improved vs. the previous month?".
+metrics: Improved Benchmarks is an **XForce-level** roll-up of *month-over-month
+benchmark improvements*. It answers "what share of this XForce's benchmarks
+improved vs. the previous month?".
 
-    improved_benchmarks = COUNT(improved benchmarks) / COUNT(comparable benchmarks)
+    improved_benchmark = COUNT(improved benchmarks) / COUNT(comparable benchmarks)
 
-**Target >= 60%.** Output is **month grain only** (benchmarks are monthly; legacy
-``improved_benchmark_final`` also emits the week grain, but the new pipeline only
-materializes the month grain — the XForce roll-up that ``xforce_index`` consumes
-is month-only).
+**Target >= 60%.** Output is the **``improved_benchmark_xforce`` metric only**,
+**month grain only** — this is the roll-up the composite ``xforce_index``
+consumes (it keys on the metric name ``improved_benchmark_xforce``). It reproduces
+legacy ``improved_benchmark`` from the **main deck** (``[IO] Performance 2026.sql``).
 
-Two benchmark families are compared (matches legacy
-``[IO] Performance 2026.sql`` + ``[IO] Performance 2026 - S&D.sql``):
+Scope note — the S&D deck is NOT reproduced
+-------------------------------------------
+Legacy also emits ``improved_benchmark_squad`` / ``improved_benchmark_district``
+from the **S&D deck** (``[IO] Performance 2026 - S&D.sql``), which attributes each
+benchmark to a squad/district via an ``agent_information`` *snapshot* join (a
+different, sparser source than the roster). That deck is **not a documented
+pipeline component** (see ``legacy/CLAUDE.md`` — the pipeline is Core&Fraud / SM /
+Content only), so the squad/district roll-ups are intentionally **out of scope**
+here. This module emits the XForce metric only.
+
+Two benchmark families are compared (matches legacy ``[IO] Performance 2026.sql``):
 
 * **NTPJ benchmark** — per ``job_id`` (job type): the monthly
   ``exp_duration_job`` (cohort-wide expected seconds, with the NTPJ trailing-
@@ -25,24 +34,22 @@ Two benchmark families are compared (matches legacy
   '2026-03-01'`` — there is no February occupancy benchmark, so February cannot
   become March's previous-month comparator).
 
-Both benchmarks are ``ROUND(..., 5)`` before the month-over-month LAG/compare
-(legacy ``ntpj_benchmark_agg`` / ``occupancy_benchmark`` round to 5 decimals
-before comparing to the previous month, so near-ties cannot flip).
+Both benchmarks are ``ROUND(..., 5)`` before the month-over-month LAG/compare, and
+the LAG **partitions by ``(key, xforce)``** (legacy ``ntpj_benchmark_base`` /
+``occupancy_benchmark_base`` ``PARTITION BY job_id, xforce``): a ``(key, xforce)``
+new this month is a first month (not counted) even if the ``key`` appeared last
+month under a different xforce. The benchmark value is cohort-wide (partition-
+invariant), so this changes only which units are counted, not the value.
 
 Ties ("stayed the same") count as **improved**. A benchmark's first month (no
-previous month to compare) is **not counted** (numerator or denominator).
+previous ``(key, xforce)`` month to compare) is **not counted** (numerator or
+denominator).
 
 Benchmark units carry the agent's ``(xforce, xplead, squad, district)`` directly
-(legacy ``ntpj_benchmark`` / ``occupancy_benchmark`` carry squad/squad_district
-per agent), so a single ``job_id`` can split across multiple squad/district rows.
-They are then rolled up:
-
-* ``improved_benchmark_squad``    — summed (COUNT DISTINCT job_id) per squad;
-* ``improved_benchmark_district`` — summed per district;
-* ``improved_benchmark_xforce``   — summed per ``(xforce, xplead)`` (legacy
-  ``improved_benchmark``; squad/district NULL). This XForce roll-up is what the
-  composite ``xforce_index`` metric consumes (it keys on the metric name
-  ``improved_benchmark_xforce``).
+(legacy ``ntpj_benchmark`` / ``occupancy_benchmark``), so a single ``job_id`` can
+split across multiple (squad, district). The XForce roll-up counts the distinct
+``(key, squad, district)`` units per ``(xforce, xplead)`` — squad/district feed
+the distinct count but are NULL on the output rows.
 
 XForce gating (legacy ``improved_benchmark_monthly`` / ``_weekly``)
 -------------------------------------------------------------------
@@ -51,17 +58,13 @@ teams) PLUS ``NOT (xplead == 'david.fernandez' AND date_reference >=
 2026-04-01)``. There is **no per-team Core/Fraud removal cutover** — non-david
 Core April-2026 xforces survive (4-component for ``xforce_index``).
 
-The squad / district roll-ups (legacy ``improved_benchmark_squad_monthly`` /
-``_district_monthly``, S&D deck) have **NO month gate and NO team cutover** —
-they emit every benchmark month present (pre-cutover).
-
 ntpj_xforce LEFT-JOIN gating
 ----------------------------
 Legacy ``improved_benchmark_final`` is driven by the ``ntpj_xforce`` output rows
 (``FROM ntpj_xforces`` / ``internal_ops_performance_2026 WHERE
 metric='ntpj_xforce'`` LEFT JOIN the benchmark units on ``month + xforce``), so a
 benchmark unit for an ``(xforce, month)`` that has **no** ``ntpj_xforce`` output
-row that month is dropped — this changes squad/district AND xforce denominators.
+row that month is dropped.
 We gate on the ``ntpj_xforce`` metric (``io_ntpj_xforce_metric``, the month rows)
 passed in as ``ntpj_xforce``. When it is not supplied we derive the **identical**
 presence from ``normalized_time_per_job`` — an ``ntpj_xforce`` row exists for an
@@ -84,14 +87,14 @@ Inputs
 * ``io_ntpj_xforce_metric`` (the gate driver) — the month rows supply the
   ``(xforce, month)`` presence that survives the LEFT-JOIN gate.
 
-Output — tidy long format (squad / district / xforce rows)
------------------------------------------------------------
+Output — tidy long format (XForce rows)
+---------------------------------------
 ``agent, xforce, xplead, team, squad, district, shift, date_reference,
 date_granularity, metric, numerator, denominator, metric_value``. ``metric`` is
-one of ``improved_benchmark_squad`` (squad set), ``improved_benchmark_district``
-(district set), or ``improved_benchmark_xforce`` (``xforce`` + ``xplead`` set).
-``agent`` and ``shift`` are always NULL; ``date_granularity`` is always
-``month``. ``metric_value = numerator / denominator * 100`` (NULL if denominator 0).
+always ``improved_benchmark_xforce`` (``xforce`` + ``xplead`` set). ``agent``,
+``team``, ``squad``, ``district``, ``shift`` are always NULL; ``date_granularity``
+is always ``month``. ``metric_value = numerator / denominator * 100`` (NULL if
+denominator 0).
 """
 
 from __future__ import annotations
@@ -108,8 +111,6 @@ from adjustments.manual import (
     reclassify_dime_slots,
 )
 
-SQUAD_METRIC = "improved_benchmark_squad"
-DISTRICT_METRIC = "improved_benchmark_district"
 XFORCE_METRIC = "improved_benchmark_xforce"
 
 # Improved Benchmarks only ever applied to Core and Fraud.
@@ -354,16 +355,13 @@ def _ntpj_xforce_months_from_substrate(ntpj: DataFrame) -> DataFrame:
     ).distinct()
 
 
-# The unit columns NOT in a roll-up's grouping key — the tuple whose DISTINCT
-# count gives that roll-up's numerator/denominator. Legacy counts
-# COUNT(DISTINCT job_id) per (xforce, squad, squad_district) and sums into each
-# roll-up, i.e. for any roll-up the count is the number of distinct benchmark
-# units = distinct (key, xforce, squad, district) tuples within the group.
-_ROLLUP_ID_COLS: dict[str, tuple[str, ...]] = {
-    "xforce": ("key", "squad", "district"),    # within (xforce, xplead)
-    "squad": ("key", "xforce", "district"),     # within squad
-    "district": ("key", "xforce", "squad"),     # within district
-}
+# The unit columns NOT in the XForce grouping key — the tuple whose DISTINCT
+# count gives the numerator/denominator. Legacy improved_benchmark (main deck)
+# counts COUNT(DISTINCT job_id) per (xforce, squad, squad_district) and sums into
+# the (xforce, xplead) roll-up, i.e. the count is the number of distinct benchmark
+# units = distinct (key, squad, district) tuples within the group (verified vs
+# legacy: xforce den 66 ≈ distinct (job_id, squad, district)).
+_XFORCE_ID_COLS: tuple[str, ...] = ("key", "squad", "district")
 
 
 def _masked_unit_id(cols: tuple[str, ...], when: Column) -> Column:
@@ -372,52 +370,38 @@ def _masked_unit_id(cols: tuple[str, ...], when: Column) -> Column:
     return F.when(when, F.concat_ws("", *parts))
 
 
-def _rollup(units: DataFrame, *, level: str, metric_name: str) -> DataFrame:
-    """Count distinct benchmark units per ``(<level>, month)`` into metric rows.
+def _xforce_rollup(units: DataFrame) -> DataFrame:
+    """Count distinct benchmark units per ``(xforce, xplead, month)`` into rows.
 
-    ``level`` is ``squad`` / ``district`` (key sets that column; ``xforce`` /
-    ``xplead`` / ``team`` NULL — legacy squad/district views carry no team) or
-    ``xforce`` (sets ``xforce`` + ``xplead``, squad/district NULL — legacy
-    ``improved_benchmark``).
-
-    Legacy improved_benchmark counts ``COUNT(DISTINCT job_id)`` per ``(xforce,
-    squad, squad_district)`` and sums into the roll-up, so the numerator /
-    denominator is the number of distinct benchmark units — distinct
-    ``(key, xforce, squad, district)`` tuples — within the group (verified
-    against legacy: xforce den 66 ≈ distinct (job_id, squad, district); squad /
-    district den sums 1035 ≈ distinct (job_id, xforce, district) / (job_id,
-    xforce, squad)).
+    Legacy ``improved_benchmark`` (main deck) counts ``COUNT(DISTINCT job_id)``
+    per ``(xforce, squad, squad_district)`` and sums into the ``(xforce, xplead)``
+    roll-up, so numerator / denominator is the number of distinct benchmark units
+    — distinct ``(key, squad, district)`` tuples — within the group. ``squad`` /
+    ``district`` are still needed on the units for this distinct count even though
+    they are NULL on the output rows. (The S&D-deck squad/district roll-ups are
+    out of scope — see the module docstring.)
     """
-    id_cols = _ROLLUP_ID_COLS[level]
     numerator = F.countDistinct(
-        _masked_unit_id(id_cols, F.col("improved") == F.lit(1))
+        _masked_unit_id(_XFORCE_ID_COLS, F.col("improved") == F.lit(1))
     ).alias("numerator")
     denominator = F.countDistinct(
-        _masked_unit_id(id_cols, F.col("counted") == F.lit(1))
+        _masked_unit_id(_XFORCE_ID_COLS, F.col("counted") == F.lit(1))
     ).alias("denominator")
 
-    is_xforce = level == "xforce"
-    if is_xforce:
-        grp = units.groupBy("xforce", "xplead", "month").agg(numerator, denominator)
-    else:
-        grp = (
-            units.groupBy(level, "month")
-            .agg(numerator, denominator)
-            .filter(F.col(level).isNotNull())
-        )
+    grp = units.groupBy("xforce", "xplead", "month").agg(numerator, denominator)
 
     null_str = F.lit(None).cast("string")
     out = grp.select(
-        F.lit(None).cast("string").alias("agent"),
-        (F.col("xforce") if is_xforce else null_str).alias("xforce"),
-        (F.col("xplead") if is_xforce else null_str).alias("xplead"),
+        null_str.alias("agent"),
+        F.col("xforce"),
+        F.col("xplead"),
         null_str.alias("team"),
-        (F.col(level) if level == "squad" else null_str).alias("squad"),
-        (F.col(level) if level == "district" else null_str).alias("district"),
+        null_str.alias("squad"),
+        null_str.alias("district"),
         null_str.alias("shift"),
         F.col("month").alias("date_reference"),
         F.lit("month").alias("date_granularity"),
-        F.lit(metric_name).alias("metric"),
+        F.lit(XFORCE_METRIC).alias("metric"),
         F.col("numerator").cast("double").alias("numerator"),
         F.col("denominator").cast("double").alias("denominator"),
     )
@@ -531,28 +515,15 @@ def compute_improved_benchmarks(
     if len(units.take(1)) == 0:
         return empty_metric_frame(spark)
 
-    units = units.persist()
-    try:
-        # Squad / district roll-ups: NO month gate, NO team cutover (Fix #1).
-        squad_rows = _rollup(units, level="squad", metric_name=SQUAD_METRIC)
-        district_rows = _rollup(units, level="district", metric_name=DISTRICT_METRIC)
-
-        # XForce roll-up: flat < 2026-05 for all teams + david carve-out (Fix #2).
-        xforce_units = units.filter(
-            (F.col("month") < F.lit(XFORCE_REMOVAL_MONTH))
-            & ~(
-                (F.col("xplead") == F.lit(DAVID_XPLEAD))
-                & (F.col("month") >= F.lit(DAVID_REMOVAL_MONTH))
-            )
+    # XForce roll-up: flat < 2026-05 for all teams + david carve-out (Fix #2).
+    xforce_units = units.filter(
+        (F.col("month") < F.lit(XFORCE_REMOVAL_MONTH))
+        & ~(
+            (F.col("xplead") == F.lit(DAVID_XPLEAD))
+            & (F.col("month") >= F.lit(DAVID_REMOVAL_MONTH))
         )
-        xforce_rows = _rollup(xforce_units, level="xforce", metric_name=XFORCE_METRIC)
-
-        result = squad_rows.unionByName(district_rows).unionByName(xforce_rows)
-        result = result.select(*METRIC_COLUMNS).persist()
-        result.count()  # materialize before unpersisting `units`
-    finally:
-        units.unpersist()
-    return result
+    )
+    return _xforce_rollup(xforce_units).select(*METRIC_COLUMNS)
 
 
 IO_IMPROVED_BENCHMARKS_METRIC_SCHEMA: tuple[tuple[str, str], ...] = (

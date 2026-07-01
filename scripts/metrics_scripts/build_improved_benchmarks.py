@@ -2,12 +2,12 @@
 
 Metrics-layer script. Thin orchestrator — the math lives in
 ``metrics/improved_benchmarks.py`` and is covered by
-``tests/metrics/test_improved_benchmarks.py``. Improved Benchmarks is
-**squad / district / xforce grain, month only, Core/Fraud only**. The squad /
-district roll-ups have no month gate; the XForce roll-up
-(``improved_benchmark_xforce``, which feeds the composite ``xforce_index``) is
-gated to ``date_reference < 2026-05-01`` plus the ``david.fernandez`` Apr-2026
-carve-out.
+``tests/metrics/test_improved_benchmarks.py``. Improved Benchmarks emits the
+**``improved_benchmark_xforce`` metric only** (legacy main-deck
+``improved_benchmark``), **XForce grain, month only, Core/Fraud only** — this is
+the component the composite ``xforce_index`` consumes. It is gated to
+``date_reference < 2026-05-01`` plus the ``david.fernandez`` Apr-2026 carve-out.
+(The S&D-deck squad/district roll-ups are out of scope — see the module docstring.)
 
 What we do here:
   1. Get the ambient SparkSession (shared ``db.open_connection``).
