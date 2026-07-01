@@ -161,6 +161,47 @@ agents; everything else is at parity.
 
 ---
 
+## Content NTPJ — `io_ntpj_metric` (Content rows) vs `cont_temp_ntpj_sla_old` (legacy `ntpj_sla_old` → `ntpj_agent`)
+
+**Status:** validated (month grain, 2026-03 … 06). Content NTPJ is **not** the
+duration ratio Core/Fraud use — it is **SLA-weighted compliance** (`ntpj_sla_old`,
+higher-is-better, bounded ≤100), reproduced from a new `io_jobs_within_sla_raw`
+substrate + the sheet-driven `Content - SLAs` map, and **unioned** into
+`io_ntpj_metric` under `metric='ntpj'` (Core/Fraud still feed the cohort benchmark;
+we filter the OUTPUT, not the input). The duration calc for Content (what the new
+pipeline shipped before) matched `cont_temp_ntpj` (180.92 for aura.olvera) but is
+NOT what legacy ships.
+
+**Base parity** (Content `ntpj` vs `cont_temp_ntpj_sla_old`, exact agent coverage
+— 0 new-only / 0 legacy-only): **May 0.0 byte-exact (17/17)**, **Apr 0.53**,
+**Mar 1.00**, **Jun 0.19** avg abs diff. Anchor: `aura.olvera` 2026-03 =
+358,800/471,000 = **76.18**. The small Mar/Apr residuals are date-boundary /
+nightly-rebuild vintage (a few agents), not a calc error.
+
+**Composite consumers (Content-aware):**
+- **Xpeer Index (Content)** adds NTPJ **raw** (higher-is-better), not folded around
+  100. This closed Content `xpeer_index` from **~25–35pp** (duration+fold) →
+  **~2–3.5pp** (after the NOcc fix, still duration) → **<1pp all months now**
+  (Feb 0.0, Mar 0.62, Apr 0.28, May 0.27, Jun 0.36; denominators exact). Core/Fraud/SM
+  `xpeer_index` **unchanged** (Core ≤0.04, Fraud ≤0.06, SM ~0.7 — no regression).
+- **ntpj_xforce (Content)** uses the SLA target `>= 95` (legacy `ntpj_sla_old_xforces`;
+  the legacy xplead roll-up inconsistently uses `>= 100`). Parity: **Apr/May/Jun
+  byte-exact**, Mar off ~5pp (one agent near the 95 boundary from the Mar base residual).
+
+### Divergences
+| Divergence | Cause | Class |
+| --- | --- | --- |
+| Mar/Apr base ≤1pp on a few agents | date-boundary (03-10 pre-grouping) + the legacy `_content` temp table rebuilds nightly, so its vintage drifts from a fresh build | open (freshness/boundary) |
+| SLA map materialized directly for this run | `sync_adjustments` needs `gspread` + the service-account secret on the cluster (the interactive cluster lacks both); the `Content - SLAs` tab is authored and is the source of truth | infra (production sync wiring) |
+
+### Verdict
+**Shipped.** Content NTPJ is at parity (May byte-exact; Mar/Apr/Jun bounded by
+date-boundary/vintage), and it fixes Content `xpeer_index` to <1pp with no
+Core/Fraud/SM regression. Remaining: wire `build_jobs_within_sla` into the job and
+ensure the SLA sync runs on a cluster with `gspread` + SA read access.
+
+---
+
 ## Shrinkage — `io_shrinkage_metric` vs `usr.mx__cx.shrinkage_io`
 
 **Status:** validated over the complete months **`2026-01-01 … 05-31`**
