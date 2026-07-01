@@ -3857,13 +3857,29 @@ CREATE OR REPLACE TEMPORARY VIEW qa_base_agg AS(
       , requested_by
       , squad AS target_squad
       , comprension_promoter + comunicacion_promoter + calidad_promoter + tiempo_promoter + expectativas_promoter AS promoters
+      , tiempo_promoter
       , number_of_questions
     FROM qa_base
 );
 
 CREATE OR REPLACE TEMPORARY VIEW qa_base_final AS(
   SELECT
-    a.*
+    a.date_reference
+    , a.requested_by
+    , a.target_squad
+    -- [Manual Fix] Exclude 'tiempo de entrega' question for jesus.morales and luis.contreras in May 2026
+    , CASE
+        WHEN b.agent IN ('jesus.morales', 'luis.contreras')
+          AND DATE_TRUNC('MONTH', a.date_reference) = '2026-05-01'
+        THEN a.promoters - COALESCE(a.tiempo_promoter, 0)
+        ELSE a.promoters
+      END AS promoters
+    , CASE
+        WHEN b.agent IN ('jesus.morales', 'luis.contreras')
+          AND DATE_TRUNC('MONTH', a.date_reference) = '2026-05-01'
+        THEN a.number_of_questions - 1
+        ELSE a.number_of_questions
+      END AS number_of_questions
     , b.agent
     , b.xplead
     , b.xforce
@@ -6604,10 +6620,20 @@ CREATE OR REPLACE TEMPORARY VIEW index_xforces_final AS(
     , squad_district
     , date_reference
     , date_granularity
-    , COALESCE(xpeers_in_target_xforce, 0) AS xpeers_in_target_xforce
+    -- On target (>= 70%): linearly scale from 90 (at threshold) to 100 (at max)
+    -- Off target (< 70%): use actual value as-is
+    , CASE
+        WHEN COALESCE(xpeers_in_target_xforce, 0) >= 70
+          THEN 90 + (COALESCE(xpeers_in_target_xforce, 0) - 70) * (100 - 90) / (100 - 70)
+        ELSE COALESCE(xpeers_in_target_xforce, 0)
+      END AS xpeers_in_target_xforce
     , COALESCE(average_index_agent, 0) AS average_index_agent
     , COALESCE(projects, 0) AS projects
+    -- Shrinkage target: 23% for May/June 2026, 20% otherwise
+    -- Score: 100 at or below target; drops 1pt per % above (= (100 + target) - actual)
     , CASE
+        WHEN date_reference IN (DATE '2026-05-01', DATE '2026-06-01') AND COALESCE(shrinkage_raw, 0) <= 23 THEN 100
+        WHEN date_reference IN (DATE '2026-05-01', DATE '2026-06-01') AND COALESCE(shrinkage_raw, 0) >  23 THEN (100 + 23) - COALESCE(shrinkage_raw, 0)
         WHEN COALESCE(shrinkage_raw, 0) <= 20 THEN 100
         ELSE 120 - COALESCE(shrinkage_raw, 0)
       END AS shrinkage
