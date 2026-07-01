@@ -86,7 +86,13 @@ REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics"))
 
-from db import open_connection, read_table, publish  # noqa: E402
+from db import (  # noqa: E402
+    open_connection,
+    read_table,
+    publish,
+    resolve_period_end,
+    MAX_DIME_SENTINEL,
+)
 from improved_benchmarks import (  # noqa: E402
     IO_IMPROVED_BENCHMARKS_METRIC_SCHEMA,
     compute_improved_benchmarks,
@@ -119,7 +125,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--period-start", required=True, type=date.fromisoformat)
-    parser.add_argument("--period-end", required=True, type=date.fromisoformat)
+    parser.add_argument(
+        "--period-end",
+        required=True,
+        help=f"ISO date (YYYY-MM-DD), or '{MAX_DIME_SENTINEL}' to resolve to "
+        "the max ingested DIME date at run time.",
+    )
     parser.add_argument(
         "--ntpj-source",
         default=DEFAULT_NTPJ_SOURCE,
@@ -177,16 +188,23 @@ def main(argv: list[str] | None = None) -> int:
         level=args.log_level, format="%(levelname)s %(name)s: %(message)s"
     )
 
-    if args.period_end < args.period_start:
-        LOGGER.error("--period-end must be >= --period-start")
-        return 2
-
     # The NTPJ substrate needs one PREVIOUS month before period_start for the
     # month-over-month LAG; the benchmark VALUES are already baked in.
     ntpj_start = _lookback_start(args.period_start, NTPJ_LOOKBACK_MONTHS)
     occ_start = _lookback_start(args.period_start, OCC_LOOKBACK_MONTHS)
 
     spark = open_connection()
+
+    use_max_dime = args.period_end == MAX_DIME_SENTINEL
+    args.period_end = resolve_period_end(args.period_end, spark)
+    if use_max_dime:
+        LOGGER.info(
+            "--period-end %s resolved to %s", MAX_DIME_SENTINEL, args.period_end
+        )
+
+    if args.period_end < args.period_start:
+        LOGGER.error("--period-end must be >= --period-start")
+        return 2
 
     with _log_step(f"read {args.ntpj_source} (from {ntpj_start})"):
         ntpj = read_table(

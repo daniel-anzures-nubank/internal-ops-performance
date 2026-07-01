@@ -97,6 +97,59 @@ def open_connection() -> "SparkSession":
 
 
 # ---------------------------------------------------------------------------
+# Period resolution
+# ---------------------------------------------------------------------------
+
+# The DIME schedule ETL table. Its freshest ingested day (MAX(dime_date)) is the
+# pipeline's natural period end — building past it just yields empty slots.
+DIME_TABLE = "etl.mx__series_contract.agent_dimensioned_activities"
+# Sentinel accepted by every script's --period-end: resolve to MAX(dime_date)
+# at run time, so builds always extend to the freshest available DIME date
+# instead of a manually pinned (and eventually stale) date.
+MAX_DIME_SENTINEL = "max_dime"
+
+
+def _max_dime_date(spark: "SparkSession") -> date:
+    """``SELECT MAX(dime_date)`` from :data:`DIME_TABLE` as a ``date``."""
+    rows = spark.sql(f"SELECT MAX(dime_date) FROM {DIME_TABLE}").collect()
+    max_date = rows[0][0] if rows else None
+    if max_date is None:
+        raise RuntimeError(
+            f"cannot resolve '{MAX_DIME_SENTINEL}': MAX(dime_date) on "
+            f"{DIME_TABLE} returned no date"
+        )
+    if isinstance(max_date, datetime):
+        max_date = max_date.date()
+    return max_date
+
+
+def resolve_period_end(value: str, spark: "SparkSession | None" = None) -> date:
+    """Resolve a ``--period-end`` CLI value to a concrete ``date``.
+
+    Accepts an ISO date string (``YYYY-MM-DD``) or the sentinel
+    :data:`MAX_DIME_SENTINEL` (``max_dime``), which resolves to
+    ``SELECT MAX(dime_date)`` from :data:`DIME_TABLE` via ``spark`` — so
+    scripts must resolve *after* the SparkSession is available. Anything else
+    raises ``ValueError`` naming the accepted forms.
+    """
+    if value == MAX_DIME_SENTINEL:
+        if spark is None:
+            raise ValueError(
+                f"--period-end '{MAX_DIME_SENTINEL}' needs an active "
+                "SparkSession to query the DIME table; resolve it after "
+                "open_connection()"
+            )
+        return _max_dime_date(spark)
+    try:
+        return date.fromisoformat(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"invalid --period-end {value!r}: expected an ISO date "
+            f"(YYYY-MM-DD) or '{MAX_DIME_SENTINEL}'"
+        ) from None
+
+
+# ---------------------------------------------------------------------------
 # Read — run an extractor SQL file, return a Spark DataFrame
 # ---------------------------------------------------------------------------
 
