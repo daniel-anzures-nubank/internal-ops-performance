@@ -91,6 +91,10 @@ from datetime import date
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
+from dime_filters import (
+    MEETING_LEAVE_DIMENSIONED_ACTIVITIES,
+    SHRINKAGE_DIME_SQUAD_EXCLUSIONS,
+)
 from shift_attribution import night_agent_months, shift_start_date
 
 # ---------------------------------------------------------------------------
@@ -102,40 +106,17 @@ from shift_attribution import night_agent_months, shift_start_date
 # legacy. Kept so a future narrower roster scope is a one-line edit.
 SHRINKAGE_OUT_OF_SCOPE_SQUADS: tuple[str, ...] = ()
 
-# DIME squads excluded from shrinkage — a fixed legacy filter on the DIME
-# ``agent_dime_squad`` (the ``squad`` column out of the dime_slots extractor).
-# Legacy ``shrinkage_base`` ([IO] Shrinkage Dataset.sql lines 249-250) keeps only
-# ``agent_dime_squad IS NOT NULL AND agent_dime_squad NOT IN (...)``. The
-# exclusion changes BOTH numerator and denominator (legacy counts shrinkage_slot
-# / required_slot FROM this already-filtered base), so it must be applied at the
-# slot stage, before the roster merge drops the DIME squad column.
-#
-# NOTE this set is shrinkage-specific. It is BROADER on the org-support side than
-# adherence/occupancy's ``DIME_SQUAD_EXCLUSIONS`` (wfm / credit_evolution / dote):
-# shrinkage excludes content / planning / quality / social / wfm / enablement and
-# excludes neither credit_evolution nor dote. Do NOT reuse the adherence list.
-SHRINKAGE_DIME_SQUAD_EXCLUSIONS: tuple[str, ...] = (
-    "content",
-    "planning",
-    "quality",
-    "social",
-    "wfm",
-    "enablement",
-)
+# SHRINKAGE_DIME_SQUAD_EXCLUSIONS now lives in the shared
+# metrics_data/dime_filters.py (imported above) — it stays shrinkage-specific
+# there (deliberately broader than adherence/occupancy's
+# DIME_SQUAD_EXCLUSIONS; do NOT reuse one list for the other).
 
 # dimensioned_activity values that, post-cutover, get re-classified as
 # shrinkage when activity_type_required is 'dime_invalid_notation'. Exact legacy
 # list ([IO] Shrinkage Dataset.sql line 263), incl. the 'Permiso Medico' /
-# 'Permiso medico' case variants.
-SHRINKAGE_MEETING_LEAVE_DIMENSIONED_ACTIVITIES: tuple[str, ...] = (
-    "Mouring",
-    "Weekly",
-    "Permiso Medico",
-    "Permiso medico",
-    "Huddle",
-    "Licencia",
-    "Vacacion",
-)
+# 'Permiso medico' case variants — the shared meeting/leave list from
+# metrics_data/dime_filters.py, kept under this module's public name.
+SHRINKAGE_MEETING_LEAVE_DIMENSIONED_ACTIVITIES = MEETING_LEAVE_DIMENSIONED_ACTIVITIES
 
 # dimensioned_activity values (lowercased) that mark a shrinkage slot as
 # UNCONTROLLABLE (leave / licencia). Everything else that is shrinkage is

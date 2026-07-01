@@ -115,6 +115,7 @@ from datetime import date
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
+from dime_filters import DIME_SQUAD_EXCLUSIONS, MEETING_LEAVE_DIMENSIONED_ACTIVITIES
 from shift_attribution import night_agent_months, shift_start_date
 
 # ---------------------------------------------------------------------------
@@ -128,35 +129,19 @@ DIME_INVALID_NOTATION_VALUE: str = "dime_invalid_notation"
 # Roster-level squad exclusions. Currently empty — all squads in scope.
 NOCC_OUT_OF_SCOPE_SQUADS: tuple[str, ...] = ()
 
-# Meeting/leave dimensioned_activity tokens excluded from occupancy. Fixed DIME
-# data filter (NOT a manual adjustment): leave (Licencia, Vacacion, Permiso
-# Medico) or meetings (Mouring, Weekly, Huddle). Legacy excludes them with the
-# same `dimensioned_activity NOT IN (...)` filter at the DIME stage (NOcc dataset
-# line 234), incl. the 'Permiso Medico'/'Permiso medico' case variants. Applied
-# on ALL dates.
-MEETING_LEAVE_DIMENSIONED_ACTIVITIES: tuple[str, ...] = (
-    "Mouring",
-    "Weekly",
-    "Permiso Medico",
-    "Permiso medico",
-    "Huddle",
-    "Licencia",
-    "Vacacion",
-)
+# MEETING_LEAVE_DIMENSIONED_ACTIVITIES now lives in the shared
+# metrics_data/dime_filters.py (imported above). Applied on ALL dates.
 
-# DIME squads excluded from occupancy — a fixed legacy filter on the DIME
-# `agent_dime_squad`. Legacy's NOcc dataset (line 236) used
+# DIME squads excluded from occupancy — the shared DIME_SQUAD_EXCLUSIONS from
+# metrics_data/dime_filters.py, kept under this module's public name. Legacy's
+# NOcc dataset (line 236) used
 # `NOT IN ('wfm', 'credit_evolution', 'dote', 'social')`, but we intentionally
 # DROP `social` from this exclusion set: Social-Media occupancy genuinely exists
 # for the whole history (sourced from Sprinklr `sm_jobs`), so `social` DIME slots
 # are kept on ALL dates. This is a documented divergence from legacy (which had
 # no Sprinklr source); see module docstring. The remaining set matches
 # adherence's DIME_SQUAD_EXCLUSIONS (wfm / credit_evolution / dote).
-NOCC_DIME_SQUAD_EXCLUSIONS: tuple[str, ...] = (
-    "wfm",
-    "credit_evolution",
-    "dote",
-)
+NOCC_DIME_SQUAD_EXCLUSIONS = DIME_SQUAD_EXCLUSIONS
 
 # Shuffle status filter: occupancy counts work the agent ATTEMPTED, not just
 # work that succeeded. So we keep transferred/skipped in addition to
