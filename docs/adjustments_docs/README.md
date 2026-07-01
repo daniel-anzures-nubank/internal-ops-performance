@@ -23,9 +23,13 @@ Most manual adjustments are sourced from a single Google Sheet — this is the
 - Spreadsheet id: `1Y5P6LijLxT6hFTd69DiSPBTUPKHO-m_6zzrs-PmOjfU`
 - One tab per adjustment type (see the catalog below). The `Guía` tab is
   documentation (tab → description → affected metrics), not data.
-- The sheet is **shared with the service account**
-  `client_email` from the configured Google service-account credentials; read it programmatically
-  with `gsheets.py` (repo root).
+- The sheet must be **shared (Viewer) with the `nu-mx-internal-ops` service
+  account** (its `client_email`; address form
+  `<name>@<project>.iam.gserviceaccount.com`); read it programmatically with
+  `gsheets.py` (repo root). On Databricks the SA key comes from the
+  `nu-mx-internal-ops-sa-secret` secret scope (one secret key per JSON field,
+  wired to `GOOGLE_SA_*` env vars on the job cluster); locally, from a `.env`
+  (see `gsheets.py`).
 - Missing DIME slots are the exception: they live in the repo at
   `adjustments/slots_faltantes_dime.csv` because they are append-style source
   rows, not reviewer-maintained adjustment windows.

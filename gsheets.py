@@ -15,8 +15,22 @@ Credentials (a Google **service account**), checked in this order:
     1. ``GOOGLE_SERVICE_ACCOUNT_JSON``  — the service-account JSON, inline.
     2. ``GOOGLE_SERVICE_ACCOUNT_FILE``  — path to the service-account JSON file.
     3. ``GOOGLE_APPLICATION_CREDENTIALS`` — the Google-standard path env var.
-Put one in a repo-root ``.env`` (gitignored). NEVER hardcode the key in source.
-Share the target sheet with the service account's ``client_email``.
+    4. ``GOOGLE_SA_*`` per-field vars — reassemble the JSON from one env var per
+       field (``GOOGLE_SA_TYPE``, ``GOOGLE_SA_PROJECT_ID``, ``GOOGLE_SA_PRIVATE_KEY``,
+       ``GOOGLE_SA_CLIENT_EMAIL``, …; see ``_SA_FIELD_ENV_VARS``).
+
+The production service account is the ``nu-mx-internal-ops`` SA (its
+``client_email``, address form ``<name>@<project>.iam.gserviceaccount.com``).
+On Databricks its key lives in the secret scope
+``nu-mx-internal-ops-sa-secret``, which stores
+the JSON **decomposed into one secret key per field** (no single-JSON key). The
+job cluster wires each secret key to the matching ``GOOGLE_SA_*`` env var
+(e.g. ``GOOGLE_SA_PRIVATE_KEY = {{secrets/nu-mx-internal-ops-sa-secret/private_key}}``),
+so path 4 above reassembles the credentials at runtime.
+
+For local dev, put one of paths 1-3 in a repo-root ``.env`` (gitignored). NEVER
+hardcode the key in source. Share the target sheet (Viewer) with the service
+account's ``client_email``.
 
 CLI (quick local check)::
 
@@ -67,6 +81,46 @@ def extract_sheet_id(spreadsheet: str) -> str:
     return match.group(1) if match else spreadsheet
 
 
+# Map each ``GOOGLE_SA_<FIELD>`` env var to its service-account JSON key. This is
+# the per-field path used on Databricks, where the ``nu-mx-internal-ops-sa-secret``
+# secret scope stores the SA key decomposed into one secret key per JSON field
+# (no single-JSON key exists), each wired to the matching env var in the job
+# cluster's ``spark_env_vars``.
+_SA_FIELD_ENV_VARS = {
+    "GOOGLE_SA_TYPE": "type",
+    "GOOGLE_SA_PROJECT_ID": "project_id",
+    "GOOGLE_SA_PRIVATE_KEY_ID": "private_key_id",
+    "GOOGLE_SA_PRIVATE_KEY": "private_key",
+    "GOOGLE_SA_CLIENT_EMAIL": "client_email",
+    "GOOGLE_SA_CLIENT_ID": "client_id",
+    "GOOGLE_SA_AUTH_URI": "auth_uri",
+    "GOOGLE_SA_TOKEN_URI": "token_uri",
+    "GOOGLE_SA_AUTH_PROVIDER_X509_CERT_URL": "auth_provider_x509_cert_url",
+    "GOOGLE_SA_CLIENT_X509_CERT_URL": "client_x509_cert_url",
+    "GOOGLE_SA_UNIVERSE_DOMAIN": "universe_domain",
+}
+
+
+def _credentials_from_fields(environ) -> dict | None:
+    """Reassemble the SA dict from ``GOOGLE_SA_*`` env vars, or ``None`` if unset.
+
+    Assembles whatever ``GOOGLE_SA_*`` vars are present and lets google-auth raise
+    if a required field is missing. The ``private_key`` is un-escaped
+    (``\\n`` -> real newline) so a value stored with a literal ``\\n`` still parses;
+    it's a no-op when the value already carries real newlines.
+    """
+    info = {
+        json_key: environ[env_var]
+        for env_var, json_key in _SA_FIELD_ENV_VARS.items()
+        if env_var in environ
+    }
+    if not info:
+        return None
+    if "private_key" in info:
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+    return info
+
+
 def _load_credentials_info() -> dict:
     """Load the service-account JSON from the environment (see module docstring)."""
     inline = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -80,10 +134,15 @@ def _load_credentials_info() -> dict:
     if path:
         return json.loads(Path(path).expanduser().read_text(), strict=False)
 
+    fields = _credentials_from_fields(os.environ)
+    if fields is not None:
+        return fields
+
     raise SystemExit(
         "No Google credentials found. Set one of GOOGLE_SERVICE_ACCOUNT_JSON, "
-        "GOOGLE_SERVICE_ACCOUNT_FILE, or GOOGLE_APPLICATION_CREDENTIALS "
-        "(see gsheets.py docstring) — typically in a repo-root .env."
+        "GOOGLE_SERVICE_ACCOUNT_FILE, GOOGLE_APPLICATION_CREDENTIALS, or the "
+        "per-field GOOGLE_SA_* vars (see gsheets.py docstring) — typically in a "
+        "repo-root .env for local dev, or a secret scope on Databricks."
     )
 
 
