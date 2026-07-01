@@ -1,7 +1,8 @@
 """Unit tests for ``metrics/xforce_index.py`` (PySpark).
 
 Small synthetic component frames (no warehouse). We verify the four component
-transforms (shrinkage fold, raw xit / avg_idx, improved fold), the XForce-weighted
+transforms (shrinkage fold — with the May/June-2026 23% target; the xpeers
+on-target 90-100 rescale; raw avg_idx; improved fold), the XForce-weighted
 shrinkage roll-up, and the five build-plan parity fixes that replace the old
 presence-based gating with legacy's explicit DATE rule:
 
@@ -34,7 +35,9 @@ from xforce_index import (
 
 FEB = dt.date(2026, 2, 1)          # pre-May  -> 4-component
 APR = dt.date(2026, 4, 1)          # pre-May  -> 4-component (david carve-out -> 3)
-MAY = dt.date(2026, 5, 1)          # >= cutoff -> 3-component
+MAY = dt.date(2026, 5, 1)          # >= cutoff -> 3-component; 23% shrinkage target
+JUN = dt.date(2026, 6, 1)          # 23% shrinkage target (month)
+MAY_WEEK = dt.date(2026, 5, 4)     # a Monday in May -> keeps the 20% target
 POST = dt.date(2026, 7, 1)         # cutover onward (all grains)
 
 _SCHEMA = T.StructType(
@@ -133,15 +136,15 @@ class TestComponentTransforms:
         )
         assert abs(one(out)["numerator"] - 100.0) < 1e-9
 
-    def test_xit_and_avg_taken_raw(self, spark):
-        # shrinkage 10% -> 100; xit 80 raw; avg 90 raw. Feb -> 4-comp, imp 0.
+    def test_below_70_xit_and_avg_raw(self, spark):
+        # shrinkage 10% -> 100; xit 50 (< 70 -> raw); avg 90 raw. Feb -> 4-comp.
         out = compute_xforce_index(
             frame(spark, [shrink("a", 10, 100)]),
-            xit(spark, 80), avg(spark, 90), None,
+            xit(spark, 50), avg(spark, 90), None,
         )
         r = one(out)
-        assert abs(r["numerator"] - (100 + 80 + 90)) < 1e-9
-        assert abs(r["metric_value"] - ((270 / 400) * 100)) < 1e-9
+        assert abs(r["numerator"] - (100 + 50 + 90)) < 1e-9
+        assert abs(r["metric_value"] - ((240 / 400) * 100)) < 1e-9
 
     def test_missing_xit_avg_coalesce_to_zero(self, spark):
         out = compute_xforce_index(
@@ -182,6 +185,63 @@ class TestComponentTransforms:
         r = one(out)
         assert abs(r["denominator"] - 400.0) < 1e-9
         assert abs(r["numerator"] - 100.0) < 1e-9  # improved folds to 0
+
+
+class TestXpeersInTargetRescale:
+    # xit component: >= 70 -> 90 + (xit-70)/3 (90..100); < 70 -> raw. (xit=0 avg=0,
+    # so numerator == the xit component; Feb -> 4-comp, improved folds to 0.)
+    def _num(self, spark, xit_mv):
+        out = compute_xforce_index(
+            frame(spark, [shrink("a", 100, 100)]),  # 100% shrinkage -> 20 (>20 fold)
+            xit(spark, xit_mv), avg(spark, 0), None,
+        )
+        # shrinkage 100% -> 120-100 = 20; so xit component = numerator - 20.
+        return one(out)["numerator"] - 20.0
+
+    def test_on_target_70_maps_to_90(self, spark):
+        assert abs(self._num(spark, 70) - 90.0) < 1e-9
+
+    def test_on_target_85_maps_to_95(self, spark):
+        assert abs(self._num(spark, 85) - 95.0) < 1e-9
+
+    def test_on_target_100_maps_to_100(self, spark):
+        assert abs(self._num(spark, 100) - 100.0) < 1e-9
+
+    def test_just_below_70_is_raw(self, spark):
+        assert abs(self._num(spark, 69) - 69.0) < 1e-9
+
+    def test_null_xit_is_zero(self, spark):
+        assert abs(self._num(spark, None) - 0.0) < 1e-9
+
+
+class TestShrinkageTarget:
+    # May/June-2026 MONTH buckets use a 23% target; everything else 20%.
+    # (xit=0 avg=0 -> numerator == the shrinkage component; MAY/JUN -> 3-comp.)
+    def _num(self, spark, pct, dref, gran="month"):
+        out = compute_xforce_index(
+            frame(spark, [shrink("a", pct, 100, dref=dref, gran=gran)]),
+            xit(spark, 0, dref=dref, gran=gran), avg(spark, 0, dref=dref, gran=gran),
+            None,
+        )
+        return one(out)["numerator"]
+
+    def test_may_month_22pct_within_relaxed_target(self, spark):
+        # 22% <= 23 -> 100 (would be 98 under the 20% target).
+        assert abs(self._num(spark, 22, MAY) - 100.0) < 1e-9
+
+    def test_may_month_above_23_folds_from_123(self, spark):
+        # 25% > 23 -> (100 + 23) - 25 = 98.
+        assert abs(self._num(spark, 25, MAY) - 98.0) < 1e-9
+
+    def test_june_month_23pct_is_100(self, spark):
+        assert abs(self._num(spark, 23, JUN) - 100.0) < 1e-9
+
+    def test_may_week_keeps_20pct_target(self, spark):
+        # A May Monday is NOT date_reference 2026-05-01 -> 20% target -> 120-22 = 98.
+        assert abs(self._num(spark, 22, MAY_WEEK, gran="week") - 98.0) < 1e-9
+
+    def test_april_month_keeps_20pct_target(self, spark):
+        assert abs(self._num(spark, 22, APR) - 98.0) < 1e-9
 
 
 class TestDateBasedGating:
@@ -355,10 +415,11 @@ class TestContract:
 
     def test_improved_none_is_handled_gracefully(self, spark):
         # Deferred improved input: build still produces rows (count via date rule).
+        # shrinkage 10% -> 100; xit 85 -> 95 (on-target rescale); avg 90. MAY -> 3.
         out = compute_xforce_index(
             frame(spark, [shrink("a", 10, 100, dref=MAY)]),
-            xit(spark, 80, dref=MAY), avg(spark, 90, dref=MAY), None,
+            xit(spark, 85, dref=MAY), avg(spark, 90, dref=MAY), None,
         )
         r = one(out)
         assert abs(r["denominator"] - 300.0) < 1e-9
-        assert abs(r["metric_value"] - 90.0) < 1e-9
+        assert abs(r["metric_value"] - 95.0) < 1e-9  # (100 + 95 + 90) / 300 * 100

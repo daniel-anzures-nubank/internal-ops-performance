@@ -13,9 +13,9 @@ mapped to a 0-100 scale:
 ================  ================================================  ============================
 component         transform (legacy ``index_xforces_final``)        source
 ================  ================================================  ============================
-shrinkage         ``<= 20 → 100``; ``> 20 → 120 - shrinkage``;       ``io_shrinkage_metric``
-                  NULL → 0                                          (agent rows, summed → XForce)
-xpeers_in_target  raw value, NULL → 0                                ``io_xpeers_in_target_metric``
+shrinkage         ``<= target → 100``; ``> target → (100+t) - shr``;  ``io_shrinkage_metric``
+                  target 23 for May/June-2026 month else 20; NULL→0  (agent rows, summed → XForce)
+xpeers_in_target  ``>= 70 → 90 + (x-70)/3``; ``< 70 → raw``; NULL→0   ``io_xpeers_in_target_metric``
 average_xpeer_    raw value, NULL → 0                                ``io_average_xpeer_index_metric``
 index
 improved_         ``>= 60 → 100``; ``< 60 → improved / 0.6``;         ``io_improved_benchmarks_metric``
@@ -158,13 +158,46 @@ def _deck_col() -> Column:
     )
 
 
-def _shrinkage_component(col: Column) -> Column:
-    """``<= 20 → 100``; ``> 20 → 120 - shrinkage``; NULL → 0."""
+# Shrinkage target (legacy index_xforces_final): 23% for May/June-2026 MONTH
+# buckets, 20% otherwise. Legacy gates on `date_reference IN (2026-05-01,
+# 2026-06-01)`, which matches month-first dates only — weekly May/June keep 20%.
+SHRINKAGE_RELAXED_MONTHS: tuple[date, ...] = (date(2026, 5, 1), date(2026, 6, 1))
+SHRINKAGE_TARGET_DEFAULT = 20.0
+SHRINKAGE_TARGET_RELAXED = 23.0
+
+
+def _shrinkage_component(col: Column, date_ref: Column) -> Column:
+    """``<= target → 100``; ``> target → (100 + target) - shrinkage``; NULL → 0.
+
+    ``target`` is 23 for May/June-2026 month buckets (``date_reference`` in
+    :data:`SHRINKAGE_RELAXED_MONTHS`), else 20.
+    """
+    relaxed = date_ref.isin(*SHRINKAGE_RELAXED_MONTHS)
     return (
-        F.when(col <= F.lit(20), F.lit(100.0))
-        .when(col > F.lit(20), F.lit(120.0) - col)
+        F.when(relaxed & (col <= F.lit(SHRINKAGE_TARGET_RELAXED)), F.lit(100.0))
+        .when(
+            relaxed & (col > F.lit(SHRINKAGE_TARGET_RELAXED)),
+            F.lit(100.0 + SHRINKAGE_TARGET_RELAXED) - col,
+        )
+        .when(col <= F.lit(SHRINKAGE_TARGET_DEFAULT), F.lit(100.0))
+        .when(
+            col > F.lit(SHRINKAGE_TARGET_DEFAULT),
+            F.lit(100.0 + SHRINKAGE_TARGET_DEFAULT) - col,
+        )
         .otherwise(F.lit(0.0))
     )
+
+
+def _xpeers_in_target_component(col: Column) -> Column:
+    """On-target (``>= 70``) rescaled into the 90-100 band; below-target raw.
+
+    ``90 + (xit - 70) * (10 / 30)`` — so 70 → 90 and 100 → 100. ``col`` must
+    already be ``COALESCE(.., 0)`` (legacy index_xforces_final).
+    """
+    return F.when(
+        col >= F.lit(70),
+        F.lit(90.0) + (col - F.lit(70.0)) * F.lit((100.0 - 90.0) / (100.0 - 70.0)),
+    ).otherwise(col)
 
 
 def _improved_component(col: Column) -> Column:
@@ -272,8 +305,12 @@ def compute_xforce_index(
         return empty_metric_frame(spark)
 
     # --- component transforms (legacy index_xforces_final) -------------------
-    s = _shrinkage_component(F.col("shrinkage_xforce").cast("double"))
-    x = F.coalesce(F.col("xit").cast("double"), F.lit(0.0))
+    s = _shrinkage_component(
+        F.col("shrinkage_xforce").cast("double"), F.col("date_reference")
+    )
+    x = _xpeers_in_target_component(
+        F.coalesce(F.col("xit").cast("double"), F.lit(0.0))
+    )
     a = F.coalesce(F.col("avg_idx").cast("double"), F.lit(0.0))
     i = _improved_component(F.col("improved").cast("double"))
 
