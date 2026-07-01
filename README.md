@@ -12,8 +12,8 @@ byte-for-byte parity with legacy).
 
 ## Architecture
 
-Four layers, each pure `pyspark.sql` (DataFrame-in / DataFrame-out) with
-transport isolated in `db.py` and the `scripts/` entry points:
+Four layers — the Python ones pure `pyspark.sql` (DataFrame-in / DataFrame-out),
+with transport isolated in `db.py` and the `scripts/` entry points:
 
 1. `extractors/` — parameterized SQL pulls from the upstream Databricks tables
    (no filters, no business logic).
@@ -39,9 +39,9 @@ All output lives in the `usr.danielanzures` schema:
 
 ## Running on Databricks
 
-The `[IO] Performance Metrics Pipeline` job runs **26 git-sourced tasks**
-(`spark_python_task`, `source: GIT`) that check out GitHub `main` fresh on every
-run — push to `main` to change what the pipeline does. The workspace git folder
+The `[IO] Performance Metrics Pipeline` job runs **27 git-sourced tasks** (an
+adjustments-sheet sync feeding the raw-table and metric builds; `spark_python_task`,
+`source: GIT`) that check out GitHub `main` fresh on every run — push to `main` to change what the pipeline does. The workspace git folder
 (`/Workspace/Users/daniel.anzures@nubank.com.mx/internal-ops-performance`) is a
 separate, manually refreshed checkout for browsing in the UI; the job never
 reads it.

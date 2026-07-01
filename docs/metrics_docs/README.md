@@ -2,7 +2,7 @@
 
 The modules in `metrics/` turn the raw `io_*_raw` tables (built by
 `metrics_data/`) into **finished performance metrics**. This is where the
-business exclusions, benchmarks, ratios, and (eventually) manual adjustments the
+business exclusions, benchmarks, ratios, and manual adjustments the
 raw layer deferred get applied.
 
 ## Shape (shared across all metric tables)
