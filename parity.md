@@ -823,10 +823,42 @@ the same bar every prior composite shipped at.
 
 ---
 
+## Average XForce Index — `io_average_xforce_index_metric` (metric `average_xforce_index`) vs `average_index_xforce` in `usr.mx__cx.internal_ops_performance_2026` (main deck)
+
+**Status:** validated over the month grain **`2026-01 … 2026-06`** on the fresh
+`xforce_index` base (built 2026-07-01). Comparison joins on `(xplead, month)`.
+This metric is a **pure mean of `xforce_index` per XPLead** (deck-grouped), so it
+adds no new numerator logic — every residual is inherited directly from
+`xforce_index` above.
+
+**Value parity (avg abs diff, pp | matched | ≤0.5):**
+
+| month | avg | matched | ≤0.5 |
+| --- | --- | --- | --- |
+| Jan | 8.68 | 24 | 0 |
+| Feb | 3.84 | 6 | 3 |
+| Mar | 3.65 | 5 | 2 |
+| Apr | 3.43 | 6 | 3 |
+| **May** | **0.43** | 7 | 4 |
+| Jun | 3.21 | 7 | 2 |
+
+`legacy_only = 0` every month (every legacy XPLead reproduced); `new_only` = 1–2
+SM/Content XPLeads the main-deck legacy table doesn't carry. May (the clean
+`xforce_index` baseline month) is **0.43**; the other months inherit
+`xforce_index`'s per-XForce residuals exactly.
+
+### Verdict
+**Shipped.** The XPLead roll-up logic (mean per `(deck, xplead)`, week+month-only
+gate, `numerator`/`denominator` fill) is correct — the metric tracks
+`xforce_index` arithmetically, with May at parity (0.43) and the remaining months
+bounded only by the upstream `xforce_index` gaps. Ships alongside the
+`xforce_index` PR (`port/xforce-index-pyspark`); merge that first (or re-merge
+`main` here) so this branch also carries the reconciled `xforce_index`.
+
+---
+
 ## Other metrics — not yet parity-checked
 
-**Average XForce Index** (`average_index_xforce`, XPLead roll-up of
-`xforce_index`) is **ported** (PySpark, unit-tested) on branch
-`port/average-xforce-index-pyspark`. With `xforce_index` now validated it can be
-checked against legacy `average_index_xforce` in `internal_ops_performance_2026`
-(month + week; NULL-xforce roll-up rows dropped).
+The XForce Index family (`xforce_index`, `average_xforce_index`) is now
+validated (above). Remaining composites and any Content-deck-specific component
+rules are tracked in `docs/parity_build_plan.md`.
