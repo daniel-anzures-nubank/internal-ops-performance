@@ -71,7 +71,8 @@ class ExtractorSpec:
 
 
 # ---------------------------------------------------------------------------
-# Per-extractor specs — one entry per `.sql` file under extractors/sql/
+# Per-extractor specs — one entry per `.sql` file under extractors/
+# (coverage enforced by tests/test_checks.py::test_specs_cover_every_extractor_sql)
 # ---------------------------------------------------------------------------
 
 
@@ -156,6 +157,110 @@ EXTRACTOR_SPECS: tuple[ExtractorSpec, ...] = (
         unique_keys=(("evaluation_id",),),
         not_null=("evaluation_id", "agent", "created_at"),
         value_in_range=(("qa_score", 0, 100),),
+    ),
+    ExtractorSpec(
+        name="content_csat",
+        # No uniqueness assumed: the sheet has no response id, and two squad
+        # reps can submit in the same second.
+        not_null=("survey_timestamp", "date_reference"),
+        not_null_warn=("email_address", "requested_by", "squad"),
+        value_in_range=(
+            ("facilidad", 1, 5),
+            ("comprension", 1, 5),
+            ("comunicacion", 1, 5),
+            ("calidad", 1, 5),
+            ("tiempo", 1, 5),
+            ("manejo_de_cambios", 1, 5),
+            ("expectativas", 1, 5),
+            ("aportacion_estrategica", 1, 5),
+            ("nps", 0, 10),
+        ),
+        notes=(
+            "Feeds the Content Quality (CSAT) metric via metrics_data/content_csat. "
+            "Google Sheet source, so respondent attribution (email_address, the "
+            "requested_by regex prefix, squad) is WARN — a hand-typed sheet can "
+            "legitimately leave cells blank or unparseable. The 8 question scores "
+            "are 1-5 and `nps` is a separate 0-10 score per the extractor header. "
+            "Severities are provisional pending a live-data run against June 2026."
+        ),
+    ),
+    ExtractorSpec(
+        name="sm_jobs",
+        # No uniqueness assumed: an agent can be assigned two cases at the
+        # same recorded second (same reasoning as shuffle_jobs).
+        not_null=(
+            "date",
+            "case_assignment_time",
+            "case_unassignment_time",
+            "activity_start_unix",
+            "activity_end_unix",
+            "net_time_spent_seconds",
+        ),
+        not_null_warn=("agent",),
+        # Mirrors the oos_jobs precedent: a single case assignment spanning
+        # > 24h is almost certainly a clock/timezone artifact, not real work.
+        value_in_range=(("net_time_spent_seconds", 0, 86400),),
+        temporal_order=(("activity_start_unix", "activity_end_unix"),),
+        notes=(
+            "Feeds Social-Media occupancy in metrics_data/occupancy_time (the SM "
+            "equivalent of oos_jobs). The SQL already drops NULL assignment/"
+            "unassignment times, so the timestamp/unix columns are ERROR. `agent` "
+            "is WARN: it is regex-extracted from `agent_email_id`, which the "
+            "source can leave NULL/unparseable for unattributed assignments. "
+            "Severities are provisional pending a live-data run against June 2026."
+        ),
+    ),
+    ExtractorSpec(
+        name="sprinklr_sm_evaluations",
+        # The extractor itself dedups to rn = 1 per case_number, so
+        # evaluation_id MUST be unique (analogous to playvox_evaluations).
+        unique_keys=(("evaluation_id",),),
+        not_null=("evaluation_id", "created_at"),
+        not_null_warn=("agent",),
+        # Same 0-100 scale as the playvox_evaluations spec (verified on live data
+        # per the extractor header).
+        value_in_range=(("qa_score", 0, 100),),
+        notes=(
+            "Feeds the Quality metric for Social Media (UNION with Playvox in "
+            "metrics_data/quality_evaluations). `agent` is WARN, not ERROR: it is "
+            "mapped agent_name -> email via the sprinklr_sm_users LEFT JOIN, so "
+            "unmapped agents legitimately yield NULL/empty and are dropped "
+            "downstream in build_evaluations. Severities are provisional pending "
+            "a live-data run against June 2026."
+        ),
+    ),
+    ExtractorSpec(
+        name="tnps_responses",
+        # No uniqueness assumed: case_number can repeat (multiple survey rows
+        # per case) — the metrics layer dedups via COUNT(DISTINCT case_number).
+        not_null=("case_number", "date", "case_closure_time"),
+        not_null_warn=("agent", "agent_email_id", "survey_response_date"),
+        value_in_range=(("survey_score", 0, 10),),
+        notes=(
+            "Feeds the SM Human tNPS metric via metrics_data/tnps_responses. "
+            "`case_closure_time` is the period filter so it (and the derived "
+            "`date`) must be present. `agent`/`agent_email_id` are WARN: the "
+            "extractor header documents unattributed responses (empty prefix). "
+            "`survey_response_date` is WARN — unsure whether the source can carry "
+            "unanswered/late rows; `survey_score` is documented nullable, and "
+            "range-check ignores NULLs (0-10 NPS scale). Severities are "
+            "provisional pending a live-data run against June 2026."
+        ),
+    ),
+    ExtractorSpec(
+        name="wows",
+        # No uniqueness assumed: case_id can repeat across rows — the metric is
+        # COUNT(DISTINCT case_id) downstream, so duplicates are expected.
+        not_null=("date",),
+        not_null_warn=("agent", "agent_email", "case_id"),
+        notes=(
+            "Feeds the SM WoWs count metric via metrics_data/wows. Google Sheet "
+            "source, so everything but the period-filtering `date` is WARN — the "
+            "sheet's agent/case_id cells can legitimately be blank or carry an "
+            "unparseable email (empty regex prefix). A NULL case_id would silently "
+            "shrink COUNT(DISTINCT case_id), hence tracking it. Severities are "
+            "provisional pending a live-data run against June 2026."
+        ),
     ),
 )
 

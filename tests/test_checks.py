@@ -13,6 +13,8 @@ check semantics. End-to-end runs against real extractor output happen via
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
@@ -232,6 +234,21 @@ def test_run_checks_surfaces_first_failure_when_unique_key_violated() -> None:
 def test_extractor_specs_have_unique_names() -> None:
     names = [s.name for s in EXTRACTOR_SPECS]
     assert len(names) == len(set(names)), f"Duplicate spec names: {names}"
+
+
+def test_specs_cover_every_extractor_sql() -> None:
+    """The registry and extractors/*.sql must stay in lockstep.
+
+    Set EQUALITY, not subset: a new extractor without a spec fails, and so
+    does a spec left pointing at a deleted/renamed extractor.
+    """
+    extractors_dir = Path(__file__).resolve().parents[1] / "extractors"
+    sql_stems = {p.stem for p in extractors_dir.glob("*.sql")}
+    spec_names = {s.name for s in EXTRACTOR_SPECS}
+    assert sql_stems == spec_names, (
+        f"extractors without a spec: {sorted(sql_stems - spec_names)}; "
+        f"specs without an extractor: {sorted(spec_names - sql_stems)}"
+    )
 
 
 def test_every_spec_has_at_least_one_check() -> None:

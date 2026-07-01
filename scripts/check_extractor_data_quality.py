@@ -1,36 +1,27 @@
-"""Run extractor data-quality checks against a Databricks SQL warehouse.
+"""Run extractor data-quality checks against the warehouse.
 
 Thin orchestrator. The actual check logic lives in ``tests/checks.py`` —
 that module is pure pandas and covered by unit tests in ``tests/test_checks.py``.
 This script only adds:
 
-  * Transport (databricks-sql-connector) — how to get a DataFrame.
+  * Transport (``db.open_connection()`` → SparkSession) — how to get a DataFrame.
   * CLI (argparse) — which extractor(s) to run, for what period.
   * Reporting — pretty-printed pass/fail summary.
 
-When the project later migrates fully to Databricks, the transport block
-gets swapped for a SparkSession call (``spark.sql(sql_text, args=...)``) and
-everything below it keeps working unchanged.
+The extractors read Unity Catalog tables, so the SparkSession needs UC access —
+in practice, run this on Databricks. A *local* SparkSession cannot resolve the
+``etl.*`` / ``usr.*`` / ``gsheets.*`` catalogs; for ad-hoc local validation, run
+the extractor SQL through the ``databricks-sql`` MCP instead.
 
-Usage (locally)
----------------
-Workspace settings live in a ``.env`` file at the repo root (gitignored). Two
-auth modes are supported — pick one:
+Usage
+-----
+::
 
-* **OAuth U2M (recommended).** Set only ``DATABRICKS_SERVER_HOSTNAME`` and
-  ``DATABRICKS_HTTP_PATH``. The first run opens a browser tab on the same
-  workspace Cursor's ``databricks-sql`` MCP uses; the token is cached under
-  ``~/.config/databricks-sdk-py/``. Subsequent runs are silent.
-* **Personal Access Token.** Also set ``DATABRICKS_TOKEN``. Override only if
-  you need to.
-
-Then run::
-
-    uv run python scripts/check_extractor_data_quality.py \\
+    python scripts/check_extractor_data_quality.py \\
         --period-start 2026-04-15 --period-end 2026-04-21
 
     # Filter to a subset:
-    uv run python scripts/check_extractor_data_quality.py \\
+    python scripts/check_extractor_data_quality.py \\
         --period-start 2026-04-15 --period-end 2026-04-21 \\
         --extractors dime_slots productivity
 
@@ -148,16 +139,15 @@ def main(argv: list[str] | None = None) -> int:
     if specs is None:
         return 2
 
-    conn = open_connection()
+    spark = open_connection()
     all_results: list[CheckResult] = []
-    try:
-        for spec in specs:
-            LOGGER.info("Running %s for %s..%s", spec.name, args.period_start, args.period_end)
-            df = run_extractor(conn, spec.name, args.period_start, args.period_end)
-            LOGGER.info("  %s rows returned", f"{len(df):,}")
-            all_results.extend(run_checks_for_extractor(df, spec))
-    finally:
-        conn.close()
+    for spec in specs:
+        LOGGER.info("Running %s for %s..%s", spec.name, args.period_start, args.period_end)
+        # checks.py is pure pandas; extractor outputs are small per-period pulls.
+        df = run_extractor(spark, spec.name, args.period_start, args.period_end).toPandas()
+        LOGGER.info("  %s rows returned", f"{len(df):,}")
+        all_results.extend(run_checks_for_extractor(df, spec))
+    # No close(): the "connection" is the shared SparkSession (db.open_connection).
 
     n_err, n_warn = print_report(all_results)
 
