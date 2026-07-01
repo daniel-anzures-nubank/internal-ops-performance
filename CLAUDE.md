@@ -33,7 +33,7 @@ Flat layout. No `src/` wrapper, no package directories, no `__init__.py` files.
 - `docs/metrics_docs/` — One `.md` per metric documenting its input raw table(s), filters applied vs. deferred, derivation logic, and output schema. Plus a `README.md` index.
 - `adjustments/` — Pure-pandas logic modules for the **manual adjustments layer** — the per-agent / per-date carve-outs the raw and metric layers defer (cross-support exclusions, leave reclassifications, training/shadowing windows, outage dates, DIME-squad exclusions, per-agent Index carve-outs). **Currently scaffolding** (no adjustment implemented yet). Source of truth is the adjustments Google Sheet. See [Adjustments Layer](#adjustments-layer-adjustments).
 - `docs/adjustments_docs/` — One `.md` per adjustment (sources, columns read, exactly which metric rows it changes). Plus a `README.md` index with the catalog and the source-of-truth sheet.
-- `gsheets.py` — Local, pure-Python Google Sheets transport (`gspread`, no Databricks/Spark/`dbutils`). Reads/writes Sheets into/from pandas. Credentials come from env vars (`GOOGLE_SERVICE_ACCOUNT_JSON` / `GOOGLE_SERVICE_ACCOUNT_FILE` / `GOOGLE_APPLICATION_CREDENTIALS`), never hardcoded. Optional `sheets` dependency group (`uv sync --group sheets`). Usage how-to: [Google Sheets access](#google-sheets-access-gsheetspy).
+- `gsheets.py` — Local, pure-Python Google Sheets transport (`gspread`, no Databricks/Spark/`dbutils`). Reads/writes Sheets into/from pandas. Credentials come from env vars (`GOOGLE_SERVICE_ACCOUNT_JSON` / `GOOGLE_SERVICE_ACCOUNT_FILE` / `GOOGLE_APPLICATION_CREDENTIALS`, or per-field `GOOGLE_SA_*`), never hardcoded. On Databricks the SA key comes from the `nu-mx-internal-ops-sa-secret` secret scope (one key per field, wired to `GOOGLE_SA_*`). Optional `sheets` dependency group (`uv sync --group sheets`). Usage how-to: [Google Sheets access](#google-sheets-access-gsheetspy).
 - `scripts/` — Runnable entry points. Each script owns its own transport (currently `databricks-sql-connector`) and its own CLI. Organized into subfolders: `scripts/metrics_data_scripts/` holds one `build_*.py` per raw table (imports the matching `metrics_data/` module and writes the result to Delta); `scripts/metrics_scripts/` holds one `build_<metric>.py` per metric (reads the `io_*_raw` table(s) via `db.read_table`, imports the matching `metrics/` module, writes the `io_*_metric` table). The data-quality runner `check_extractor_data_quality.py` stays at the `scripts/` root.
 - `tests/` — Pure-pandas `test_*.py` unit tests (no warehouse), organized to mirror the code: `tests/metrics_data/` (raw-table modules), `tests/metrics/` (metric modules), `tests/extractors/` (reserved for extractor checks). The DQ engine `checks.py` + `test_checks.py` and `tests/parity/` live at the `tests/` root. Imports resolve via `pythonpath = [".", "tests", "metrics_data", "metrics"]` in `pyproject.toml`.
 - `docs/metrics_definitions.md` — Canonical definitions, formulas, datasets, filters, and worked examples for every IO metric. Source of truth when migrating legacy calculations to Python.
@@ -249,18 +249,33 @@ the **Content roster** sheet.
 > the `google-workspace` MCP (`drive_search`, `sheets_getMetadata`,
 > `sheets_getRange`), not `gsheets.py`. See [SOT → DIME schedule](#dime-schedule-google-drive-sheets--etl-table-a-duality).
 
-**1. Auth — a Google service account (never a personal login).** Credentials are
-resolved from env vars in this order (put one in a gitignored repo-root `.env`;
+**1. Auth — a Google service account (never a personal login).** The production
+SA is the **`nu-mx-internal-ops`** service account (its `client_email`; address
+form `<name>@<project>.iam.gserviceaccount.com`), whose key is stored in the
+`nu-mx-internal-ops-sa-secret` Databricks scope. Credentials are resolved from
+env vars in this order (put one in a gitignored repo-root `.env` for local dev;
 never hardcode the key):
 
 1. `GOOGLE_SERVICE_ACCOUNT_JSON` — the service-account JSON, inline.
 2. `GOOGLE_SERVICE_ACCOUNT_FILE` — path to the service-account JSON file.
 3. `GOOGLE_APPLICATION_CREDENTIALS` — the Google-standard path env var.
+4. `GOOGLE_SA_*` per-field vars — one env var per JSON field (`GOOGLE_SA_TYPE`,
+   `GOOGLE_SA_PROJECT_ID`, `GOOGLE_SA_PRIVATE_KEY`, `GOOGLE_SA_CLIENT_EMAIL`, …),
+   reassembled into the credentials dict (`private_key` `\n`-unescaped).
 
-**2. Share the sheet with the service account.** Open the JSON, copy its
-`client_email` (`…@….iam.gserviceaccount.com`), and share the target sheet with
-that address (Viewer to read, Editor to write). A sheet that isn't shared returns
-`403 PERMISSION_DENIED` — that's the current state of the adjustments sheet.
+**Production source (Databricks).** On the `[IO] Performance Metrics Pipeline`
+job cluster the SA key comes from the secret scope
+**`nu-mx-internal-ops-sa-secret`**, which stores the JSON **decomposed into one
+secret key per field** (11 keys: `type`, `project_id`, `private_key_id`,
+`private_key`, `client_email`, … — there is **no** single-JSON key). The job
+cluster's `spark_env_vars` wire each secret key to the matching `GOOGLE_SA_*` env
+var (e.g. `GOOGLE_SA_PRIVATE_KEY = {{secrets/nu-mx-internal-ops-sa-secret/private_key}}`),
+so resolution path 4 above reassembles the credentials at runtime.
+
+**2. Share the sheet with the service account.** Share the target sheet with the
+`nu-mx-internal-ops` SA's `client_email` (address form above) — Viewer to read,
+Editor to write. A sheet that isn't shared returns
+`403 PERMISSION_DENIED`.
 
 **3. Dependencies.** Either `uv sync --group sheets`, or run ad hoc with
 `uv run --with gspread --with google-auth …` (add
@@ -294,7 +309,7 @@ many calls. Default scopes cover read+write Sheets + Drive; narrow to
 
 The third layer (on top of `metrics_data/` → `metrics/`). It applies the **manual adjustments** — per-agent / per-date carve-outs that depend on a human decision and are therefore kept out of the deterministic raw/metric layers: cross-support exclusions, agent leave (maternity/vacation) reclassifications, training & shadowing windows, outage/incident dates, DIME-squad business exclusions, and per-agent Xpeer Index carve-outs. They are applied in the **metric layer** (which raw rows count / how they're reclassified), never in `metrics_data/`.
 
-The **source of truth** is the adjustments Google Sheet (one tab per adjustment type): [https://docs.google.com/spreadsheets/d/1Y5P6LijLxT6hFTd69DiSPBTUPKHO-m_6zzrs-PmOjfU/edit?gid=720896495#gid=720896495](https://docs.google.com/spreadsheets/d/1Y5P6LijLxT6hFTd69DiSPBTUPKHO-m_6zzrs-PmOjfU/edit?gid=720896495#gid=720896495). Read it locally with `gsheets.py` once the sheet is shared with the service account (currently returns `403`).
+The **source of truth** is the adjustments Google Sheet (one tab per adjustment type): [https://docs.google.com/spreadsheets/d/1Y5P6LijLxT6hFTd69DiSPBTUPKHO-m_6zzrs-PmOjfU/edit?gid=720896495#gid=720896495](https://docs.google.com/spreadsheets/d/1Y5P6LijLxT6hFTd69DiSPBTUPKHO-m_6zzrs-PmOjfU/edit?gid=720896495#gid=720896495). Read it locally with `gsheets.py` once the sheet is shared (Viewer) with the `nu-mx-internal-ops` service account's `client_email` (see the [Google Sheets access](#google-sheets-access-gsheetspy) section).
 
 **Status: scaffolding** — the folders and `docs/adjustments_docs/README.md` (catalog + source of truth) exist, but no adjustment is implemented yet. When implementing, mirror the other layers: module in `adjustments/`, build script in `scripts/adjustments_scripts/`, tests in `tests/adjustments/`, and one `docs/adjustments_docs/<name>.md` per adjustment. See `docs/adjustments_docs/README.md` for the planned catalog.
 
