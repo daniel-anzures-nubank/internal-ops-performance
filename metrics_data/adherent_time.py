@@ -64,6 +64,7 @@ from datetime import date
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
+from dime_filters import DIME_SQUAD_EXCLUSIONS, MEETING_LEAVE_DIMENSIONED_ACTIVITIES
 from shift_attribution import night_agent_months, shift_start_date
 
 # ---------------------------------------------------------------------------
@@ -100,28 +101,8 @@ NULL_STATUS_TRUST_DATE: str = "2026-01-22"
 # Per-slot result keys (one row per scheduled DIME slot).
 SLOT_KEYS: tuple[str, ...] = ("agent", "date", "slot_start", "activity_type_required")
 
-# Meeting/leave dimensioned_activity tokens excluded from adherence. This is a
-# fixed DIME data filter (NOT a manual adjustment): these slots are leave
-# (Licencia, Vacacion, Permiso Medico) or meetings (Mouring, Weekly, Huddle), so
-# they are not adherence-eligible scheduled work. Legacy excludes them with the
-# same `dimensioned_activity NOT IN (...)` filter at the DIME stage; exact legacy
-# list, incl. the 'Permiso Medico'/'Permiso medico' case variants.
-MEETING_LEAVE_DIMENSIONED_ACTIVITIES: tuple[str, ...] = (
-    "Mouring",
-    "Weekly",
-    "Permiso Medico",
-    "Permiso medico",
-    "Huddle",
-    "Licencia",
-    "Vacacion",
-)
-
-# DIME squads excluded from adherence — a fixed legacy filter on the DIME
-# `agent_dime_squad` (operational / workforce-management squads, not part of the
-# adherence universe). Legacy applies `agent_dime_squad IS NOT NULL AND NOT IN
-# (...)` at the DIME stage; `metrics_data/jobs_raw.py` already excludes the same
-# set for NTPJ. Note this is the DIME squad, not the roster squad.
-DIME_SQUAD_EXCLUSIONS: tuple[str, ...] = ("wfm", "credit_evolution", "dote")
+# MEETING_LEAVE_DIMENSIONED_ACTIVITIES and DIME_SQUAD_EXCLUSIONS now live in
+# the shared metrics_data/dime_filters.py (imported above).
 
 
 # ---------------------------------------------------------------------------

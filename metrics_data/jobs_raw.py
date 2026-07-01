@@ -95,6 +95,7 @@ from datetime import date
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
+from dime_filters import DIME_SQUAD_EXCLUSIONS
 from shift_attribution import night_agent_months, shift_start_date
 
 # ---------------------------------------------------------------------------
@@ -110,11 +111,8 @@ DIME_ACTIVITY_TYPE_EXCLUSIONS: tuple[str, ...] = (
     "time_off",
 )
 
-DIME_SQUAD_EXCLUSIONS: tuple[str, ...] = (
-    "wfm",
-    "credit_evolution",
-    "dote",
-)
+# DIME_SQUAD_EXCLUSIONS now lives in the shared metrics_data/dime_filters.py
+# (imported above).
 
 DIME_SHUFFLE_STATUS_VALUES: tuple[str, ...] = ("available", "oos")
 
