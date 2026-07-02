@@ -4,8 +4,9 @@ Raw **Content CSAT** survey responses. **One row per survey response × content
 agent** (the legacy fan-out — see grain note below).
 
 Feeds the future Content **Quality (CSAT)** metric: each survey response rates how
-well the Content (enablement) team supported a squad that month, across 8
-questions scored 1-5 (a "promoter" is any answer `>= 4`). The metrics layer
+well the Content (enablement) team supported a squad that month; legacy scores
+5 of the survey's 8 questions, each 1-5 (a "promoter" is any answer `>= 4`).
+The metrics layer
 aggregates per agent as `SUM(promoters) / SUM(number_of_questions)` (target ≥ 95%).
 
 - Module: `metrics_data/content_csat.py`
@@ -94,6 +95,6 @@ agents and 8 target squads.
 | `target_squad` | STRING | the supported squad the survey is about (join key) |
 | `requested_by` | STRING | respondent email prefix (squad rep who filled the survey) |
 | `survey_timestamp` | TIMESTAMP | when the survey was filled |
-| `promoters` | INT | # of the 8 questions answered `>= 4` |
-| `number_of_questions` | INT | always 8 |
+| `promoters` | INT | # of the 5 scored questions answered `>= 4` |
+| `number_of_questions` | INT | always 5 (4 for the May-2026 `tiempo`-exclusion agents) |
 | `csat_score` | DOUBLE | `promoters / number_of_questions` (0-1, per response) |
