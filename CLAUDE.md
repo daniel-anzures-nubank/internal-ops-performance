@@ -33,7 +33,7 @@ When you find legacy behavior that looks wrong, you *reproduce it* for pre-cutov
 
 - **Night-shift date attribution** (`metrics_data/shift_attribution.py`) — night-shift activity crossing midnight re-attributes to the shift's start day via a noon boundary, **from 2026-07-01 onward only** (pre-cutover byte-identical to legacy's calendar-day split).
 - **SM empty-slot = 1800** (`metrics_data/occupancy_time.py`) — legacy SM credits a dimensioned OOS slot with **no matching Sprinklr overlap** as fully occupied (its `SUM(CASE WHEN activity_occuped=1 …)` is NULL, and `NULL <= 1800` falls through to `ELSE 1800`). Reproduced for slot dates **< 2026-07-01**; corrected (0 when empty) from the cutover.
-- **Shrinkage required-slot rule** (`metrics/shrinkage.py`) — a slot is required unless `activity_type_required` is `dime_invalid_notation` (dates `< 2026-03-01`) or `time_off` (`>= 2026-03-01`) — this is a *legacy-internal* cutover, reproduced as-is.
+- **Shrinkage required-slot rule** (`metrics/shrinkage.py`) — after dropping `lunch_break` always, a slot is required unless `activity_type_required` is `dime_invalid_notation` (dates `< 2026-03-01`) or `time_off` (`>= 2026-03-01`) — a *legacy-internal* cutover, reproduced as-is.
 - **SM quality source switch** — Playvox before `2026-05-01`, Sprinklr on/after (a documented *enhancement*: legacy SM quality was Playvox-only and goes dark mid-May).
 
 **Deliberate divergences from legacy** (documented, intentional — do not "fix back"):
