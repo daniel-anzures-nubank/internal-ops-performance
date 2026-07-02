@@ -47,7 +47,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
-from db import open_connection, run_extractor  # noqa: E402
+from db import (  # noqa: E402
+    open_connection,
+    run_extractor,
+    resolve_period_end,
+    MAX_DIME_SENTINEL,
+)
 from checks import (  # noqa: E402
     EXTRACTOR_SPECS,
     CheckResult,
@@ -97,7 +102,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--period-start", required=True, type=date.fromisoformat)
-    parser.add_argument("--period-end", required=True, type=date.fromisoformat)
+    parser.add_argument(
+        "--period-end",
+        required=True,
+        help=f"ISO date (YYYY-MM-DD), or '{MAX_DIME_SENTINEL}' to resolve to "
+        "the max ingested DIME date at run time.",
+    )
     parser.add_argument(
         "--extractors",
         nargs="*",
@@ -131,15 +141,23 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(levelname)s %(name)s: %(message)s")
 
-    if args.period_end < args.period_start:
-        LOGGER.error("--period-end must be >= --period-start")
-        return 2
-
     specs = _select_specs(args.extractors)
     if specs is None:
         return 2
 
     spark = open_connection()
+
+    use_max_dime = args.period_end == MAX_DIME_SENTINEL
+    args.period_end = resolve_period_end(args.period_end, spark)
+    if use_max_dime:
+        LOGGER.info(
+            "--period-end %s resolved to %s", MAX_DIME_SENTINEL, args.period_end
+        )
+
+    if args.period_end < args.period_start:
+        LOGGER.error("--period-end must be >= --period-start")
+        return 2
+
     all_results: list[CheckResult] = []
     for spec in specs:
         LOGGER.info("Running %s for %s..%s", spec.name, args.period_start, args.period_end)

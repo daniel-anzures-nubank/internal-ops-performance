@@ -70,7 +70,13 @@ REPO_ROOT = _repo_root()
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "metrics_data"))
 
-from db import open_connection, run_extractor, publish  # noqa: E402
+from db import (  # noqa: E402
+    open_connection,
+    run_extractor,
+    publish,
+    resolve_period_end,
+    MAX_DIME_SENTINEL,
+)
 from shrinkage_slots import (  # noqa: E402
     IO_SHRINKAGE_SLOTS_SCHEMA,
     compute_shrinkage_slots,
@@ -91,7 +97,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--period-start", required=True, type=date.fromisoformat)
-    parser.add_argument("--period-end", required=True, type=date.fromisoformat)
+    parser.add_argument(
+        "--period-end",
+        required=True,
+        help=f"ISO date (YYYY-MM-DD), or '{MAX_DIME_SENTINEL}' to resolve to "
+        "the max ingested DIME date at run time.",
+    )
     parser.add_argument(
         "--target",
         default=DEFAULT_TARGET,
@@ -138,11 +149,18 @@ def main(argv: list[str] | None = None) -> int:
         level=args.log_level, format="%(levelname)s %(name)s: %(message)s"
     )
 
+    spark = open_connection()
+
+    use_max_dime = args.period_end == MAX_DIME_SENTINEL
+    args.period_end = resolve_period_end(args.period_end, spark)
+    if use_max_dime:
+        LOGGER.info(
+            "--period-end %s resolved to %s", MAX_DIME_SENTINEL, args.period_end
+        )
+
     if args.period_end < args.period_start:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
-
-    spark = open_connection()
 
     with _log_step("agent_information"):
         roster = run_extractor(
