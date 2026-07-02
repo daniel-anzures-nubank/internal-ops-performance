@@ -4,8 +4,9 @@ Raw **Content CSAT** survey responses. **One row per survey response × content
 agent** (the legacy fan-out — see grain note below).
 
 Feeds the future Content **Quality (CSAT)** metric: each survey response rates how
-well the Content (enablement) team supported a squad that month, across 8
-questions scored 1-5 (a "promoter" is any answer `>= 4`). The metrics layer
+well the Content (enablement) team supported a squad that month; legacy scores
+5 of the survey's 8 questions, each 1-5 (a "promoter" is any answer `>= 4`).
+The metrics layer
 aggregates per agent as `SUM(promoters) / SUM(number_of_questions)` (target ≥ 95%).
 
 - Module: `metrics_data/content_csat.py`
@@ -55,11 +56,17 @@ agents and 8 target squads.
 
 ## How the score is computed (per response)
 
-- Each of the 8 questions (`facilidad`, `comprension`, `comunicacion`, `calidad`,
-  `tiempo`, `manejo_de_cambios`, `expectativas`, `aportacion_estrategica`) is a
-  promoter if its score `>= 4` (null → not a promoter).
-- `promoters` = count of promoter questions (0-8); `number_of_questions` = 8
-  (constant, matching legacy); `csat_score = promoters / number_of_questions`.
+- The survey sheet carries 8 question columns, but legacy (`qa_base`, promoters
+  sum at ~L3859 of the Content Temp Fix) scores exactly **5**: `comprension`,
+  `comunicacion`, `calidad`, `tiempo`, `expectativas`. `facilidad` (question 1),
+  `manejo_de_cambios` and `aportacion_estrategica` are **not** scored. (An
+  earlier "first 5" reading — `facilidad` in, `expectativas` out — coincidentally
+  matched legacy on the data of the day and caused the documented ±1-2pp
+  residual.)
+- Each scored question is a promoter if its score `>= 4` (null → not a promoter).
+- `promoters` = count of promoter questions (0-5); `number_of_questions` = 5
+  (constant, matching legacy; 4 for the May-2026 `tiempo` exclusion agents);
+  `csat_score = promoters / number_of_questions`.
 
 ## Deferred to the metrics layer (NOT applied here)
 
@@ -88,6 +95,6 @@ agents and 8 target squads.
 | `target_squad` | STRING | the supported squad the survey is about (join key) |
 | `requested_by` | STRING | respondent email prefix (squad rep who filled the survey) |
 | `survey_timestamp` | TIMESTAMP | when the survey was filled |
-| `promoters` | INT | # of the 8 questions answered `>= 4` |
-| `number_of_questions` | INT | always 8 |
+| `promoters` | INT | # of the 5 scored questions answered `>= 4` |
+| `number_of_questions` | INT | always 5 (4 for the May-2026 `tiempo`-exclusion agents) |
 | `csat_score` | DOUBLE | `promoters / number_of_questions` (0-1, per response) |
