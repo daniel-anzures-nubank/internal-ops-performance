@@ -13,8 +13,14 @@
 --   * Pull every SM case evaluation in the period that is on/after the SM
 --     cutover (2026-05-01) — see "Cutover" below.
 --   * Map `agent_name` -> Nubank email -> agent prefix via `sprinklr_sm_users`.
---     Rows whose agent can't be mapped (no `user_email`) yield an empty `agent`
---     and are dropped downstream in `build_evaluations`.
+--     Rows whose agent can't be mapped (no `user_email`) are dropped BEFORE the
+--     dedup (mirroring legacy, which filters to mapped social agents before its
+--     dedup). The source carries exact duplicate rows per `case_number` under
+--     two `agent_name`s — one mapped, one unmapped (e.g. 'Yamil Ramirez' ->
+--     rodrigo.ramirez vs the unmapped 'Rodrigo Ramirez') — with IDENTICAL
+--     `checklist_modified_date` and `report_date`, so deduping first made the
+--     winner nondeterministic and silently lost the evaluation whenever the
+--     unmapped twin won.
 --   * Expose the same shape the metrics_data shaper consumes for Playvox:
 --     evaluation_id, agent, qa_score, team_name, scorecard_id, created_at.
 --   * `qa_score` (`score_avg`) is already on the same 0-100 scale as Playvox
@@ -64,14 +70,18 @@ WITH sm_filtered AS (
     ROW_NUMBER() OVER (
       PARTITION BY sm.case_number
       ORDER BY sm.checklist_modified_date DESC NULLS LAST,
-               sm.report_date DESC NULLS LAST
+               sm.report_date DESC NULLS LAST,
+               -- deterministic tie-break: identical revision timestamps occur
+               -- in the source (duplicate-agent twins), don't shuffle re-runs
+               sm.agent_name ASC
     ) AS rn
   FROM etl.mx__series_contract.social_media_case_summary_information sm
-  LEFT JOIN usr.mx__enablement.sprinklr_sm_users ag  ON sm.agent_name = ag.user_name
+  JOIN usr.mx__enablement.sprinklr_sm_users ag  ON sm.agent_name = ag.user_name
   LEFT JOIN usr.mx__enablement.sprinklr_sm_users mon ON sm.auditor    = mon.user_name
   WHERE sm.report_date >= :period_start
     AND sm.report_date <  DATE_ADD(:period_end, 1)
     AND sm.report_date >= DATE '2026-05-01'
+    AND ag.user_email IS NOT NULL
     AND COALESCE(mon.user_email, '') NOT IN (CONCAT('testuser', '@', 'nu.com.mx'))
 )
 SELECT
