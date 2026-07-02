@@ -73,25 +73,55 @@ byte-for-byte (including legacy's bugs) per the project's legacy-parity decision
 * NOTE this is distinct from the night-shift re-attribution, which still uses its
   own ``shift_attribution.NIGHT_SHIFT_CUTOVER`` (untouched).
 
-* **Social-Media empty-slot full credit (pre-cutover parity quirk).** The legacy
-  SM deck (``legacy/[IO] Performance 2026 - Social Media Temp Fix.sql``) counts a
-  dimensioned SM slot with NO overlapping matching-activity Sprinklr case as
-  FULLY occupied: ``occupancy_agg`` (lines 1123-1135) computes
-  ``SUM(CASE WHEN activity_occuped = 1 THEN duration END)`` — NULL when no
-  overlapping case matches the slot's activity type — and the downstream
-  ``CASE WHEN SUM(occupancy_time) <= 1800 THEN SUM(occupancy_time) ELSE 1800 END``
-  (lines 1189 and 1223) evaluates ``NULL <= 1800`` to NULL, so an empty slot
-  falls through to ``ELSE 1800``. Partially covered slots keep their actual
-  overlap seconds (the ``WHEN`` branch); only slots with zero matching cases get
-  the 1800 default. We reproduce this quirk for SM DIME slots
+* **Legacy SM scoring (pre-cutover parity quirks).** For SM DIME slots
   (:data:`SM_DIME_SQUADS`) dated **before**
-  :data:`SM_EMPTY_SLOT_FULL_CREDIT_CUTOVER` (2026-07-01), restricted to the
-  productive slot universe legacy scored (its DIME filter, lines 1064/1079,
-  drops ``lunch_break`` / ``dime_invalid_notation`` / ``time_off`` /
-  ``shrinkage`` — the eligibility flag is decided on the PRE-reclass
-  ``activity_type_required``, since this module relabels ``dime_invalid_notation``
-  to ``'oos'``). On/after the cutover the corrected behavior applies: an empty
-  slot is 0.
+  :data:`SM_EMPTY_SLOT_FULL_CREDIT_CUTOVER` (2026-07-01) we reproduce four
+  quirks of the legacy SM deck
+  (``legacy/[IO] Performance 2026 - Social Media Temp Fix.sql``) byte-for-byte;
+  on/after the cutover the corrected behavior applies everywhere:
+
+  1. **Empty slot = 1800.** Legacy counts a dimensioned SM slot with NO
+     overlapping matching-activity Sprinklr case as FULLY occupied:
+     ``occupancy_agg`` (lines 1123-1135) computes
+     ``SUM(CASE WHEN activity_occuped = 1 THEN duration END)`` — NULL when no
+     overlapping case matches the slot's activity type — and the downstream
+     ``CASE WHEN SUM(occupancy_time) <= 1800 THEN SUM(occupancy_time) ELSE 1800
+     END`` (lines 1189 and 1223) evaluates ``NULL <= 1800`` to NULL, so an
+     empty slot falls through to ``ELSE 1800``. Partially covered slots keep
+     their actual overlap seconds (the ``WHEN`` branch); only slots with zero
+     matching cases get the 1800 default. Restricted to the productive slot
+     universe legacy scored (its DIME filter, lines 1064/1079, drops
+     ``lunch_break`` / ``dime_invalid_notation`` / ``time_off`` / ``shrinkage``
+     — the eligibility flag is decided on the PRE-reclass
+     ``activity_type_required``, since this module relabels
+     ``dime_invalid_notation`` to ``'oos'``). Post-cutover an empty slot is 0.
+
+  2. **No-dedup occupied sum.** Legacy has NO interval dedup of overlapping
+     Sprinklr assignments: ``occupancy_agg`` (lines 1123-1135) sums the RAW
+     clipped per-job durations from ``occupancy_base`` (the plain
+     job-clipped-to-slot ``duration``, lines 1103-1121), then the downstream
+     cap bounds the slot at 1800 — i.e. ``occ = LEAST(Σ clip(job), 1800)``.
+     Reproduced for SM pre-cutover slots that HAVE a matching overlap (verified
+     byte-exact against published legacy on real data); post-cutover (and for
+     all non-SM slots on all dates) the ``prev_max_end`` interval dedup applies.
+
+  3. **``dime_invalid_notation`` slots are dropped, not reclassified.**
+     Legacy's SM DIME filter (line 1064) removes ``dime_invalid_notation``
+     slots from the universe entirely — they never reach the numerator OR the
+     denominator — whereas this module reclassifies them to ``'oos'``.
+     Reproduced in :func:`filter_dime`: SM pre-cutover
+     ``dime_invalid_notation`` slots are filtered OUT; non-SM squads and
+     post-cutover slots keep the reclassify behavior.
+
+  4. **Only social DIME squads are in scope for SM-team agents.** Legacy
+     scores ONLY slots whose ``agent_dime_squad`` is in
+     ``('social', 'social_social')`` for the SM deck (line 1065), so an
+     SM-team agent's slots from other DIME squads (e.g. ``collections``) are
+     out of scope pre-cutover. The performance ``team`` is only known after
+     the roster join, so :func:`compute_slot_occupancy` tags each slot with
+     ``non_sm_dime_squad_pre_cutover`` and :func:`compute_occupancy_time`
+     drops the tagged rows where ``team = 'social media'`` post-join.
+     Non-SM teams keep all their slots; post-cutover SM keeps them too.
 
 The two **fixed** DIME filters (meeting/leave ``dimensioned_activity`` drop and
 the wfm/credit_evolution/dote DIME-squad drop) apply on ALL dates.
@@ -110,7 +140,9 @@ A single slot can have multiple overlapping jobs of the same activity type
 double-count the overlapping portion. We merge overlapping same-activity
 intervals with the classic ``prev_max_end`` running-max trick — legacy used a
 window function and we port it to a Spark ``Window.partitionBy(...).orderBy(...)``
-running max via ``lag`` over the unbounded-preceding frame.
+running max via ``lag`` over the unbounded-preceding frame. Exception: legacy's
+SM deck never deduped, so pre-cutover SM slots use the raw no-dedup sum
+(quirk 2 above).
 
 Output schema (one row per agent per DIME slot)
 -----------------------------------------------
@@ -171,16 +203,18 @@ SHUFFLE_OCCUPIED_STATUSES: tuple[str, ...] = ("finished", "transferred", "skippe
 # Slot duration — 30 minutes.
 SLOT_DURATION_SECONDS: int = 30 * 60
 
-# --- Social-Media empty-slot full credit (pre-cutover parity quirk) ---------
+# --- Legacy SM scoring (pre-cutover parity quirks) ---------------------------
 # The legacy SM deck scores only these DIME squads
 # (`[IO] Performance 2026 - Social Media Temp Fix.sql` line 1065:
 # `agent_dime_squad IN ('social', 'social_social')`).
 SM_DIME_SQUADS: tuple[str, ...] = ("social", "social_social")
 
-# Slots dated BEFORE this reproduce the legacy quirk (a slot with no
-# matching-activity overlapping Sprinklr case earns the full 1800 s — the
-# `ELSE 1800` fall-through at legacy lines 1189/1223); on/after it the
-# corrected behavior applies (an empty slot is 0). See module docstring.
+# SM slots dated BEFORE this reproduce the legacy SM quirks (module docstring):
+# empty slot = 1800 (the `ELSE 1800` fall-through at legacy lines 1189/1223),
+# the no-dedup occupied sum, the `dime_invalid_notation` drop, and the
+# social-DIME-only slot scope for SM-team agents. On/after it the corrected
+# behavior applies everywhere (empty slot = 0, interval dedup, reclassify,
+# keep all DIME squads).
 SM_EMPTY_SLOT_FULL_CREDIT_CUTOVER: date = date(2026, 7, 1)
 
 # Legacy's SM occupancy DIME filter (lines 1064/1079) drops these activity
@@ -235,6 +269,14 @@ def filter_dime(dime: DataFrame) -> DataFrame:
       * ``activity_type_required == 'dime_invalid_notation'`` →
         ``activity_type_required = 'oos'``
 
+    Exception to the second reclassification (legacy SM scoring, quirk 3 of the
+    module docstring): SM DIME slots (:data:`SM_DIME_SQUADS`) dated before
+    :data:`SM_EMPTY_SLOT_FULL_CREDIT_CUTOVER` with
+    ``activity_type_required == 'dime_invalid_notation'`` are DROPPED, not
+    reclassified — legacy's SM deck (line 1064) removes them from the universe
+    entirely. Non-SM squads and post-cutover SM slots keep the reclassify
+    behavior.
+
     Activity-type (``lunch_break`` / ``time_off`` / ``shrinkage``) exclusions
     still move to the metrics layer.
 
@@ -262,6 +304,23 @@ def filter_dime(dime: DataFrame) -> DataFrame:
     out = out.filter(
         F.col("squad").isNotNull()
         & ~F.col("squad").isin(list(NOCC_DIME_SQUAD_EXCLUSIONS))
+    )
+
+    # Legacy SM scoring (pre-cutover, quirk 3 of the module docstring): the SM
+    # deck's DIME filter (line 1064) removes `dime_invalid_notation` slots from
+    # the universe entirely — they never reach numerator or denominator — so
+    # they must NOT be reclassified to 'oos' below. Applied BEFORE the
+    # reclassifications on the PRE-reclass activity_type_required; non-SM
+    # squads and post-cutover SM slots fall through to the reclassify step.
+    out = out.filter(
+        ~(
+            F.col("squad").isin(list(SM_DIME_SQUADS))
+            & (F.col("date") < F.lit(SM_EMPTY_SLOT_FULL_CREDIT_CUTOVER))
+            & (
+                F.col("activity_type_required")
+                == F.lit(DIME_INVALID_NOTATION_VALUE)
+            )
+        )
     )
 
     # SM empty-slot full-credit eligibility (pre-cutover parity quirk; module
@@ -426,17 +485,30 @@ def compute_slot_occupancy(dime_filtered: DataFrame, jobs: DataFrame) -> DataFra
          a Spark ``Window`` + ``lag``-style unbounded-preceding running max.
       4. ``contribution = activity_occuped × max(0, cjob_end -
          max(cjob_start, prev_max_end))`` where ``activity_occuped = 1`` iff
-         ``slot.activity_type_required == job.activity_type``.
+         ``slot.activity_type_required == job.activity_type``. A parallel
+         no-dedup contribution ``raw_contribution = activity_occuped ×
+         (cjob_end - cjob_start)`` (plain clipped duration, no ``prev_max_end``
+         subtraction) feeds the legacy SM no-dedup sum (quirk 2, module
+         docstring).
       5. Sum contributions per slot. Cap at 1800. LEFT-JOIN semantics: slots
-         with no matching job keep ``occupancy_time = 0`` — EXCEPT eligible
-         Social-Media slots (``sm_empty_slot_full_credit``, tagged by
-         :func:`filter_dime`): pre-cutover SM slots with NO overlapping
-         matching-activity job earn the full 1800 s, reproducing legacy's
-         ``ELSE 1800`` fall-through (module docstring). A slot with a matching
-         overlap keeps its actual (capped) seconds.
+         with no matching job keep ``occupancy_time = 0`` — EXCEPT
+         pre-cutover Social-Media slots (legacy SM scoring, module docstring):
+           * eligible empty SM slots (``sm_empty_slot_full_credit``, tagged by
+             :func:`filter_dime` — NO overlapping matching-activity job) earn
+             the full 1800 s, reproducing legacy's ``ELSE 1800`` fall-through;
+           * SM pre-cutover slots WITH a matching overlap take the NO-DEDUP
+             sum capped at 1800 (``LEAST(Σ raw_contribution, 1800)``) —
+             legacy's ``occupancy_agg`` sums raw clipped durations with no
+             interval dedup (lines 1123-1135);
+           * everything else (non-SM, or SM on/after the cutover) keeps the
+             deduped (capped) seconds.
 
     Returns one row per (agent, squad, date, slot_start, slot_end,
-    activity_type_required) with ``occupancy_time`` (long seconds).
+    activity_type_required) with ``occupancy_time`` (long seconds) plus the
+    boolean ``non_sm_dime_squad_pre_cutover`` (DIME squad NOT in
+    :data:`SM_DIME_SQUADS` AND date < the cutover) — consumed by
+    :func:`compute_occupancy_time` to drop SM-team agents' non-social DIME
+    slots post-roster-join (quirk 4, module docstring).
     """
     keys = list(SLOT_KEYS)
 
@@ -490,11 +562,21 @@ def compute_slot_occupancy(dime_filtered: DataFrame, jobs: DataFrame) -> DataFra
         F.greatest(F.lit(0).cast("long"), F.col("cjob_end") - effective_start),
     ).otherwise(F.lit(0).cast("long"))
 
+    # Legacy SM no-dedup contribution (quirk 2, module docstring): the plain
+    # clipped duration — no prev_max_end subtraction, no greatest(0, ...)
+    # guard — matching legacy's `occupancy_base` duration (lines 1103-1121)
+    # summed as-is by `occupancy_agg` (lines 1123-1135).
+    raw_contribution = F.col("activity_occuped").cast("long") * (
+        F.col("cjob_end") - F.col("cjob_start")
+    )
+
     per_slot = (
         clipped.withColumn("contribution", contribution)
+        .withColumn("raw_contribution", raw_contribution)
         .groupBy(*keys)
         .agg(
             F.sum("contribution").alias("occupancy_time"),
+            F.sum("raw_contribution").alias("_raw_occupancy_time"),
             F.max("activity_occuped").alias("_matching_overlap"),
         )
         .withColumn(
@@ -514,14 +596,35 @@ def compute_slot_occupancy(dime_filtered: DataFrame, jobs: DataFrame) -> DataFra
     sm_full_credit = F.col("sm_empty_slot_full_credit") & (
         F.coalesce(F.col("_matching_overlap"), F.lit(0)) == 0
     )
+    # Legacy SM scoring gate (quirks 2 and 4, module docstring): SM DIME slots
+    # dated before the cutover.
+    sm_pre_cutover = F.col("squad").isin(list(SM_DIME_SQUADS)) & (
+        F.col("date") < F.lit(SM_EMPTY_SLOT_FULL_CREDIT_CUTOVER)
+    )
     return (
         joined_back.withColumn(
             "occupancy_time",
             F.when(sm_full_credit, F.lit(SLOT_DURATION_SECONDS))
+            .when(
+                sm_pre_cutover,
+                F.least(
+                    F.coalesce(F.col("_raw_occupancy_time"), F.lit(0)),
+                    F.lit(SLOT_DURATION_SECONDS),
+                ),
+            )
             .otherwise(F.coalesce(F.col("occupancy_time"), F.lit(0)))
             .cast("long"),
         )
-        .drop("sm_empty_slot_full_credit", "_matching_overlap")
+        .withColumn(
+            "non_sm_dime_squad_pre_cutover",
+            ~F.col("squad").isin(list(SM_DIME_SQUADS))
+            & (F.col("date") < F.lit(SM_EMPTY_SLOT_FULL_CREDIT_CUTOVER)),
+        )
+        .drop(
+            "sm_empty_slot_full_credit",
+            "_matching_overlap",
+            "_raw_occupancy_time",
+        )
     )
 
 
@@ -546,6 +649,11 @@ def compute_occupancy_time(
     (see ``filter_dime`` / module docstring): Social-Media occupancy is
     intentionally ON for the whole history, a documented divergence from legacy
     (which had no Sprinklr source).
+
+    Legacy SM scoring (quirk 4, module docstring): pre-cutover slots of
+    ``team = 'social media'`` agents whose DIME squad is NOT in
+    :data:`SM_DIME_SQUADS` are dropped after the roster join — legacy's SM
+    deck (line 1065) never scored them.
     """
     # --- DIME side ----------------------------------------------------------
     dime_f = filter_dime(dime)
@@ -572,9 +680,17 @@ def compute_occupancy_time(
     # exactly this — its final ``normalized_occupancy_final`` groups to one row
     # per ``slot_start`` and applies ``LEAST(SUM(occupancy_time), 1800)`` AFTER
     # summing — so we sum here and let the post-roster cap below bound it.
+    # `min` on the legacy-SM scope flag keeps the collapsed slot in SM scope
+    # when ANY duplicate DIME-squad copy is social (matching legacy, which
+    # would score the social copy).
     per_slot = per_slot.groupBy(
         "agent", "date", "slot_start", "slot_end", "activity_type_required"
-    ).agg(F.sum("occupancy_time").alias("occupancy_time"))
+    ).agg(
+        F.sum("occupancy_time").alias("occupancy_time"),
+        F.min("non_sm_dime_squad_pre_cutover").alias(
+            "non_sm_dime_squad_pre_cutover"
+        ),
+    )
 
     # Night-shift agents that cross midnight are re-attributed to the day their
     # shift started (>= 2026-07-01 only). `slot_start` is local-time unix, so it
@@ -634,6 +750,20 @@ def compute_occupancy_time(
     enriched = per_slot.withColumn(
         "snapshot_month", F.trunc(F.to_date(F.col("date")), "month")
     ).join(roster, on=["agent", "snapshot_month"], how="inner")
+
+    # Legacy SM scoring (pre-cutover, quirk 4 of the module docstring): the SM
+    # deck scores ONLY social/social_social DIME slots (line 1065), so an
+    # SM-team agent's slots from other DIME squads are out of scope before the
+    # cutover. The performance `team` is only known after the roster join,
+    # hence the drop happens here; non-SM teams (NULL team included, via the
+    # coalesce) keep all their slots.
+    enriched = enriched.filter(
+        ~F.coalesce(
+            (F.col("team") == F.lit("social media"))
+            & F.col("non_sm_dime_squad_pre_cutover"),
+            F.lit(False),
+        )
+    ).drop("non_sm_dime_squad_pre_cutover")
 
     # --- final shape --------------------------------------------------------
     enriched = enriched.withColumn(

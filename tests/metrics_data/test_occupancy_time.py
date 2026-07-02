@@ -11,6 +11,10 @@ legacy DIME filters (meeting/leave dimensioned_activity drop and the
 wfm/credit_evolution/dote DIME-squad drop). ``social`` DIME slots are KEPT on
 all dates — Social-Media occupancy is sourced from Sprinklr ``sm_jobs`` and is
 intentionally ON for the whole history (a documented divergence from legacy).
+Pre-cutover (< 2026-07-01) SM slots reproduce the legacy SM deck's scoring
+quirks byte-for-byte: empty slot = 1800, the no-dedup occupied sum,
+``dime_invalid_notation`` slots dropped (not reclassified), and only
+social/social_social DIME slots in scope for SM-team agents.
 There is no monthly benchmark (it moved to the metrics layer); output is one
 row per slot with ``occupancy_minutes`` and ``required_minutes``.
 """
@@ -282,8 +286,42 @@ class TestFilterDime:
         assert out[0]["activity_type_required"] == "oos"
 
     def test_systemic_invalid_notation_reclassification(self, spark):
+        # Non-SM DIME squad (default 'core'): the reclassify behavior is
+        # unchanged on all dates.
         out = filter_dime(
             make_dime(spark, [{"activity_type_required": "dime_invalid_notation"}])
+        ).collect()
+        assert len(out) == 1
+        assert out[0]["activity_type_required"] == "oos"
+
+    @pytest.mark.parametrize("squad", list(SM_DIME_SQUADS))
+    def test_sm_pre_cutover_invalid_notation_dropped_not_reclassified(self, spark, squad):
+        # Legacy SM scoring (quirk 3): the SM deck's DIME filter (line 1064)
+        # removes `dime_invalid_notation` slots from the universe entirely, so
+        # pre-cutover SM slots (date D is May 2026) are dropped, never
+        # reclassified to 'oos'.
+        out = filter_dime(
+            make_dime(
+                spark,
+                [{"squad": squad, "activity_type_required": "dime_invalid_notation"}],
+            )
+        )
+        assert out.count() == 0
+
+    def test_sm_post_cutover_invalid_notation_still_reclassified(self, spark):
+        # On/after the cutover the corrected behavior applies to SM squads too:
+        # the slot is kept and reclassified like everyone else's.
+        out = filter_dime(
+            make_dime(
+                spark,
+                [
+                    {
+                        "squad": "social",
+                        "date": POST_JULY,
+                        "activity_type_required": "dime_invalid_notation",
+                    }
+                ],
+            )
         ).collect()
         assert len(out) == 1
         assert out[0]["activity_type_required"] == "oos"
@@ -599,14 +637,15 @@ class TestSmEmptySlotFullCredit:
         slots = self._sm_slot(spark, activity_type_required=act)
         assert self._occ(slots, self._no_jobs(spark)) == 0
 
-    def test_reclassified_invalid_notation_sm_slot_not_credited(self, spark):
-        # Legacy drops `dime_invalid_notation` slots outright (line 1064); this
-        # module reclassifies them to 'oos', but eligibility is decided on the
-        # PRE-reclass value, so the reclassified slot stays at 0.
+    def test_invalid_notation_sm_slot_dropped_from_universe(self, spark):
+        # Legacy drops `dime_invalid_notation` slots outright (line 1064).
+        # Pre-cutover SM slots now reproduce that drop in filter_dime (legacy
+        # SM scoring, quirk 3) instead of reclassifying to 'oos', so the slot
+        # never reaches the occupancy calc — and can never earn the 1800
+        # default.
         slots = self._sm_slot(spark, activity_type_required="dime_invalid_notation")
-        out = slots.collect()
-        assert out[0]["activity_type_required"] == "oos"  # reclass happened
-        assert self._occ(slots, self._no_jobs(spark)) == 0
+        assert slots.count() == 0
+        assert compute_slot_occupancy(slots, self._no_jobs(spark)).count() == 0
 
     def test_excluded_activity_types_constant_matches_legacy_filter(self):
         assert SM_FULL_CREDIT_EXCLUDED_ACTIVITY_TYPES == (
@@ -628,6 +667,159 @@ class TestSmEmptySlotFullCredit:
         ).collect()
         assert len(out) == 1
         assert out[0]["occupancy_minutes"] == SLOT_DURATION_SECONDS / 60.0
+
+
+# ---------------------------------------------------------------------------
+# Legacy SM no-dedup occupied sum (pre-cutover parity quirk)
+# ---------------------------------------------------------------------------
+
+
+class TestSmNoDedupOccupiedSum:
+    """Legacy SM deck quirk: no interval dedup — ``occupancy_agg`` sums the
+    RAW clipped job durations per slot (lines 1123-1135 of the SM Temp Fix
+    notebook), capped at 1800 downstream (lines 1189/1223):
+    ``occ = LEAST(Σ clip(job), 1800)``. Reproduced for SM pre-cutover slots
+    with a matching overlap; non-SM slots (all dates) and SM slots on/after
+    2026-07-01 keep the ``prev_max_end`` interval dedup."""
+
+    def _sm_slot(self, spark, **overrides):
+        row = {"squad": "social", "activity_type_required": "oos", **overrides}
+        return filter_dime(make_dime(spark, [row]))
+
+    def _occ(self, slots, jobs):
+        rows = compute_slot_occupancy(slots, jobs).collect()
+        assert len(rows) == 1
+        return int(rows[0]["occupancy_time"])
+
+    def _overlapping_sm_cases(self, spark, day=D):
+        # [0, 1200) + [600, 1500): dedup (union coverage) = 1500; raw no-dedup
+        # sum = 1200 + 900 = 2100 -> capped at 1800.
+        return make_sm(
+            spark,
+            [
+                {"date": day, "activity_start_unix": SLOT_BASE, "activity_end_unix": SLOT_BASE + 1200},
+                {"date": day, "activity_start_unix": SLOT_BASE + 600, "activity_end_unix": SLOT_BASE + 1500},
+            ],
+        )
+
+    def test_sm_pre_cutover_overlap_sums_without_dedup(self, spark):
+        # (a) two overlapping cases [0,600) + [300,900): dedup would give the
+        # 900 s union; legacy's raw sum gives 600 + 600 = 1200 s.
+        sm = make_sm(
+            spark,
+            [
+                {"activity_start_unix": SLOT_BASE, "activity_end_unix": SLOT_BASE + 600},
+                {"activity_start_unix": SLOT_BASE + 300, "activity_end_unix": SLOT_BASE + 900},
+            ],
+        )
+        jobs = build_jobs_union(empty_shuffle(spark), empty_oos(spark), sm)
+        assert self._occ(self._sm_slot(spark), jobs) == 1200
+
+    def test_sm_pre_cutover_no_dedup_sum_capped_at_1800(self, spark):
+        # (a) raw sum 2100 s exceeds the slot -> LEAST(..., 1800).
+        jobs = build_jobs_union(
+            empty_shuffle(spark), empty_oos(spark), self._overlapping_sm_cases(spark)
+        )
+        assert self._occ(self._sm_slot(spark), jobs) == SLOT_DURATION_SECONDS
+
+    def test_non_sm_slot_still_dedups(self, spark):
+        # (b) the same overlap pattern on a non-SM slot (default DIME squad
+        # 'core') keeps the union coverage: 1500 s, not 2100 -> 1800.
+        jobs = build_jobs_union(
+            make_shuffle(
+                spark,
+                [
+                    {"activity_start_unix": SLOT_BASE, "activity_end_unix": SLOT_BASE + 1200},
+                    {"activity_start_unix": SLOT_BASE + 600, "activity_end_unix": SLOT_BASE + 1500},
+                ],
+            ),
+            empty_oos(spark),
+        )
+        slots = filter_dime(make_dime(spark, [{}]))
+        assert self._occ(slots, jobs) == 1500
+
+    def test_sm_post_cutover_slot_still_dedups(self, spark):
+        # (b) SM slot on/after the cutover: corrected behavior -> dedup (1500).
+        slots = self._sm_slot(spark, date=POST_JULY)
+        jobs = build_jobs_union(
+            empty_shuffle(spark),
+            empty_oos(spark),
+            self._overlapping_sm_cases(spark, day=POST_JULY),
+        )
+        assert self._occ(slots, jobs) == 1500
+
+
+# ---------------------------------------------------------------------------
+# Legacy SM slot scope — social DIME squads only (pre-cutover parity quirk)
+# ---------------------------------------------------------------------------
+
+
+class TestSmNonSocialDimeSlotScope:
+    """Legacy SM deck quirk: only ``agent_dime_squad IN ('social',
+    'social_social')`` slots are scored (line 1065 of the SM Temp Fix
+    notebook), so an SM-team agent's slots from other DIME squads are out of
+    scope before 2026-07-01. The performance team is only known after the
+    roster join, so the drop happens there; non-SM teams keep all their slots
+    and post-cutover SM keeps them too."""
+
+    def _run(self, spark, *, team, dime_squad, day, month):
+        roster = make_roster(
+            spark,
+            [
+                {
+                    "squad": "social" if team == "social media" else "core",
+                    "team": team,
+                    "snapshot_month": month,
+                    "snapshot_date": dt.date(month.year, month.month, 28),
+                }
+            ],
+        )
+        dime = make_dime(spark, [{"squad": dime_squad, "date": day}])
+        return compute_occupancy_time(
+            roster, dime, empty_shuffle(spark), empty_oos(spark)
+        ).collect()
+
+    def test_sm_team_non_social_dime_slot_dropped_pre_cutover(self, spark):
+        # (d) SM-team agent with a 'collections' DIME slot in May 2026: legacy
+        # never scored it -> dropped post-roster-join.
+        out = self._run(
+            spark, team="social media", dime_squad="collections",
+            day=D, month=dt.date(2026, 5, 1),
+        )
+        assert len(out) == 0
+
+    def test_sm_team_social_dime_slot_kept_pre_cutover(self, spark):
+        # The social DIME slot itself stays in scope pre-cutover.
+        out = self._run(
+            spark, team="social media", dime_squad="social",
+            day=D, month=dt.date(2026, 5, 1),
+        )
+        assert len(out) == 1
+
+    def test_sm_team_non_social_dime_slot_kept_post_cutover(self, spark):
+        # (d) On/after the cutover the corrected behavior applies: the SM-team
+        # agent's non-social DIME slot is kept.
+        out = self._run(
+            spark, team="social media", dime_squad="collections",
+            day=POST_JULY, month=dt.date(2026, 7, 1),
+        )
+        assert len(out) == 1
+
+    def test_non_sm_team_non_social_dime_slot_kept_pre_cutover(self, spark):
+        # Invariant: non-SM teams keep all their (non-excluded) DIME slots on
+        # all dates — byte-identical to the pre-fix behavior.
+        out = self._run(
+            spark, team="core", dime_squad="collections",
+            day=D, month=dt.date(2026, 5, 1),
+        )
+        assert len(out) == 1
+
+    def test_flag_column_does_not_leak_into_output(self, spark):
+        out = self._run(
+            spark, team="core", dime_squad="collections",
+            day=D, month=dt.date(2026, 5, 1),
+        )
+        assert "non_sm_dime_squad_pre_cutover" not in out[0].asDict()
 
 
 # ---------------------------------------------------------------------------
