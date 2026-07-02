@@ -23,17 +23,21 @@ Tables
 Window note
 -----------
 ``improved_benchmarks`` needs one **previous** month before its output start for
-the month-over-month LAG. Run this for ``--period-start`` = (improved_benchmarks
-output start − 1 month) so the comparator month is materialized. The NTPJ
-trailing benchmark (months ≤ 2026-03 use M-4 … M) needs ~4 more months of
-``io_jobs_raw`` before that — read automatically via the look-back.
+the month-over-month LAG, so this script automatically EMITS from
+``--period-start − 1 month`` (the comparator month) — no operator adjustment
+needed (the 2026-07-01 full job run proved that relying on a shifted
+``--period-start`` breaks: the job passes the plain period and January's LAG
+came up empty). The NTPJ trailing benchmark (months ≤ 2026-03 use M-4 … M)
+needs ~4 more months of ``io_jobs_raw`` before that — read automatically via
+the look-back, and materialized in ``io_jobs_raw`` by ``build_jobs_raw``'s own
+BENCHMARK_LOOKBACK_MONTHS window.
 
 Usage
 -----
 Runs on a Databricks cluster (``spark-submit`` / a Databricks job task)::
 
     python scripts/metrics_scripts/build_normalized_time_per_job.py \\
-        --period-start 2025-12-01 --period-end 2026-04-30 --dry-run
+        --period-start 2026-01-01 --period-end 2026-04-30 --dry-run
 """
 
 from __future__ import annotations
@@ -88,14 +92,18 @@ LOGGER = logging.getLogger("cx_metrics.normalized_time_per_job")
 DEFAULT_SOURCE = "usr.danielanzures.io_jobs_raw"
 DEFAULT_TARGET = "usr.danielanzures.io_normalized_time_per_job"
 
-# Extra months read before period_start so the trailing-window benchmark
+# Extra months read before the emitted start so the trailing-window benchmark
 # (months <= 2026-03 use M-4 ... M) has its source data. Matches build_ntpj.
 BENCHMARK_LOOKBACK_MONTHS = 4
 
+# The improved_benchmarks month-over-month LAG needs its comparator month
+# MATERIALIZED in the output, so we emit from period_start − this many months.
+LAG_COMPARATOR_MONTHS = 1
 
-def _lookback_start(period_start: date) -> date:
-    """First day of the month BENCHMARK_LOOKBACK_MONTHS before period_start."""
-    total = period_start.year * 12 + (period_start.month - 1) - BENCHMARK_LOOKBACK_MONTHS
+
+def _months_before(day: date, months: int) -> date:
+    """First day of the month ``months`` before ``day``."""
+    total = day.year * 12 + (day.month - 1) - months
     year, month = divmod(total, 12)
     return date(year, month + 1, 1)
 
@@ -161,7 +169,8 @@ def main(argv: list[str] | None = None) -> int:
         level=args.log_level, format="%(levelname)s %(name)s: %(message)s"
     )
 
-    lookback_start = _lookback_start(args.period_start)
+    substrate_start = _months_before(args.period_start, LAG_COMPARATOR_MONTHS)
+    lookback_start = _months_before(substrate_start, BENCHMARK_LOOKBACK_MONTHS)
     spark = open_connection()
 
     use_max_dime = args.period_end == MAX_DIME_SENTINEL
@@ -175,13 +184,17 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
+    LOGGER.info(
+        "Emitting from %s (LAG comparator month before --period-start %s)",
+        substrate_start, args.period_start,
+    )
     with _log_step(f"read {args.source} (look-back from {lookback_start})"):
         jobs = read_table(spark, args.source, lookback_start, args.period_end)
 
     with _log_step("compute_normalized_time_per_job"):
         result = compute_normalized_time_per_job(
             jobs,
-            args.period_start,
+            substrate_start,
             args.period_end,
             general_exclusions=read_adjustment_table(spark, "exclusiones_generales"),
             cross_support=read_adjustment_table(spark, "cross_support"),
@@ -233,7 +246,8 @@ def main(argv: list[str] | None = None) -> int:
             args.target,
             IO_NORMALIZED_TIME_PER_JOB_SCHEMA,
             layer="metrics",
-            period_start=args.period_start,
+            # Registry records the WRITTEN window (incl. the comparator month).
+            period_start=substrate_start,
             period_end=args.period_end,
             run_id=args.run_id,
             snapshot=not args.no_snapshot,
