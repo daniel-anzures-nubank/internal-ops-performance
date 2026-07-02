@@ -2,15 +2,22 @@
 
 Small synthetic agent-level component metric frames. We verify the per-component
 target thresholds, the targets-achieved / total-targets ratio, the team-specific
-component sets (Core/Fraud NTPJ vs SM tNPS+WoWs), and the four parity fixes:
+component sets (Core/Fraud NTPJ vs SM tNPS+WoWs vs Content SLA-NTPJ+CSAT), and
+the parity fixes:
 
 * Fix #1 — only week + month grains survive pre-cutover;
 * Fix #2 — the per-grain/team era boundary on the RAW ``date_reference``
   (a January *weekly* bucket already carries Quality for SM and the XPLead grain,
   but NOT for the Core/Fraud XForce grain);
 * Fix #3 — Core/Fraud do NOT coalesce a missing NTPJ (the row is kept with NULL
-  value), while Social Media coalesces every component to 0;
-* Fix #4 — Social-Media-only degenerate squad/district roll-ups.
+  value), while Social Media / Content coalesce every component to 0;
+* Fix #4 — SM/Content degenerate squad/district roll-ups (SM sums counts;
+  Content averages the grain rows' metric_value with a constant-0 denominator).
+
+Content specifics: rows only from Feb 2026 (the legacy save filter drops
+Jan-2026), NTPJ is the higher-is-better SLA metric (``>= 95``; XPLead grain
+``>= 100`` pre-cutover — the legacy quirk), NTPJ + NOcc join from March, and the
+XPLead grain is month-only pre-cutover.
 """
 
 from __future__ import annotations
@@ -336,14 +343,124 @@ class TestDeck:
         assert len(xf_rows) == 2  # one main, one sm
 
 
-class TestGeneral:
-    def test_content_excluded(self, spark):
+class TestContent:
+    def test_march_onward_component_set_and_ratio(self, spark):
+        # a: adh 96(✓) ntpj 96(✓ SLA >=95) nocc 110(✓) csat 96(✓) -> 4/4
+        # b: adh 90(✗) ntpj 90(✗)          nocc 90(✗)  csat 80(✗) -> 0/4 ; 4/8 -> 50%
         out = compute_xpeers_in_target(
-            adherence=frame(spark, [m("adherence", "a", 96, team="content", xforce="ct"),
-                                    m("adherence", "b", 96, team="core", xforce="cf")]),
-            ntpj=frame(spark, [m("ntpj", "b", 90, team="core", xforce="cf")]),
+            adherence=frame(spark, [m("adherence", "a", 96, team="content"),
+                                    m("adherence", "b", 90, team="content")]),
+            ntpj=frame(spark, [m("ntpj", "a", 96, team="content"),
+                               m("ntpj", "b", 90, team="content")]),
+            normalized_occupancy=frame(spark, [
+                m("normalized_occupancy", "a", 110, team="content"),
+                m("normalized_occupancy", "b", 90, team="content")]),
+            content_csat=frame(spark, [m("content_csat", "a", 96, team="content"),
+                                       m("content_csat", "b", 80, team="content")]),
         )
-        assert {r["xforce"] for r in grain_rows(out, METRIC_NAME)} == {"cf"}
+        r = one(out)
+        assert abs(r["numerator"] - 4.0) < 1e-9
+        assert abs(r["denominator"] - 8.0) < 1e-9
+        assert abs(r["metric_value"] - 50.0) < 1e-9
+
+    def test_ntpj_threshold_is_ge_95_sla_direction(self, spark):
+        # Content NTPJ is higher-is-better: 95(✓) 94.9(✗) 100(✓).
+        out = compute_xpeers_in_target(
+            adherence=frame(spark, [m("adherence", a, 50, team="content")
+                                    for a in ("a", "b", "c")]),
+            ntpj=frame(spark, [m("ntpj", "a", 95, team="content"),
+                               m("ntpj", "b", 94.9, team="content"),
+                               m("ntpj", "c", 100, team="content")]),
+        )
+        r = one(out)  # adh 0/3 ; ntpj 2/3 -> 2/6
+        assert abs(r["numerator"] - 2.0) < 1e-9
+        assert abs(r["denominator"] - 6.0) < 1e-9
+
+    def test_february_is_adherence_plus_csat_only(self, spark):
+        # NTPJ + NOcc join only from March; CSAT is in from the start.
+        out = compute_xpeers_in_target(
+            adherence=frame(spark, [m("adherence", "a", 96, team="content", dref=FEB)]),
+            ntpj=frame(spark, [m("ntpj", "a", 96, team="content", dref=FEB)]),
+            normalized_occupancy=frame(spark, [
+                m("normalized_occupancy", "a", 110, team="content", dref=FEB)]),
+            content_csat=frame(spark, [m("content_csat", "a", 96, team="content", dref=FEB)]),
+        )
+        assert abs(one(out)["denominator"] - 2.0) < 1e-9  # adh + csat
+
+    def test_january_2026_dropped(self, spark):
+        # The legacy Content deck's save filter permanently drops Jan-2026.
+        out = compute_xpeers_in_target(
+            adherence=frame(spark, [
+                m("adherence", "a", 96, team="content", dref=JAN),
+                m("adherence", "a", 96, team="content", dref=JAN_WEEK, gran="week")]),
+            ntpj=frame(spark, [m("ntpj", "a", 96, team="content", dref=JAN)]),
+        )
+        assert len(out.take(1)) == 0
+
+    def test_missing_csat_coalesces_to_zero_not_null(self, spark):
+        # Content coalesces every component (SM-style) — no NULL rows.
+        out = compute_xpeers_in_target(
+            adherence=frame(spark, [m("adherence", "a", 96, team="content", dref=FEB)]),
+        )
+        r = one(out)  # adherence only: 1/1
+        assert abs(r["numerator"] - 1.0) < 1e-9
+        assert abs(r["denominator"] - 1.0) < 1e-9
+        assert abs(r["metric_value"] - 100.0) < 1e-9
+
+    def test_xplead_month_only_pre_cutover(self, spark):
+        out = compute_xpeers_in_target_xplead(
+            adherence=frame(spark, [
+                m("adherence", "a", 96, team="content", dref=FEB),
+                m("adherence", "a", 96, team="content", dref=FEB_WEEK, gran="week")]),
+        )
+        assert {r["date_granularity"] for r in grain_rows(out, XPLEAD_METRIC_NAME)} == {
+            "month"
+        }
+
+    def test_xplead_ntpj_ge_100_legacy_quirk(self, spark):
+        # Pre-cutover the Content XPLead grain flags NTPJ >= 100 (not >= 95):
+        # 96 fails, 100 passes.
+        out = compute_xpeers_in_target_xplead(
+            adherence=frame(spark, [m("adherence", a, 50, team="content")
+                                    for a in ("a", "b")]),
+            ntpj=frame(spark, [m("ntpj", "a", 96, team="content"),
+                               m("ntpj", "b", 100, team="content")]),
+        )
+        r = one(out, XPLEAD_METRIC_NAME)  # adh 0/2 ; ntpj 1/2 -> 1/4
+        assert abs(r["numerator"] - 1.0) < 1e-9
+        assert abs(r["denominator"] - 4.0) < 1e-9
+
+    def test_rollups_average_metric_value_with_zero_denominator(self, spark):
+        # Content roll-ups (legacy L5641-5730): numerator = SUM(metric_value),
+        # denominator = COUNT(DISTINCT agent) = 0, metric_value = AVG.
+        # A all-pass (mv 100) + B all-fail (mv 0) -> num 100, den 0, mv 50.
+        out = compute_xpeers_in_target(
+            adherence=frame(spark, [
+                m("adherence", "a", 96, team="content", dref=FEB, xforce="A"),
+                m("adherence", "b", 50, team="content", dref=FEB, xforce="B")]),
+            content_csat=frame(spark, [
+                m("content_csat", "a", 96, team="content", dref=FEB, xforce="A"),
+                m("content_csat", "b", 80, team="content", dref=FEB, xforce="B")]),
+        )
+        for metric in (SQUAD_METRIC_NAME, DISTRICT_METRIC_NAME):
+            r = one(out, metric)
+            assert r["xforce"] is None and r["squad"] is None and r["district"] is None
+            assert abs(r["numerator"] - 100.0) < 1e-9
+            assert abs(r["denominator"] - 0.0) < 1e-9
+            assert abs(r["metric_value"] - 50.0) < 1e-9
+
+    def test_content_and_core_same_xforce_stay_split(self, spark):
+        # Content is its own deck — a shared xforce name does not merge.
+        out = compute_xpeers_in_target(
+            adherence=frame(spark, [m("adherence", "a", 96, team="content", xforce="x"),
+                                    m("adherence", "b", 96, team="core", xforce="x")]),
+            ntpj=frame(spark, [m("ntpj", "a", 96, team="content", xforce="x"),
+                               m("ntpj", "b", 90, team="core", xforce="x")]),
+        )
+        assert len(grain_rows(out, METRIC_NAME)) == 2
+
+
+class TestGeneral:
 
     def test_driver_is_adherence(self, spark):
         out = compute_xpeers_in_target(
