@@ -16,8 +16,14 @@
 --
 -- Scope of this query (what IS done here)
 --   * Parse the sheet's string `timestamp` ('M/d/yyyy H:mm:ss') into a TIMESTAMP.
---   * Derive `date_reference = survey_timestamp - 1 month` — the month the survey is
---     ABOUT (a survey filled in April rates March), matching legacy.
+--   * Derive `date_reference` from the sheet's `mes` label ('Abril 2026' ->
+--     2026-04-01) — the month the survey is ABOUT. The previous rule
+--     (`survey_timestamp - 1 month`) was a proxy that broke for responses filled
+--     more than a month late (e.g. April-cycle surveys submitted in early June
+--     landed in May); the owner switched the OG legacy notebook to `mes` and this
+--     mirrors it. A malformed/unparseable `mes` falls back to the old
+--     timestamp-minus-1-month proxy so a sheet typo degrades gracefully instead
+--     of silently dropping the response.
 --   * Normalize the respondent to an email prefix (lowercased) from `email_address`.
 --   * Expose the 8 raw question scores (1-5) and the separate `nps` score raw.
 --   * Expose the raw `squad` (the supported squad, display form e.g. 'E.M.I.', 'TXN').
@@ -37,7 +43,8 @@
 --
 -- Output schema (one row per survey response)
 --   survey_timestamp        TIMESTAMP  when the survey was filled (parsed)
---   date_reference          TIMESTAMP  survey_timestamp - 1 month (month rated)
+--   date_reference          TIMESTAMP  first of the month rated (from `mes`;
+--                                      fallback survey_timestamp - 1 month)
 --   requested_by            STRING     respondent email prefix, lowercased
 --   email_address           STRING     raw respondent email
 --   squad                   STRING     raw supported squad (display form)
@@ -53,10 +60,54 @@
 --   nps                     BIGINT     separate 0-10 NPS score (not part of CSAT)
 -- =====================================================================================
 
+WITH parsed AS (
+  SELECT
+    TO_TIMESTAMP(timestamp, 'M/d/yyyy H:mm:ss') AS survey_timestamp,
+    -- 'Abril 2026' -> 2026-04-01: the month the survey is ABOUT. NULL when the
+    -- label is missing/malformed (unknown month name or non-numeric year).
+    MAKE_DATE(
+      TRY_CAST(SPLIT(TRIM(mes), ' ')[1] AS INT),
+      CASE LOWER(SPLIT(TRIM(mes), ' ')[0])
+        WHEN 'enero'      THEN 1
+        WHEN 'febrero'    THEN 2
+        WHEN 'marzo'      THEN 3
+        WHEN 'abril'      THEN 4
+        WHEN 'mayo'       THEN 5
+        WHEN 'junio'      THEN 6
+        WHEN 'julio'      THEN 7
+        WHEN 'agosto'     THEN 8
+        WHEN 'septiembre' THEN 9
+        WHEN 'octubre'    THEN 10
+        WHEN 'noviembre'  THEN 11
+        WHEN 'diciembre'  THEN 12
+      END,
+      1
+    ) AS mes_month,
+    LOWER(REGEXP_EXTRACT(email_address, '^[a-zA-Z]+\\.[a-zA-Z]+', 0)) AS requested_by,
+    email_address,
+    squad,
+    mes,
+    facilidad,
+    comprension,
+    comunicacion,
+    calidad,
+    tiempo,
+    manejo_de_cambios,
+    expectativas,
+    aportacion_estrategica,
+    nps
+  FROM gsheets.sheets.mx_content_csat_daniel_anz_temp
+  WHERE timestamp IS NOT NULL
+    AND timestamp != ''
+)
+
 SELECT
-  TO_TIMESTAMP(timestamp, 'M/d/yyyy H:mm:ss')                       AS survey_timestamp,
-  TO_TIMESTAMP(timestamp, 'M/d/yyyy H:mm:ss') - INTERVAL 1 MONTH    AS date_reference,
-  LOWER(REGEXP_EXTRACT(email_address, '^[a-zA-Z]+\\.[a-zA-Z]+', 0)) AS requested_by,
+  survey_timestamp,
+  COALESCE(
+    CAST(mes_month AS TIMESTAMP),
+    survey_timestamp - INTERVAL 1 MONTH
+  )                                                                 AS date_reference,
+  requested_by,
   email_address,
   squad,
   mes,
@@ -69,8 +120,6 @@ SELECT
   expectativas,
   aportacion_estrategica,
   nps
-FROM gsheets.sheets.mx_content_csat_daniel_anz_temp
-WHERE timestamp IS NOT NULL
-  AND timestamp != ''
-  AND (TO_TIMESTAMP(timestamp, 'M/d/yyyy H:mm:ss') - INTERVAL 1 MONTH) >= :period_start
-  AND (TO_TIMESTAMP(timestamp, 'M/d/yyyy H:mm:ss') - INTERVAL 1 MONTH) <= :period_end
+FROM parsed
+WHERE COALESCE(CAST(mes_month AS TIMESTAMP), survey_timestamp - INTERVAL 1 MONTH) >= :period_start
+  AND COALESCE(CAST(mes_month AS TIMESTAMP), survey_timestamp - INTERVAL 1 MONTH) <= :period_end
