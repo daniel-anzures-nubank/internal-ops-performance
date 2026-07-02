@@ -14,8 +14,17 @@ This script is a thin orchestrator. The math lives in
   4. Either print a summary (``--dry-run``) or replace the target Delta table.
 
 jobs_raw is a RAW per-job feed (no aggregation, no monthly benchmark — those
-move to the metrics layer), so it only needs the requested period; there is
-no rolling-baseline lookback here (the metrics layer reads its own look-back).
+move to the metrics layer). The table is materialized with a
+**BENCHMARK_LOOKBACK_MONTHS look-back before ``--period-start``**: the NTPJ
+builds (``build_ntpj`` / ``build_normalized_time_per_job``) read this TABLE
+with their own trailing-window look-back (months <= 2026-03 use ``M-4 … M``,
+and the improved_benchmarks substrate emits ``period_start − 1`` month), so the
+rows must exist here or those windows silently collapse to the period. That is
+exactly what regressed the 2026-07-01 full run: rebuilding this table with
+``period_start = 2026-01-01`` dropped the 2025 look-back rows a prior
+``extend_jobs_2025`` run had materialized, and every Jan–Mar 2026 NTPJ
+benchmark shrank to a 2026-only window. Six months covers the deepest need
+(the ``period_start − 1`` substrate month needs jobs from ``period_start − 5``).
 
 Missing DIME slots
 ------------------
@@ -95,6 +104,21 @@ LOGGER = logging.getLogger("cx_metrics.jobs_raw")
 
 DEFAULT_TARGET = "usr.danielanzures.io_jobs_raw"
 
+# Extra months MATERIALIZED before --period-start so the NTPJ trailing-window
+# benchmark reads (build_ntpj: M-4 … M for months <= 2026-03) and the
+# improved_benchmarks substrate month (period_start − 1, whose window reaches
+# period_start − 5) find their source rows in this table. See the module
+# docstring — without this the downstream look-back reads silently return
+# nothing and the early-2026 benchmarks collapse to period-only windows.
+BENCHMARK_LOOKBACK_MONTHS = 6
+
+
+def _lookback_start(period_start: date) -> date:
+    """First day of the month BENCHMARK_LOOKBACK_MONTHS before period_start."""
+    total = period_start.year * 12 + (period_start.month - 1) - BENCHMARK_LOOKBACK_MONTHS
+    year, month = divmod(total, 12)
+    return date(year, month + 1, 1)
+
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -167,21 +191,28 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("--period-end must be >= --period-start")
         return 2
 
+    lookback_start = _lookback_start(args.period_start)
+    LOGGER.info(
+        "Materializing benchmark look-back: reading from %s (%s months before "
+        "--period-start %s)",
+        lookback_start, BENCHMARK_LOOKBACK_MONTHS, args.period_start,
+    )
+
     with _log_step("agent_information"):
         roster = run_extractor(
-            spark, "agent_information", args.period_start, args.period_end
+            spark, "agent_information", lookback_start, args.period_end
         )
 
     with _log_step("dime_slots"):
-        dime = run_extractor(spark, "dime_slots", args.period_start, args.period_end)
+        dime = run_extractor(spark, "dime_slots", lookback_start, args.period_end)
 
     with _log_step("shuffle_jobs"):
         shuffle_jobs = run_extractor(
-            spark, "shuffle_jobs", args.period_start, args.period_end
+            spark, "shuffle_jobs", lookback_start, args.period_end
         )
 
     with _log_step("oos_jobs"):
-        oos_jobs = run_extractor(spark, "oos_jobs", args.period_start, args.period_end)
+        oos_jobs = run_extractor(spark, "oos_jobs", lookback_start, args.period_end)
 
     with _log_step("compute_jobs_raw"):
         result = compute_jobs_raw(roster, dime, shuffle_jobs, oos_jobs)
@@ -226,7 +257,9 @@ def main(argv: list[str] | None = None) -> int:
             args.target,
             IO_JOBS_RAW_SCHEMA,
             layer="metrics_data",
-            period_start=args.period_start,
+            # Registry records the WRITTEN window (incl. the materialized
+            # look-back), not the requested period — the table truly holds it.
+            period_start=lookback_start,
             period_end=args.period_end,
             run_id=args.run_id,
             snapshot=not args.no_snapshot,
