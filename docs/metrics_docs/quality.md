@@ -29,36 +29,52 @@ one row per evaluation (Playvox + Sprinklr SM), carrying `evaluation_id`,
 
 ## Steps applied here (deferred by the raw layer)
 
-1. **Latest record per `evaluation_id`** — legacy `ROW_NUMBER() OVER (PARTITION
-   BY evaluation_id ORDER BY created_at DESC)`, keep rn=1. The raw table only
-   carries day-grain `date` (not the original `created_at`), so we keep the row
-   with the latest `date` per `evaluation_id`.
-   > **Caveat:** same-day re-scores can't be ordered finer than the day. If exact
-   > parity is needed, thread `created_at`/`updated_at` through the raw table.
-2. **Drop Content** (`team == 'content'`).
-3. Drop rows with a null `qa_score`.
+1. **Team-scoped blacklists** (date < 2026-07-01): Core/Fraud drop
+   `scorecard_id` / `evaluation_id` in the legacy blacklists; Social Media
+   drops only its single blacklisted `scorecard_id`. Cutover-gated — lifted
+   from 2026-07-01 onward.
+2. **Latest record per `(source, evaluation_id)`** by `created_at DESC` —
+   legacy `ROW_NUMBER() OVER (PARTITION BY evaluation_id ORDER BY
+   local_mx_evaluation__created_at DESC)`, keep rn=1. Deduped within each
+   source (legacy dedups inside each single-source notebook); the Playvox and
+   Sprinklr id spaces are disjoint, so cross-source dedup is a no-op.
+3. **Drop Content** (`team == 'content'`).
+4. Drop rows with a null `qa_score`.
 
-## Sources (Playvox + Sprinklr SM)
+**No date drops.** No outage-date exclusion is applied: the 2026-06-30 legacy
+re-export re-included the 2026-03-27 / 2026-04-09 quality rows (the published
+`usr.mx__cx.quality_io` and `usr.danielanzures.sm_temp_quality` both carry
+those dates), so current legacy drops no quality dates and neither do we. An
+earlier revision dropped them (ported from a pre-re-export legacy snapshot);
+reverted for parity.
 
-Quality unions two feeds in the raw layer, tagged by a `source` column:
+## Sources (Playvox + Sprinklr SM — a union, like legacy)
 
-- **Playvox** (`qmo_playvox_consolidated`) — Core / Fraud / Content, and
-  historically Social Media.
+Quality unions two feeds in the raw layer, tagged by a `source` column,
+matching legacy's SM deck `qa_base` (`[IO] Performance 2026 - Social Media
+Temp Fix.sql`, lines 2988-3028):
+
+- **Playvox** (`qmo_playvox_consolidated`) — Core / Fraud / Content / Social
+  Media. **No upper date bound** (legacy's Playvox branch has no SM/May cutoff;
+  SM Playvox evaluations keep flowing until they naturally end after
+  2026-05-15).
 - **Sprinklr SM** (`social_media_case_summary_information`) — Social-Media case
-  QA, from `2026-05-01` onward.
+  QA, **floored at `2026-05-01`** (legacy `sm.report_date >= "2026-05-01"`,
+  line 3025).
 
-Legacy carried the Sprinklr `UNION ALL` only in the Core/Fraud dataset, where it
-was **dead code** — the active-roster join excluded `social`, so none ever
-reached `usr.mx__cx.quality_io`. The new pipeline keeps social agents in the
-roster, so the Sprinklr SM rows now actually score SM Quality. Both feeds are on
-the same 0-100 scale and are averaged together here regardless of `source`
-(additive — a social agent with both Playvox and Sprinklr evaluations
-contributes both).
+Both feeds are on the same 0-100 scale and are averaged together here
+regardless of `source` (additive — in early May a social agent with both
+Playvox and Sprinklr evaluations contributes both, exactly like legacy). The
+Core/Fraud Quality dataset also carries the Sprinklr `UNION ALL`, but there it
+is **dead code** — its active-roster join excludes `social`, so none ever
+reached `usr.mx__cx.quality_io`; the SM deck's union is the live one.
 
-## Deferred to the future Adjustments layer (NOT applied here)
+## Applied blacklists / no date drops
 
-- The `scorecard_id` / `evaluation_id` blacklists.
-- Outage-date exclusions (2026-03-27, 2026-04-09).
+- The team-scoped `scorecard_id` / `evaluation_id` blacklists ARE applied here
+  (hardcoded, cutover-gated to date < 2026-07-01) — see step 1 above.
+- **No outage-date exclusions.** The 2026-06-30 legacy re-export re-included
+  the 2026-03-27 / 2026-04-09 quality rows, so no quality dates are dropped.
 
 ## Output schema (one row per agent per period)
 

@@ -4,34 +4,34 @@ This is a RAW dataset, not a finished metric. It exposes every QA evaluation
 attributed to an active roster agent, one row per evaluation, with its score. A
 downstream ``metrics`` layer (``metrics/quality.py``) dedups latest-per-
 ``evaluation_id`` (within each source), drops Content, applies the legacy
-blacklists / outage-date exclusions, and averages the raw ``qa_score`` values
-into the Quality score at whatever grain it wants.
+blacklists, and averages the raw ``qa_score`` values into the Quality score at
+whatever grain it wants.
 
-Sources (Core/Fraud Playvox; Social-Media Playvox→Sprinklr switch)
-------------------------------------------------------------------
+Sources (Playvox + Sprinklr SM — a UNION, matching legacy)
+----------------------------------------------------------
 * **Playvox** (``qmo_playvox_consolidated``) — Quality of record for Core and
-  Fraud (always), and for Social Media **before** ``SPRINKLR_SM_CUTOVER``.
+  Fraud, and Social Media's original QA feed. **No upper date bound**: legacy's
+  Playvox branch carries no SM/May cutoff (SM Playvox evaluations keep flowing
+  until they naturally end after 2026-05-15), and neither does ours.
 * **Sprinklr SM** (``social_media_case_summary_information``) — Social-Media
-  case QA. SM QA evaluations migrated Playvox→Sprinklr in May 2026, so SM quality
-  **switches source** at ``SPRINKLR_SM_CUTOVER`` (2026-05-01): Playvox for SM
-  evaluations dated ``< 2026-05-01``, Sprinklr for ``>= 2026-05-01``. Both feeds
-  report ``qa_score`` on the same 0-100 scale. A ``source`` column ('playvox' /
-  'sprinklr_sm') tags each row's provenance.
+  case QA, **floored at 2026-05-01** (``SPRINKLR_SM_CUTOVER``), matching
+  legacy's Sprinklr branch (``sm.report_date >= "2026-05-01"``, ``[IO]
+  Performance 2026 - Social Media Temp Fix.sql`` ``qa_base`` line 3025). Both
+  feeds report ``qa_score`` on the same 0-100 scale. A ``source`` column
+  ('playvox' / 'sprinklr_sm') tags each row's provenance.
 
-Note: SM source switch is a clean SWITCH, not a union — and an enhancement
--------------------------------------------------------------------------
-This is a deliberate enhancement BEYOND legacy, not a byte-for-byte SM parity
-claim. Legacy SM quality (``[IO] Performance 2026 - Social Media.sql`` ``qa_base``,
-line 2916) is **Playvox-only** (Sprinklr is used in that notebook only for
-occupancy/tNPS, never quality), so it goes dark when SM-agent Playvox evals stop
-mid-May 2026. We instead follow the real source migration: SM uses Sprinklr from
-2026-05-01 on. To keep this a clean switch, Playvox Social-Media rows dated on/
-after the cutover are dropped (see ``compute_quality_evaluations``) so they never
-coexist with the Sprinklr SM rows and double-count. Consequence:
-  * SM Jan–Apr 2026 = Playvox → matches legacy.
-  * SM May 2026+ = Sprinklr → intentionally does NOT match legacy's Playvox-only
-    SM table.
-This parallels the accepted SM Normalized-Occupancy / Sprinklr precedent.
+Note: the two sources UNION (legacy parity) — there is NO source switch
+-----------------------------------------------------------------------
+Legacy SM quality (``[IO] Performance 2026 - Social Media Temp Fix.sql``
+``qa_base``, lines 2988-3028) ``UNION ALL``s the two branches: Playvox is
+unbounded and Sprinklr starts at 2026-05-01, so in early May an SM agent can
+contribute BOTH a Playvox and a Sprinklr evaluation to the same period's mean.
+We reproduce that union exactly — Playvox Social-Media rows dated on/after
+2026-05-01 are **kept**. (An earlier revision implemented a "clean switch" that
+dropped them; reverted for legacy parity.) Double-counting is not a concern:
+the metric layer dedups latest-per-``evaluation_id`` within each source, and
+the Playvox ``evaluation__id`` / Sprinklr ``case_number`` id spaces are
+disjoint, so cross-source dedup is a no-op.
 
 Public API
 ----------
@@ -62,9 +62,14 @@ Filters deferred to the metrics layer (``metrics/quality.py``, NOT applied here)
 -------------------------------------------------------------------------------
 * The team-scoped ``scorecard_id`` / ``evaluation_id`` blacklists. ``scorecard_id``
   is carried through this raw table so the metric layer can apply them.
-* The team-asymmetric outage-date exclusions (2026-03-27, 2026-04-09).
 * Latest-per-``evaluation_id`` dedup (per source), Content exclusion, and the
   ``COUNT(DISTINCT evaluation_id)`` denominator.
+
+No dates are dropped for quality — anywhere. The 2026-06-30 legacy re-export
+re-included the 2026-03-27 / 2026-04-09 outage rows (the published
+``usr.mx__cx.quality_io`` and ``usr.danielanzures.sm_temp_quality`` both carry
+those dates), so neither this raw layer nor the metric layer applies any
+quality date drop.
 
 Output schema (one row per evaluation)
 --------------------------------------
@@ -107,23 +112,17 @@ QUALITY_OUT_OF_SCOPE_SQUADS: tuple[str, ...] = ()
 SOURCE_PLAYVOX = "playvox"
 SOURCE_SPRINKLR_SM = "sprinklr_sm"
 
-# Performance team string for Social Media (note the space). Used to scope the
-# SM Playvox->Sprinklr source switch to social-team rows only.
-SOCIAL_MEDIA_TEAM = "social media"
-
 # Sprinklr SM scorecard literal (legacy SM ``qa_base`` Sprinklr branch assigns
 # this constant). Carried so the metric-layer blacklist sees a stable value.
 SPRINKLR_SCORECARD_ID = "SprinklrScorecardV1"
 
-# Social Media QA evaluations MIGRATED from Playvox to Sprinklr in May 2026. SM
-# quality therefore SWITCHES source at this date: Playvox for evaluations dated
-# < 2026-05-01, Sprinklr for >= 2026-05-01. This is a clean switch, NOT a union —
-# Playvox SM rows on/after the switch are dropped (see ``compute_quality_evaluations``)
-# so they never coexist with Sprinklr SM and double-count. The Sprinklr feed is
-# floored here (and in the extractor) to >= this date; below it there are no
-# Sprinklr rows so SM stays Playvox. This is a deliberate enhancement beyond legacy
-# (whose SM quality is Playvox-only and goes dark when SM-agent Playvox evals stop
-# mid-May), paralleling the accepted SM Normalized-Occupancy / Sprinklr precedent.
+# Floor of the Sprinklr SM feed (SM QA started being logged in Sprinklr in May
+# 2026). Matches legacy's Sprinklr branch ``sm.report_date >= "2026-05-01"``
+# ([IO] Performance 2026 - Social Media Temp Fix.sql qa_base line 3025); the
+# extractor hard-floors it too, and it is re-applied here defensively. This is
+# a FLOOR on the Sprinklr feed only — Playvox is NOT cut off at this date: the
+# two sources UNION, exactly like legacy, and SM Playvox evaluations keep
+# flowing until they naturally end after 2026-05-15.
 SPRINKLR_SM_CUTOVER: date = date(2026, 5, 1)
 
 # Legacy affiliation regex (Playvox path): lowercase "first.last" with an
@@ -195,14 +194,12 @@ def compute_quality_evaluations(
     """End-to-end quality_evaluations pipeline (one row per evaluation).
 
     ``sprinklr_sm`` is the optional Sprinklr SM case-QA feed; when provided, its
-    rows on/after :data:`SPRINKLR_SM_CUTOVER` (2026-05-01) are unioned on top of
-    Playvox (tagged ``source='sprinklr_sm'``).
+    rows on/after :data:`SPRINKLR_SM_CUTOVER` (2026-05-01, the feed's floor) are
+    unioned on top of Playvox (tagged ``source='sprinklr_sm'``).
 
-    Social Media quality SWITCHES source at the cutover (Playvox < 2026-05-01,
-    Sprinklr >= 2026-05-01); to keep it a clean switch rather than a union, Playvox
-    Social-Media rows dated on/after the cutover are DROPPED here so they cannot
-    coexist with the Sprinklr SM rows. The switch is scoped to the Social-Media
-    team only (roster ``team = 'social media'``); Core/Fraud are always Playvox.
+    The two sources UNION, matching legacy: the Playvox branch has no upper date
+    bound (SM Playvox evaluations dated on/after 2026-05-01 are KEPT), and the
+    Sprinklr branch is floored at 2026-05-01. No dates are dropped.
     """
     spark = playvox.sparkSession
 
@@ -262,18 +259,6 @@ def compute_quality_evaluations(
     enriched = evals.withColumn(
         "snapshot_month", F.trunc(F.to_date(F.col("date")), "month")
     ).join(roster, on=["agent", "snapshot_month"], how="inner")
-
-    # SM source switch (NOT a union): for the Social-Media team, evaluations dated
-    # on/after the cutover come from Sprinklr only — drop the Playvox SM rows on/
-    # after 2026-05-01 so the two sources never coexist and double-count. SM is
-    # identified by the roster ``team`` ('social media', with a space), consistent
-    # with the metric layer. Core/Fraud (and pre-cutover SM) keep Playvox.
-    sm_playvox_after_switch = (
-        (F.lower(F.col("team")) == F.lit(SOCIAL_MEDIA_TEAM))
-        & (F.col("source") == F.lit(SOURCE_PLAYVOX))
-        & (F.to_date(F.col("date")) >= F.lit(SPRINKLR_SM_CUTOVER))
-    )
-    enriched = enriched.filter(~sm_playvox_after_switch)
 
     out = enriched.select(
         "agent",

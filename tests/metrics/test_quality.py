@@ -3,7 +3,8 @@
 Small synthetic Spark frames mimicking ``io_quality_evaluations_raw``, no
 warehouse. We verify the mean-score math, the latest-per-(source, evaluation_id)
 dedup by ``created_at DESC``, the Content exclusion, null-score handling, the
-team-scoped blacklists, the team-asymmetric outage-date exclusion, the
+team-scoped blacklists, the no-date-drop rule (the 2026-06-30 legacy re-export
+re-included the 03-27/04-09 outage rows, so no quality dates are dropped), the
 cross-source id-collision guard, the distinct-evaluation denominator, and the
 output contract.
 """
@@ -329,8 +330,12 @@ class TestTeamScopedBlacklists:
         assert day["metric_value"] == 50.0
 
 
-class TestTeamAsymmetricOutage:
-    def test_core_fraud_drops_both_outage_dates(self, spark):
+class TestNoDateDrops:
+    # The 2026-06-30 legacy re-export re-included the 2026-03-27 / 2026-04-09
+    # outage rows (published quality_io / sm_temp_quality carry both dates), so
+    # current legacy drops NO quality dates — and neither do we.
+
+    def test_core_fraud_keeps_former_outage_dates(self, spark):
         out = compute_quality(
             make_raw(
                 spark,
@@ -349,11 +354,11 @@ class TestTeamAsymmetricOutage:
         )
         days = {r["date_reference"]: r for r in
                 out.filter(out["date_granularity"] == "day").collect()}
-        assert dt.date(2026, 3, 27) not in days
-        assert dt.date(2026, 4, 9) not in days
+        assert days[dt.date(2026, 3, 27)]["metric_value"] == 10.0
+        assert days[dt.date(2026, 4, 9)]["metric_value"] == 20.0
         assert days[dt.date(2026, 4, 10)]["metric_value"] == 90.0
 
-    def test_social_media_keeps_april_9_drops_march_27(self, spark):
+    def test_social_media_keeps_former_outage_dates(self, spark):
         out = compute_quality(
             make_raw(
                 spark,
@@ -369,12 +374,10 @@ class TestTeamAsymmetricOutage:
         )
         days = {r["date_reference"]: r for r in
                 out.filter(out["date_granularity"] == "day").collect()}
-        assert dt.date(2026, 3, 27) not in days
+        assert days[dt.date(2026, 3, 27)]["metric_value"] == 10.0
         assert days[dt.date(2026, 4, 9)]["metric_value"] == 88.0
 
-    def test_outage_not_applied_after_cutover(self, spark):
-        # 2026-03-27 is pre-cutover so still dropped; a hypothetical future date is
-        # never an outage date — covered by date-list, this just guards the gate.
+    def test_post_cutover_dates_kept(self, spark):
         out = compute_quality(
             make_raw(
                 spark,
@@ -387,3 +390,31 @@ class TestTeamAsymmetricOutage:
         )
         day = _day_one(out)
         assert day["metric_value"] == 91.0
+
+
+class TestPlayvoxSprinklrUnion:
+    def test_sm_playvox_and_sprinklr_union_in_may(self, spark):
+        # Legacy UNION ALL: in early May an SM agent contributes BOTH a Playvox
+        # and a Sprinklr evaluation to the same period's mean — including a
+        # Playvox SM evaluation dated 2026-05-10, which SURVIVES (no source
+        # switch drops it).
+        out = compute_quality(
+            make_raw(
+                spark,
+                [
+                    {"agent": "s.one", "team": "social media", "squad": "social",
+                     "source": "playvox", "evaluation_id": "pv-may",
+                     "date": dt.date(2026, 5, 10),
+                     "created_at": dt.datetime(2026, 5, 10, 9, 0),
+                     "qa_score": 80.0},
+                    {"agent": "s.one", "team": "social media", "squad": "social",
+                     "source": "sprinklr_sm", "evaluation_id": "spr-may",
+                     "date": dt.date(2026, 5, 10),
+                     "created_at": dt.datetime(2026, 5, 10, 10, 0),
+                     "qa_score": 100.0},
+                ],
+            )
+        )
+        day = _day_by_agent(out)["s.one"]
+        assert day["denominator"] == 2
+        assert day["metric_value"] == 90.0

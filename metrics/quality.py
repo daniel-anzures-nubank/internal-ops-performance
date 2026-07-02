@@ -15,19 +15,21 @@ evaluation scores. **Content is excluded**: its quality of record is the separat
 **Quality (CSAT)** metric. ``compute_quality`` excludes only ``team == 'content'``;
 the social team string is ``'social media'`` (with a space).
 
-Sources (Playvox + Sprinklr SM)
--------------------------------
+Sources (Playvox + Sprinklr SM — a union, like legacy)
+------------------------------------------------------
 Quality is scored from two feeds prepared by the raw layer
-(``io_quality_evaluations_raw``): Playvox (Core / Fraud, and Social Media before
-2026-05-01) and Sprinklr SM (Social-Media case QA on/after 2026-05-01). SM quality
-SWITCHES source Playvox->Sprinklr at 2026-05-01 (the raw layer drops Playvox SM
-rows on/after that date); Core/Fraud are always Playvox. The raw table carries a
-``source`` column ('playvox' / 'sprinklr_sm'). Dedup here is **per (source,
-evaluation_id)** so a Playvox ``evaluation__id`` and a Sprinklr ``case_number``
-can never collide and silently drop a row (legacy dedups within each single-source
-notebook). NOTE: the SM-source switch (2026-05-01) is an enhancement beyond legacy
-and is independent of ``QUALITY_CUTOVER`` (2026-07-01), which gates only the
-legacy blacklist / outage quirks below.
+(``io_quality_evaluations_raw``), **unioned exactly like legacy** (``[IO]
+Performance 2026 - Social Media Temp Fix.sql`` ``qa_base``, lines 2988-3028):
+Playvox (Core / Fraud / Social Media, **no upper date bound** — SM Playvox
+evaluations keep flowing until they naturally end after 2026-05-15) and Sprinklr
+SM (Social-Media case QA, floored at 2026-05-01 like legacy's ``sm.report_date
+>= "2026-05-01"``). In early May an SM agent can contribute BOTH a Playvox and
+a Sprinklr evaluation to the same period's mean — that is legacy behavior, not
+double-counting. The raw table carries a ``source`` column ('playvox' /
+'sprinklr_sm'). Dedup here is **per (source, evaluation_id)** so a Playvox
+``evaluation__id`` and a Sprinklr ``case_number`` can never collide and
+silently drop a row (legacy dedups within each single-source notebook; the two
+id spaces are disjoint, so cross-source dedup is a no-op).
 
 Input
 -----
@@ -45,12 +47,12 @@ Legacy parity steps applied here (deferred by the raw layer)
     - Social Media (``[IO] Performance 2026 - Social Media.sql`` ``qa_base``,
       line 2920): drop ONLY ``scorecard_id == SM_BLACKLIST_SCORECARD_ID`` — NO
       evaluation_id blacklist.
-* **Team-asymmetric outage-date exclusion** (date < 2026-07-01), verified
-  against legacy:
-    - Core / Fraud (``qa_score_2026``, line 233; ``qa_score_2025``): drop
-      ``date IN (2026-03-27, 2026-04-09)`` AFTER the dedup.
-    - Social Media (``qa_deduped``, line 2931): drop ONLY ``2026-03-27``, BEFORE
-      the dedup (the filter sits in the ROW_NUMBER CTE's WHERE).
+* **NO date drops** — no outage-date exclusion is applied. The 2026-06-30
+  legacy re-export re-included the 2026-03-27 / 2026-04-09 outage rows: the
+  published ``usr.mx__cx.quality_io`` and ``usr.danielanzures.sm_temp_quality``
+  (both rebuilt 2026-07-01/02) carry rows on both dates, so current legacy
+  drops no quality dates and neither do we. (An earlier revision dropped them,
+  ported from a pre-re-export legacy snapshot; reverted for parity.)
 * **Latest record per (source, evaluation_id)** by ``created_at DESC`` (legacy
   ``ROW_NUMBER() OVER (PARTITION BY evaluation_id ORDER BY
   local_mx_evaluation__created_at DESC)``, keep rn=1).
@@ -86,11 +88,11 @@ METRIC_NAME = "quality"
 EXCLUDED_TEAMS: tuple[str, ...] = ("content",)
 
 # Performance team string for Social Media (note the space). Used to scope the
-# team-asymmetric blacklist / outage rules.
+# team-asymmetric blacklist rules.
 SOCIAL_MEDIA_TEAM = "social media"
 
-# Cutover before which the legacy QA quirks (blacklists, outage drops) apply.
-# From this date onward they are dropped (corrections take effect).
+# Cutover before which the legacy QA blacklists apply. From this date onward
+# they are dropped (corrections take effect).
 QUALITY_CUTOVER: date = date(2026, 7, 1)
 
 # --- Team-scoped blacklists (legacy QA artifacts, pre-cutover only) ---------
@@ -113,11 +115,6 @@ BLACKLIST_EVALUATION_IDS: tuple[str, ...] = (
 # Social Media — legacy/[IO] Performance 2026 - Social Media.sql qa_base
 #   scorecard__id NOT IN ("68def79b3f83da8cc9cb5299")  (line 2920); NO eval_id list.
 SM_BLACKLIST_SCORECARD_IDS: tuple[str, ...] = ("68def79b3f83da8cc9cb5299",)
-
-# --- Team-asymmetric outage dates (legacy "general access problems") --------
-# Core / Fraud drop both; Social Media drops only 2026-03-27.
-OUTAGE_DATES_CORE_FRAUD: tuple[date, ...] = (date(2026, 3, 27), date(2026, 4, 9))
-OUTAGE_DATES_SOCIAL_MEDIA: tuple[date, ...] = (date(2026, 3, 27),)
 
 
 def _is_social_media(col: "F.Column") -> "F.Column":
@@ -143,16 +140,6 @@ def _apply_blacklists(evals: DataFrame) -> DataFrame:
 
     blacklisted = pre_cutover & F.when(is_sm, sm_hit).otherwise(core_fraud_hit)
     return evals.filter(~blacklisted)
-
-
-def _outage_mask(team_col: "F.Column", date_col: "F.Column") -> "F.Column":
-    """True where the row is on a team-scoped outage date AND pre-cutover."""
-    cal = F.to_date(date_col)
-    pre_cutover = cal < F.lit(QUALITY_CUTOVER)
-    is_sm = _is_social_media(team_col)
-    sm_outage = cal.isin(list(OUTAGE_DATES_SOCIAL_MEDIA))
-    cf_outage = cal.isin(list(OUTAGE_DATES_CORE_FRAUD))
-    return pre_cutover & F.when(is_sm, sm_outage).otherwise(cf_outage)
 
 
 def _dedup_latest_per_evaluation(evals: DataFrame) -> DataFrame:
@@ -194,23 +181,10 @@ def compute_quality(quality_evaluations: DataFrame) -> DataFrame:
     # blacklisted revision must not be eligible to win the dedup.
     evals = _apply_blacklists(evals)
 
-    # Outage ordering is team-asymmetric:
-    #   * Social Media (legacy qa_deduped, line 2931) filters 2026-03-27 INSIDE the
-    #     ROW_NUMBER CTE -> the outage filter applies BEFORE the dedup.
-    #   * Core / Fraud (legacy qa_score_2026, line 233) filters the outage dates in
-    #     the post-dedup aggregation CTE -> AFTER the dedup.
-    # An evaluation_id belongs to exactly one team, so we split the filter around
-    # the dedup by team.
-    is_sm = _is_social_media(F.col("team"))
-    sm_pre_dedup_drop = is_sm & _outage_mask(F.col("team"), F.col("date"))
-    evals = evals.filter(~sm_pre_dedup_drop)
-
+    # No outage-date drops: the 2026-06-30 legacy re-export re-included the
+    # 2026-03-27 / 2026-04-09 rows, so current legacy drops no quality dates
+    # and neither do we (see module docstring).
     evals = _dedup_latest_per_evaluation(evals)
-
-    # Core/Fraud outage drop (post-dedup). SM was already filtered above; guard
-    # against double-applying by scoping to non-SM here.
-    cf_post_dedup_drop = (~is_sm) & _outage_mask(F.col("team"), F.col("date"))
-    evals = evals.filter(~cf_post_dedup_drop)
 
     if len(evals.take(1)) == 0:
         return empty_metric_frame(spark)
