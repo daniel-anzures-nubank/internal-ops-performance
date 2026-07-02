@@ -54,7 +54,10 @@ into this one table via the same per-slot overlap logic:
   - `dimensioned_activity IN ('Control MC', 'xMC Debit Fraud')` →
     `activity_type_required = 'oos'`
   - `activity_type_required = 'dime_invalid_notation'` →
-    `activity_type_required = 'oos'`
+    `activity_type_required = 'oos'` — **except** SM DIME slots
+    (`agent_dime_squad IN ('social', 'social_social')`) dated before
+    `2026-07-01`, which are **dropped** instead (legacy SM scoring rule 3
+    below).
 - **DIME fixed legacy filters** (applied at the slot stage, so both the agent
   occupancy and the per-squad benchmark exclude them — legacy NOcc dataset
   lines 234–236):
@@ -71,7 +74,7 @@ into this one table via the same per-slot overlap logic:
   with a NULL assignment/unassignment time (no measurable interval).
 - **Roster**: `status = 'active'` (inner join on `(agent, snapshot_month)`).
 
-## Social-Media occupancy (ON for all dates) and the empty-slot 1800 rule
+## Social-Media occupancy (ON for all dates) and legacy SM scoring (pre-2026-07-01)
 
 Legacy's main NOcc dataset excluded `agent_dime_squad = 'social'` DIME slots
 and had no Sprinklr source, but the **Social-Media deck**
@@ -80,24 +83,57 @@ occupancy from Sprinklr case assignments. The new code keeps `social` DIME
 slots and unions `sm_jobs` on **all dates**, so Social-Media occupancy is
 populated for the whole history.
 
-**Empty-slot full credit (pre-cutover parity quirk).** The legacy SM deck
-counts a dimensioned SM slot with **no** overlapping matching-activity Sprinklr
-case as **fully occupied**: `occupancy_agg` (lines 1123–1135) computes
+To reproduce the published legacy SM Normalized Occupancy **byte-for-byte**
+for slot dates before the parity cutover, four legacy SM scoring quirks are
+gated on the same condition — `agent_dime_squad IN ('social', 'social_social')`
+(the squads the legacy deck scores, line 1065; constant `SM_DIME_SQUADS`) AND
+slot date **before** `SM_EMPTY_SLOT_FULL_CREDIT_CUTOVER` (`2026-07-01`).
+On/after the cutover the corrected behavior applies everywhere.
+
+**1. Empty-slot full credit.** The legacy SM deck counts a dimensioned SM slot
+with **no** overlapping matching-activity Sprinklr case as **fully occupied**:
+`occupancy_agg` (lines 1123–1135) computes
 `SUM(CASE WHEN activity_occuped = 1 THEN duration END)` — NULL when no
 overlapping case matches the slot's activity type — and the downstream
 `CASE WHEN SUM(occupancy_time) <= 1800 THEN SUM(occupancy_time) ELSE 1800 END`
 (lines 1189 / 1223) evaluates `NULL <= 1800` to NULL, falling through to
 `ELSE 1800` (seconds = the full 30-minute slot). Partially covered slots keep
 their actual overlap seconds; only slots with zero matching cases get the 1800
-default. The rule is reproduced here for SM DIME slots
-(`agent_dime_squad IN ('social', 'social_social')` — the squads the legacy deck
-scores, line 1065) dated **before** `SM_EMPTY_SLOT_FULL_CREDIT_CUTOVER`
-(`2026-07-01`), restricted to legacy's slot universe: its DIME filter (lines
+default. Restricted to legacy's slot universe: its DIME filter (lines
 1064 / 1079) drops `lunch_break` / `dime_invalid_notation` / `time_off` /
 `shrinkage`, and eligibility is decided on the **pre-reclass**
 `activity_type_required` (this module relabels `dime_invalid_notation` to
-`'oos'`, but legacy never scored those slots). On/after the cutover the
-corrected behavior applies: an empty slot is 0.
+`'oos'`, but legacy never scored those slots). On/after the cutover an empty
+slot is 0.
+
+**2. No-dedup occupied sum.** Legacy has **no interval dedup** of overlapping
+Sprinklr assignments: `occupancy_base` (lines 1103–1121) clips each job to the
+slot and `occupancy_agg` (lines 1123–1135) sums those RAW clipped durations
+as-is; the downstream 1800 cap (lines 1189 / 1223) bounds the slot —
+`occ = LEAST(Σ clip(job), 1800)`. Reproduced for SM pre-cutover slots that
+**have** a matching overlap (verified byte-exact against published legacy on
+real data: half-open clipping + `Σ(cjob_end − cjob_start)` capped at 1800).
+Non-SM slots (all dates) and SM slots on/after the cutover keep the
+`prev_max_end` interval dedup.
+
+**3. `dime_invalid_notation` slots are dropped, not reclassified.** Legacy's
+SM DIME filter (line 1064) removes `dime_invalid_notation` slots from the
+universe entirely — they never reach the numerator **or** the denominator —
+whereas this module normally reclassifies them to `'oos'`. `filter_dime`
+therefore filters OUT SM pre-cutover `dime_invalid_notation` slots (decided on
+the pre-reclass value); non-SM squads and post-cutover SM slots keep the
+reclassify behavior.
+
+**4. Only social DIME squads are in scope for SM-team agents.** Legacy scores
+ONLY slots whose `agent_dime_squad` is `social` / `social_social` for the SM
+deck (line 1065), so an SM-team agent's slots from **other** DIME squads (e.g.
+`collections`, `1err`) are out of scope pre-cutover. The performance `team` is
+only known after the roster join, so `compute_slot_occupancy` tags each slot
+with a `non_sm_dime_squad_pre_cutover` boolean (DIME squad NOT in
+`SM_DIME_SQUADS` AND date < cutover) and `compute_occupancy_time` drops the
+tagged rows where `team = 'social media'` post-join (the flag never reaches
+the output schema). Non-SM teams keep all their slots on all dates; SM keeps
+them from the cutover onward.
 
 ## luis.contreras OOS timestamp correction
 
@@ -114,7 +150,8 @@ Per slot, jobs whose `activity_type` matches the slot's (reclassified)
 single slot can have multiple overlapping jobs of the same activity type (e.g.
 an agent juggling two chats), overlapping same-activity intervals are merged
 with the `prev_max_end` running-max trick before summing, to avoid
-double-counting. The result is capped at 30 minutes per slot.
+double-counting. The result is capped at 30 minutes per slot. Exception:
+pre-cutover SM slots use legacy's raw no-dedup sum instead (rule 2 above).
 
 ## Date attribution (night shifts)
 
