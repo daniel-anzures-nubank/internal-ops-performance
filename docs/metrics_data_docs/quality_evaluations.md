@@ -33,19 +33,30 @@ and (from 2026-05-01) Sprinklr SM** — see the next section.
 > quality of record is the separate `content_csat` metric). Content rows are
 > still present in *this raw table*.
 
-## Sprinklr SM union (Social Media, `>= 2026-05-01`)
+## Sprinklr SM union (Social Media, `>= 2026-05-01`) — a union, like legacy
 
-Social Media QA is logged against **Sprinklr cases**, not Playvox. From the
-`SPRINKLR_SM_CUTOVER` (`2026-05-01`) onward we `UNION ALL` the Sprinklr SM
-case-QA feed on top of Playvox. The cutover is **hard-floored in the extractor**
-(`report_date >= DATE '2026-05-01'`) and re-applied defensively in the module,
-so earlier SM quality stays Playvox-only and nothing changes retroactively.
+Social Media QA started being logged against **Sprinklr cases** in May 2026.
+From the Sprinklr feed's floor (`SPRINKLR_SM_CUTOVER`, `2026-05-01`) onward we
+`UNION ALL` the Sprinklr SM case-QA feed on top of Playvox. The floor is
+**hard-coded in the extractor** (`report_date >= DATE '2026-05-01'`) and
+re-applied defensively in the module — matching legacy's Sprinklr branch
+(`sm.report_date >= "2026-05-01"`, `[IO] Performance 2026 - Social Media Temp
+Fix.sql` `qa_base` line 3025).
 
-This differs from legacy: legacy carried the Sprinklr `UNION ALL` only in the
-Core/Fraud Quality dataset, where it was **dead code** — `agent_information` was
-built with `squad NOT IN ('social', 'content')`, so every (social) Sprinklr row
-was dropped before output. Here the new roster keeps social agents, so the
-Sprinklr SM rows actually reach output and are scored for Social Media.
+**The Playvox branch has no May cutoff** — exactly like legacy's, which is
+unbounded above (SM Playvox evaluations keep flowing until they naturally end
+after 2026-05-15). So in early May an SM agent can contribute both a Playvox
+and a Sprinklr evaluation to the same period; that is legacy behavior, not
+double-counting (the metric layer dedups per `(source, evaluation_id)`, and
+the Playvox / Sprinklr id spaces are disjoint). An earlier revision of this
+module implemented a "clean switch" that dropped Playvox SM rows on/after
+2026-05-01; that was reverted for legacy parity.
+
+One legacy nuance: the Core/Fraud Quality dataset also carries the Sprinklr
+`UNION ALL`, but there it is **dead code** — its `agent_information` is built
+with `squad NOT IN ('social', 'content')`, so every (social) Sprinklr row is
+dropped before output. The SM deck's union is the live one, and it is what
+this table reproduces.
 
 Sprinklr-specific source filtering (in `extractors/sprinklr_sm_evaluations.sql`):
 
@@ -80,8 +91,13 @@ Sprinklr-specific source filtering (in `extractors/sprinklr_sm_evaluations.sql`)
 ## Deferred to the metrics layer (NOT applied here)
 
 - The `scorecard_id` / `evaluation_id` blacklists.
-- The hardcoded outage-date exclusions (2026-03-27, 2026-04-09).
 - Any narrower squad scoping.
+
+**No dates are dropped for quality — anywhere.** The 2026-06-30 legacy
+re-export re-included the 2026-03-27 / 2026-04-09 outage rows (the published
+`usr.mx__cx.quality_io` and `usr.danielanzures.sm_temp_quality` both carry
+those dates), so neither this raw layer nor `metrics/quality.py` applies any
+quality date drop.
 
 ## Output schema (one row per evaluation)
 
@@ -95,7 +111,9 @@ Sprinklr-specific source filtering (in `extractors/sprinklr_sm_evaluations.sql`)
 | `district` | STRING | roster district (was `squad_district`) |
 | `shift` | STRING | roster shift |
 | `date` | DATE | calendar day the evaluation was logged (MX local) |
+| `created_at` | TIMESTAMP | raw evaluation timestamp (legacy dedup order key) |
 | `evaluation_id` | STRING | Playvox evaluation id, or Sprinklr `case_number` |
 | `team_name` | STRING | source team / scorecard team (`'SM'` for Sprinklr) |
+| `scorecard_id` | STRING | source scorecard id (for the metric-layer blacklist) |
 | `source` | STRING | `'playvox'` or `'sprinklr_sm'` |
 | `qa_score` | DOUBLE | the evaluation's score (0-100) |

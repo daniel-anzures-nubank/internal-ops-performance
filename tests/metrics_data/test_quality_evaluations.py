@@ -3,11 +3,12 @@
 Small synthetic Spark frames, no warehouse.
 
 quality_evaluations is a RAW dataset: one row per individual QA evaluation (no
-per-day aggregation). Two sources unioned: Playvox (all teams) and Sprinklr SM
-(Social Media, >= 2026-07-01). We verify the Playvox source gate, the
-per-evaluation shaping, the Sprinklr cutover + ``source`` tagging, the
-``scorecard_id`` / ``created_at`` carry-through, and the roster join that
-attaches the standardized dimensions.
+per-day aggregation). Two sources unioned, matching legacy: Playvox (all teams,
+no upper date bound) and Sprinklr SM (Social Media, floored >= 2026-05-01). We
+verify the Playvox source gate, the per-evaluation shaping, the Sprinklr floor
++ ``source`` tagging, the Playvox/Sprinklr UNION (no source switch, no date
+drops), the ``scorecard_id`` / ``created_at`` carry-through, and the roster
+join that attaches the standardized dimensions.
 """
 
 from __future__ import annotations
@@ -111,7 +112,7 @@ def make_sprinklr(spark, rows):
         "qa_score": 90.0,
         "team_name": "SM",
         "scorecard_id": SPRINKLR_SCORECARD_ID,
-        "created_at": dt.datetime(2026, 5, 15, 9, 0),  # >= cutover (2026-05-01)
+        "created_at": dt.datetime(2026, 5, 15, 9, 0),  # >= the Sprinklr floor (2026-05-01)
     }
     return _rows_to_df(spark, _SPRINKLR_SCHEMA, rows, defaults)
 
@@ -315,7 +316,8 @@ class TestComputeQualityEvaluations:
         assert squads_by_date[dt.date(2026, 4, 15)] == "credit"
 
     def test_outage_dates_not_filtered_in_raw(self, spark):
-        # The raw layer is intentionally minimal; outage filtering is metrics-layer.
+        # No quality date drops anywhere (the 2026-06-30 legacy re-export
+        # re-included 03-27/04-09); the raw layer keeps these rows.
         out = _collect(
             compute_quality_evaluations(
                 make_roster(
@@ -356,13 +358,14 @@ class TestComputeQualityEvaluations:
 
 
 # ---------------------------------------------------------------------------
-# Social-Media source SWITCH at 2026-05-01 (Playvox -> Sprinklr) + provenance
+# Playvox + Sprinklr SM UNION (legacy parity) + the Sprinklr 2026-05-01 floor
 # ---------------------------------------------------------------------------
 #
-# SM quality switches source at 2026-05-01: Playvox before, Sprinklr on/after.
-# This is a clean switch, not a union — Playvox SM rows on/after the cutover are
-# dropped so the two sources never coexist. The switch is scoped to the
-# Social-Media team (roster team='social media'); Core/Fraud are always Playvox.
+# The two sources UNION, matching legacy's SM-deck qa_base: the Playvox branch
+# has no SM/May cutoff (SM Playvox evals keep flowing until they naturally end
+# after 2026-05-15) and the Sprinklr branch is floored at 2026-05-01. Playvox
+# SM rows on/after 2026-05-01 SURVIVE — there is no source switch and no date
+# drop.
 
 
 def _sm_roster(spark, months):
@@ -381,8 +384,8 @@ _MAY = (dt.date(2026, 5, 1), dt.date(2026, 5, 31))
 _APR = (dt.date(2026, 4, 1), dt.date(2026, 4, 30))
 
 
-class TestSocialMediaSourceSwitch:
-    def test_sprinklr_used_on_or_after_cutover(self, spark):
+class TestPlayvoxSprinklrUnion:
+    def test_sprinklr_used_on_or_after_floor(self, spark):
         out = _collect(
             compute_quality_evaluations(
                 _sm_roster(spark, [_MAY]),
@@ -396,9 +399,9 @@ class TestSocialMediaSourceSwitch:
         assert [r["evaluation_id"] for r in out] == ["sm-1"]
         assert out[0]["source"] == SOURCE_SPRINKLR_SM
 
-    def test_clean_switch_drops_playvox_sm_on_or_after_cutover(self, spark):
+    def test_union_keeps_both_sources_on_same_may_date(self, spark):
         # An SM agent with BOTH a Playvox eval and a Sprinklr eval on the SAME May
-        # date -> only the Sprinklr one survives (no union, no double-count).
+        # date -> BOTH survive (legacy UNION ALL; no source switch).
         out = _collect(
             compute_quality_evaluations(
                 _sm_roster(spark, [_MAY]),
@@ -415,11 +418,31 @@ class TestSocialMediaSourceSwitch:
             )
         )
         by_id = {r["evaluation_id"]: r["source"] for r in out}
-        assert by_id == {"spr-may": SOURCE_SPRINKLR_SM}
-        assert "pv-may" not in by_id  # Playvox SM on/after cutover is dropped
+        assert by_id == {
+            "pv-may": SOURCE_PLAYVOX,
+            "spr-may": SOURCE_SPRINKLR_SM,
+        }
 
-    def test_playvox_sm_kept_before_cutover(self, spark):
-        # Before the cutover SM stays Playvox (and Sprinklr is floored out).
+    def test_playvox_sm_evaluation_dated_2026_05_10_survives(self, spark):
+        # The directive's regression guard: a Playvox SM evaluation dated on/after
+        # the Sprinklr floor (2026-05-10) is KEPT — legacy's Playvox branch has no
+        # May cutoff.
+        out = _collect(
+            compute_quality_evaluations(
+                _sm_roster(spark, [_MAY]),
+                make_playvox(
+                    spark,
+                    [{"evaluation_id": "pv-may-10", "qa_score": 92.0,
+                      "created_at": dt.datetime(2026, 5, 10, 9, 30)}],
+                ),
+            )
+        )
+        assert [r["evaluation_id"] for r in out] == ["pv-may-10"]
+        assert out[0]["source"] == SOURCE_PLAYVOX
+        assert out[0]["date"] == dt.date(2026, 5, 10)
+
+    def test_playvox_sm_kept_before_floor(self, spark):
+        # Before the Sprinklr floor SM is Playvox-only (Sprinklr is floored out).
         out = _collect(
             compute_quality_evaluations(
                 _sm_roster(spark, [_APR]),
@@ -438,8 +461,9 @@ class TestSocialMediaSourceSwitch:
         by_id = {r["evaluation_id"]: r["source"] for r in out}
         assert by_id == {"pv-apr": SOURCE_PLAYVOX}  # Sprinklr Apr floored out
 
-    def test_core_fraud_always_playvox_even_after_cutover(self, spark):
-        # The switch is SM-only: a Core agent keeps Playvox on/after 2026-05-01.
+    def test_core_fraud_playvox_kept_after_floor(self, spark):
+        # A Core agent's Playvox eval on/after 2026-05-01 is kept (the floor only
+        # gates the Sprinklr feed; Playvox is never cut off for any team).
         out = _collect(
             compute_quality_evaluations(
                 make_roster(
@@ -472,7 +496,7 @@ class TestSocialMediaSourceSwitch:
         assert out[0]["source"] == SOURCE_SPRINKLR_SM
         assert out[0]["scorecard_id"] == SPRINKLR_SCORECARD_ID
 
-    def test_sprinklr_before_cutover_dropped(self, spark):
+    def test_sprinklr_before_floor_dropped(self, spark):
         # An April Sprinklr row is floored out; a May one is kept.
         out = _collect(
             compute_quality_evaluations(
@@ -489,7 +513,7 @@ class TestSocialMediaSourceSwitch:
         )
         assert [r["evaluation_id"] for r in out] == ["sm-may"]
 
-    def test_cutover_boundary_is_inclusive(self, spark):
+    def test_floor_boundary_is_inclusive(self, spark):
         out = _collect(
             compute_quality_evaluations(
                 _sm_roster(spark, [_MAY]),

@@ -9,7 +9,8 @@ Here we only:
      (via `db.read_table`).
   3. Call ``compute_quality`` to get the day/week/month/quarter/semester/year
      mean-score rows (latest per (source, evaluation_id) by created_at DESC,
-     Content excluded, team-scoped blacklists + outage drops for date < cutover).
+     Content excluded, team-scoped blacklists for date < cutover; NO date drops
+     — the 2026-06-30 legacy re-export re-included the 03-27/04-09 outage rows).
   4. Either print a summary (`--dry-run`) or replace the target Delta table.
 
 Tables
@@ -19,10 +20,11 @@ Tables
 
 Manual adjustments
 ------------------
-The team-scoped ``scorecard_id`` / ``evaluation_id`` blacklists and the
-team-asymmetric outage-date exclusions are hardcoded, cutover-gated constants
-applied inside ``compute_quality`` (legacy QA artifacts, date < 2026-07-01). No
-adjustment-sheet tables are read here.
+The team-scoped ``scorecard_id`` / ``evaluation_id`` blacklists are hardcoded,
+cutover-gated constants applied inside ``compute_quality`` (legacy QA
+artifacts, date < 2026-07-01). No outage-date exclusions apply — the
+2026-06-30 legacy re-export re-included the 03-27/04-09 quality rows, so no
+quality dates are dropped. No adjustment-sheet tables are read here.
 
 Usage
 -----

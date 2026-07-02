@@ -10,8 +10,8 @@
 --   Quality metric for Social Media.
 --
 -- Scope of this query (what IS done here)
---   * Pull every SM case evaluation in the period that is on/after the SM
---     cutover (2026-05-01) — see "Cutover" below.
+--   * Pull every SM case evaluation in the period that is on/after the feed's
+--     floor (2026-05-01) — see "Floor" below.
 --   * Map `agent_name` -> Nubank email -> agent prefix via `sprinklr_sm_users`.
 --     Rows whose agent can't be mapped (no `user_email`) are dropped BEFORE the
 --     dedup (mirroring legacy, which filters to mapped social agents before its
@@ -31,19 +31,22 @@
 --     revision (latest `checklist_modified_date`), analogous to the Playvox
 --     `ROW_NUMBER()` dedup.
 --
--- Cutover (>= 2026-05-01)
---   SM QA evaluations migrated Playvox -> Sprinklr in May 2026, so SM quality
---   SWITCHES source at 2026-05-01: Playvox before, Sprinklr on/after. This feed
---   is hard-floored at 2026-05-01 regardless of `:period_start`; below that date
---   SM stays Playvox. The metrics_data layer drops Playvox SM rows on/after the
---   cutover so the switch is clean (not a union) and enforces the same floor via
---   `SPRINKLR_SM_CUTOVER`. NOTE: this is a deliberate enhancement beyond legacy,
---   whose SM-quality block (`[IO] Performance 2026 - Social Media.sql` qa_base)
---   is Playvox-ONLY and goes dark when SM Playvox evals stop mid-May.
+-- Floor (>= 2026-05-01)
+--   SM QA started being logged in Sprinklr in May 2026. This feed is
+--   hard-floored at 2026-05-01 regardless of `:period_start`, matching legacy's
+--   Sprinklr branch (`sm.report_date >= "2026-05-01"`, `[IO] Performance 2026 -
+--   Social Media Temp Fix.sql` qa_base line 3025); the metrics_data layer
+--   re-applies the same floor via `SPRINKLR_SM_CUTOVER`. This is a FLOOR on
+--   the Sprinklr feed only — Playvox is NOT cut off at this date. The two
+--   sources UNION exactly like legacy: SM Playvox evaluations keep flowing
+--   until they naturally end after 2026-05-15, so in early May an SM agent can
+--   contribute evaluations from both feeds.
 --
 -- Out of scope (handled by the metrics_data / metrics layers)
 --   * Roster join, `status = 'active'` filter, squad/team derivation.
---   * The `scorecard_id` / `evaluation_id` blacklists and outage-date exclusions.
+--   * The `scorecard_id` / `evaluation_id` blacklists (no outage-date
+--     exclusions exist anywhere for quality — the 2026-06-30 legacy re-export
+--     re-included the 03-27/04-09 rows).
 --   * `evaluation_id` cross-source dedup (Sprinklr case numbers and Playvox ids
 --     are disjoint id spaces, so no collision).
 --
