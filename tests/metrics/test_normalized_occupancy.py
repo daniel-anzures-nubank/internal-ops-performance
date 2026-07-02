@@ -240,3 +240,42 @@ class TestCrossMonthWeekBenchmark:
         assert abs(week["numerator"] - 75.0) < 1e-9
         assert abs(week["denominator"] - 100.0) < 1e-9
         assert abs(week["metric_value"] - 75.0) < 1e-9
+
+
+class TestMarchFloor:
+    def test_pre_march_slots_are_dropped(self, spark):
+        """Legacy publishes NOcc only from 2026-03-01 — no Jan/Feb rows."""
+        out = compute_normalized_occupancy(
+            make_raw(
+                spark,
+                [
+                    {"date": dt.date(2026, 1, 15)},
+                    {"date": dt.date(2026, 2, 10)},
+                    {"date": dt.date(2026, 3, 2)},
+                ],
+            )
+        )
+        rows = out.collect()
+        # day/week/month grains carry no pre-floor buckets (quarter/semester/
+        # year labels are period starts like 2026-01-01 even for March slots).
+        fine = [r for r in rows if r["date_granularity"] in ("day", "week", "month")]
+        assert min(r["date_reference"] for r in fine) >= dt.date(2026, 2, 23)
+        day_rows = [r for r in rows if r["date_granularity"] == "day"]
+        assert [r["date_reference"] for r in day_rows] == [dt.date(2026, 3, 2)]
+
+    def test_week_straddling_floor_is_partial(self, spark):
+        """The Monday-2026-02-23 week keeps only its March days (legacy-like)."""
+        out = compute_normalized_occupancy(
+            make_raw(
+                spark,
+                [
+                    # Feb 27 (Fri) dropped by the floor; Mar 1 (Sun) survives.
+                    {"date": dt.date(2026, 2, 27), "slot_time": "09:00:00"},
+                    {"date": dt.date(2026, 3, 1), "slot_time": "09:00:00",
+                     "occupancy_minutes": 15.0},
+                ],
+            )
+        )
+        week = _by_agent(out, "week")["nuberto.lopez"]
+        assert week["date_reference"] == dt.date(2026, 2, 23)
+        assert abs(week["numerator"] - 50.0) < 1e-9  # only the Mar 1 slot counts
