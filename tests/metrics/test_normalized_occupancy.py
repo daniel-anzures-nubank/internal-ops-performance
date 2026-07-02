@@ -210,3 +210,33 @@ class TestComputeNormalizedOccupancy:
         out = compute_normalized_occupancy(spark.createDataFrame([], _RAW_SCHEMA))
         assert out.count() == 0
         assert out.columns == [c for c, _ in IO_NORMALIZED_OCCUPANCY_METRIC_SCHEMA]
+
+
+class TestCrossMonthWeekBenchmark:
+    def test_week_straddling_month_boundary_takes_max_benchmark(self, spark):
+        """Legacy `MAX(occupancy_exp)` at every grain: a week spanning two
+        months uses the HIGHER month benchmark, not a weighted average.
+
+        Week 2026-04-27 spans Apr 27 - May 3. April cohort occupancy 50%,
+        May cohort 100% -> the week denominator must be 100, not the
+        required-minutes-weighted 75.
+        """
+        out = compute_normalized_occupancy(
+            make_raw(
+                spark,
+                [
+                    # April day: benchmark month Apr = 50% (this agent IS the cohort)
+                    {"date": dt.date(2026, 4, 28), "slot_time": "09:00:00",
+                     "occupancy_minutes": 15.0},
+                    # May day: benchmark month May = 100%
+                    {"date": dt.date(2026, 5, 1), "slot_time": "09:00:00",
+                     "occupancy_minutes": 30.0},
+                ],
+            )
+        )
+        week = _by_agent(out, "week")["nuberto.lopez"]
+        assert week["date_reference"] == dt.date(2026, 4, 27)
+        # Agent week occupancy: 45/60 = 75%. Benchmark: MAX(50, 100) = 100.
+        assert abs(week["numerator"] - 75.0) < 1e-9
+        assert abs(week["denominator"] - 100.0) < 1e-9
+        assert abs(week["metric_value"] - 75.0) < 1e-9
