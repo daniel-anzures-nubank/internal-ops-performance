@@ -28,9 +28,10 @@ Two-step, per **month**:
    step 1 (equal-weight across squads — the legacy ``AVG(occupancy_monthly)``
    over the squads sharing a district + shift).
 
-Each slot carries its ``(month, district, shift)`` benchmark; when rolled up to
-a multi-month bucket the benchmark is averaged weighted by required minutes (a
-single-month bucket therefore just keeps that month's benchmark).
+Each slot carries its ``(month, district, shift)`` benchmark; a bucket's
+benchmark is ``MAX`` over its slots (legacy ``MAX(occupancy_exp)`` at every
+grain — a single-month bucket keeps that month's benchmark; a week straddling
+a month boundary takes the HIGHER of the two month benchmarks).
 
 **Deck exception (Content):** legacy's Content deck keys this benchmark on
 ``squad_district`` only — no shift. Content's roster carries a NULL shift, so we
@@ -152,20 +153,26 @@ def _aggregate(slots: DataFrame, granularity: str) -> DataFrame:
     """One NO row per (agent, bucket) for a single granularity."""
     work = slots.withColumn(
         "date_reference", bucket_date(F.col("date"), granularity)
-    ).withColumn("_bench_weighted", F.col("benchmark") * F.col("required_minutes"))
+    )
 
     sums = work.groupBy("agent", "date_reference").agg(
         F.sum("occupancy_minutes").alias("_occ"),
         F.sum("required_minutes").alias("_req"),
-        F.sum("_bench_weighted").alias("_bench_w"),
+        F.max("benchmark").alias("_bench"),
     )
 
-    # Agent occupancy % and the required-minute-weighted benchmark %.
+    # Agent occupancy % and the bucket benchmark %. Legacy takes
+    # MAX(occupancy_exp) over the bucket at EVERY grain ([IO] Performance
+    # 2026.sql L695/713/739; the SM deck likewise) — identical to the single
+    # month benchmark for day/month buckets, but for a week straddling a month
+    # boundary it picks the HIGHER of the two month benchmarks. An earlier
+    # required-minutes-weighted average here was an unflagged mis-port that
+    # diverged on exactly those cross-month weeks (e.g. 2026-03-30, 2026-04-27).
     numerator = F.when(
         F.col("_req") > 0, F.col("_occ") / F.col("_req") * F.lit(100.0)
     ).otherwise(F.lit(None).cast("double"))
     denominator = F.when(
-        F.col("_req") > 0, F.col("_bench_w") / F.col("_req") * F.lit(100.0)
+        F.col("_req") > 0, F.col("_bench") * F.lit(100.0)
     ).otherwise(F.lit(None).cast("double"))
 
     sums = sums.withColumn("numerator", numerator).withColumn(
