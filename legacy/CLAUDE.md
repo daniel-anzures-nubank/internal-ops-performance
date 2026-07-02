@@ -3,6 +3,8 @@
 ## Project Overview
 This workspace contains notebooks for the **Internal Operations (IO) Performance** analysis at Nubank Mexico CX.
 
+**Re-exported 2026-06-30.** These notebooks were re-exported from production on 2026-06-30 and contain the *current* legacy rules. That refresh changed three rules (and recomputed all history in the published tables): the `index_xforces_final` shrinkage target relaxes to **23%** for May/June-2026 month buckets; its `xpeers_in_target` component is **rescaled into the 90-100 band with a 70-cliff** (`>= 70 → 90 + (x-70)/3`) — note the `xpeers_in_target` metric's own on-target thresholds did **not** change, only this component fold; and Content CSAT excludes the *'tiempo de entrega'* question. The re-export also re-included some outage-date rows (e.g. quality 03-27 / 04-09) that earlier exports dropped.
+
 ## Pipeline Architecture
 
 ### Pipeline: "MX Internal Ops metrics update"
@@ -29,6 +31,8 @@ This is the main orchestration pipeline that updates all performance metrics.
 - The notebook itself produces all datasets AND orchestrates the final metrics
 - Handles metrics for content agents only
 
+> **Temp Fix variants are the runnable SOT.** For Social Media and Content, always read `[IO] Performance 2026 - Social Media Temp Fix.sql` / `[IO] Performance 2026 - Content Temp Fix.sql` — they materialize the `sm_temp_*` / `cont_temp_*` tables the published decks are actually built from; the non-Temp-Fix variants are older references. `[IO] Performance 2026 - Old.sql` is historical, and `[IO] Performance 2026 - S&D.sql` is **not** a pipeline component (S&D squad/district roll-ups are out of the migration's scope). The Content notebook is rebuilt **nightly**, so its published table can be transiently empty mid-rebuild.
+
 ## Team Hierarchy
 - **Xpeers (agents)**: Individual customer service representatives
 - **XForces**: Team leads managing a group of agents
@@ -39,16 +43,34 @@ This is the main orchestration pipeline that updates all performance metrics.
 | Metric | Description | Target | Level |
 | --- | --- | --- | --- |
 | Adherence | delivered_hours / required_hours | >= 95% | Agent |
-| NTPJ (Normalized Time Per Job) | actual_duration / expected_duration | <= 100% | Agent |
-| Normalized Occupancy (NOCC) | occupancy_time / job_time / expected | Varies | Agent |
-| Quality | TBD | TBD | Agent |
-| Shrinkage | TBD | TBD | Agent |
+| NTPJ (Normalized Time Per Job) | actual_duration / expected_duration (Content: SLA-weighted compliance, higher-better) | <= 100% (Content >= 95%) | Agent |
+| Normalized Occupancy (NOCC) | agent occupancy / district+shift benchmark | >= 100% | Agent |
+| Quality | mean QA score (Playvox; SM switches to Sprinklr from 2026-05) | >= 95% | Agent |
+| Shrinkage | non-productive / required slots | <= 20% | Agent |
+| tNPS | (promoters − detractors) / valid responses (SM only) | >= 88% | Agent |
+| WoWs | COUNT(DISTINCT case_id) per month (SM only) | >= 5 | Agent |
+| Content CSAT | promoters / questions (Content only; its Quality) | >= 95% | Agent |
+| Xpeer Index | mean of the agent's other metrics (folded) | >= 95% | Agent |
+| XForce Index | mean of up to 4 normalized components | >= 90% (published tables use 90, not 95) | XForce |
 
 ## Key Tables
 - `etl.mx__series_contract.cx_mx_bdx_snapshots` — Agent roster snapshots (squad, district, shift, hire date)
 - `usr.mx__cx.adherence_io` — Adherence hours data
 - `usr.mx__cx.normalized_time_per_job` — NTPJ metric base
 - `usr.mx__cx.normalized_occupancy` — Occupancy metric base
+
+## Published Output Tables — Parity Gotchas
+
+The final decks land in three tables: `usr.mx__cx.internal_ops_performance_2026` (Core & Fraud "main" deck), `..._2026_social_media`, and `..._2026_content`. Read these before any parity or roll-up work against them:
+
+- `date_reference` is a **TIMESTAMP** — wrap with `DATE()` before joining on dates.
+- **XForce-grain rows carry NULL `squad`** (derive Core/Fraud from the agent rows); **drop NULL-xforce roll-up rows** — they're artifacts.
+- `index_xforce` has a **Jan–Mar 2026 duplicate-key fan-out artifact** (up to 18 rows per key, different values); `xpeers_in_target_xplead` has a related Jan–Mar xplead fan-out. Neither is reproduced by the new pipeline.
+- **`shrinkage_xplead` is share-of-XForces-in-target** per XPLead (`COUNT(DISTINCT xforce with shrinkage <= 20) / COUNT(DISTINCT xforce)`, main deck ~L1642-1674) — *not* slot-weighted shrinkage. The new pipeline currently emits slot-weighted values here (unresolved divergence).
+- **SM occupancy counts empty dimensioned OOS slots as fully occupied**: the per-slot `SUM(CASE WHEN activity_occuped = 1 THEN duration END)` is NULL when nothing matches, and `NULL <= 1800` falls through to `ELSE 1800` (SM Temp Fix ~L1129, L1189, L1223). Also SM shrinkage_xforce computes over the SM deck's own `social_agents` roster.
+- The **main deck also carries cross-listed SM/Content agent rows** (e.g. the Jan-2026 `enablement` cohort's adherence/NTPJ; SM nocc rows with NULL values) — the new pipeline attributes those agents to their own teams instead; no data loss, different deck.
+- The main-deck Content `ntpj_agent` rows from March onward are the **old duration-based Content NTPJ**, superseded by the SLA-based metric in the Content deck.
+- Legacy grains are **day/week/month only** (improved_benchmark also has week-grain rows the new pipeline deliberately doesn't build); quartile metrics (`*_general_quartile` / `*_team_quartile`) and most per-squad/district/xforce/xplead roll-ups of base metrics were never ported.
 
 ## Source Datasets
 
