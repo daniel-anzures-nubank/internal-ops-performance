@@ -25,7 +25,14 @@ applies the business exclusions listed below).
   Permiso medico / Huddle / Licencia / Vacacion; NULL kept), and drop the
   excluded DIME squads (`agent_dime_squad` not in `wfm` / `credit_evolution` /
   `dote`, NULL dropped). Both are fixed legacy DIME filters, not manual
-  adjustments.
+  adjustments. **SM deck-split (pre-2026-07-01):** the legacy SM deck's
+  exclusion (`Social Media Temp Fix.sql:231`) lists only the five meeting
+  items, so SM DIME squads (`social` / `social_social`) KEEP `Licencia` /
+  `Vacacion` slots before the cutover — they enter the SM adherence
+  denominator and, with no matching productivity, score ~100% via the
+  LEAST/GREATEST NULL-skip quirk (legacy behavior, reproduced; ~3.4k slots /
+  226 agent-days / 26 agents Jan–May 2026). From the cutover on, the unified
+  7-item exclusion applies everywhere.
 - **Productivity**: keep "connected" rows (legacy `agent_productivity` WHERE):
   - `inferred_status IN ('available', 'oos', 'training')`, OR
   - `inferred_status = 'pause' AND level_3 = 'paused_with_jobs'`, OR

@@ -64,7 +64,12 @@ from datetime import date
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
-from dime_filters import DIME_SQUAD_EXCLUSIONS, MEETING_LEAVE_DIMENSIONED_ACTIVITIES
+from dime_filters import (
+    DIME_SQUAD_EXCLUSIONS,
+    LEAVE_DIMENSIONED_ACTIVITIES,
+    MEETING_LEAVE_DIMENSIONED_ACTIVITIES,
+    SM_DIME_SQUADS,
+)
 from shift_attribution import night_agent_months, shift_start_date
 
 # ---------------------------------------------------------------------------
@@ -101,6 +106,18 @@ NULL_STATUS_TRUST_DATE: str = "2026-01-22"
 # Per-slot result keys (one row per scheduled DIME slot).
 SLOT_KEYS: tuple[str, ...] = ("agent", "date", "slot_start", "activity_type_required")
 
+# Legacy SM adherence deck-split (parity quirk): the SM deck's meeting/leave
+# exclusion ([IO] Performance 2026 - Social Media Temp Fix.sql:231) lists only
+# the FIVE meeting items -- it KEEPS `Licencia`/`Vacacion` slots, which then
+# enter the SM adherence denominator as required slots (and, having no
+# matching productivity, score ~100% via the LEAST/GREATEST NULL-skip quirk
+# this module already reproduces). Blast radius measured 2026-07-02: 3,420
+# slots / 226 agent-days / 26 SM agents, Jan-May 2026 (the Licencia/Vacacion
+# DIME notation for SM stopped in early May). Reproduced for SM DIME squads
+# before this cutover; from the cutover on, the unified 7-item exclusion
+# applies to every deck.
+SM_LEAVE_EXCLUSION_CUTOVER: date = date(2026, 7, 1)
+
 # MEETING_LEAVE_DIMENSIONED_ACTIVITIES and DIME_SQUAD_EXCLUSIONS now live in
 # the shared metrics_data/dime_filters.py (imported above).
 
@@ -119,6 +136,9 @@ def filter_dime(dime: DataFrame) -> DataFrame:
         :data:`MEETING_LEAVE_DIMENSIONED_ACTIVITIES` — leave/meeting slots that
         aren't adherence-eligible scheduled work (a NULL ``dimensioned_activity``
         is kept). This is a fixed data filter, **not** a manual adjustment.
+        EXCEPTION (legacy SM deck-split, :data:`SM_LEAVE_EXCLUSION_CUTOVER`):
+        pre-cutover SM DIME squads keep ``Licencia``/``Vacacion`` slots — the
+        legacy SM deck excludes only the five meeting items.
       * the DIME ``squad`` column (``agent_dime_squad``) is non-NULL and not in
         :data:`DIME_SQUAD_EXCLUSIONS` — drops operational/WFM squads
         (``wfm`` / ``credit_evolution`` / ``dote``), matching legacy.
@@ -130,6 +150,14 @@ def filter_dime(dime: DataFrame) -> DataFrame:
       * ``slot_start``: UTC unix = ``slot_start_local_unix + 6h``
       * ``slot_end``:   UTC unix = ``slot_end_local_unix   + 6h``
     """
+    # SM deck-split (see SM_LEAVE_EXCLUSION_CUTOVER): pre-cutover SM DIME
+    # slots keep `Licencia`/`Vacacion` (legacy SM excludes only the five
+    # meeting items); every other row uses the unified 7-item exclusion.
+    sm_kept_leave = (
+        F.col("squad").isin(list(SM_DIME_SQUADS))
+        & (F.to_date(F.col("date")) < F.lit(SM_LEAVE_EXCLUSION_CUTOVER))
+        & F.col("dimensioned_activity").isin(list(LEAVE_DIMENSIONED_ACTIVITIES))
+    )
     return (
         dime.filter(F.col("activity_type_required").isNotNull())
         .filter(
@@ -137,6 +165,7 @@ def filter_dime(dime: DataFrame) -> DataFrame:
             | ~F.col("dimensioned_activity").isin(
                 list(MEETING_LEAVE_DIMENSIONED_ACTIVITIES)
             )
+            | sm_kept_leave
         )
         # DIME-squad exclusion: `squad` here is the DIME `agent_dime_squad`
         # (from the dime_slots extractor), not the roster squad. Match legacy's
