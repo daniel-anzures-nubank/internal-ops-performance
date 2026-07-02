@@ -133,3 +133,53 @@ def test_job_exclusions_match_queues_and_squad_scope():
     out = drop_excluded_jobs(drop_cross_support_jobs(jobs, cross_support), job_exclusions)
 
     assert out.empty
+
+
+def test_named_agent_exclusion_applies_across_equipo_mismatch(spark):
+    """A row naming a specific agent applies by name, ignoring `equipo`.
+
+    Reproduces the 2026-03 'Auditorías CNVB' rows: equipo='Core' but the named
+    agents are rostered team='fraud'. Legacy dropped them by name; requiring
+    roster team == equipo silently skipped the approved exclusion.
+    """
+    slots = spark.createDataFrame(
+        [
+            ("janet.castro", "fraud", "2026-03-25", "12:00:00", "available"),
+            ("janet.castro", "fraud", "2026-04-02", "12:00:00", "available"),
+            ("ana.nu", "core", "2026-03-25", "12:00:00", "available"),
+        ],
+        "agent string, team string, date string, slot_time string, activity_type_required string",
+    )
+    adjustments = spark.createDataFrame(
+        [("Core", "janet.castro", "2026-03-24", "2026-03-28", "0:00", "23:59")],
+        "equipo string, agente string, fecha_inicio string, fecha_fin string, "
+        "hora_inicio string, hora_fin string",
+    )
+
+    out = drop_slot_windows(slots, adjustments)
+    kept = sorted((r["agent"], str(r["date"])) for r in out.collect())
+
+    assert kept == [
+        ("ana.nu", "2026-03-25"),          # different agent: untouched
+        ("janet.castro", "2026-04-02"),    # named agent outside the window: kept
+    ]
+
+
+def test_todos_rows_stay_team_scoped(spark):
+    """`Agente = Todos` rows still scope by `equipo` (team-wide drops)."""
+    slots = spark.createDataFrame(
+        [
+            ("ana.nu", "core", "2026-03-27", "12:00:00", "available"),
+            ("juan.nu", "social media", "2026-03-27", "12:00:00", "available"),
+        ],
+        "agent string, team string, date string, slot_time string, activity_type_required string",
+    )
+    adjustments = spark.createDataFrame(
+        [("Core", "Todos", "2026-03-27", "2026-03-27", "0:00", "23:59")],
+        "equipo string, agente string, fecha_inicio string, fecha_fin string, "
+        "hora_inicio string, hora_fin string",
+    )
+
+    out = drop_slot_windows(slots, adjustments)
+
+    assert [r["agent"] for r in out.collect()] == ["juan.nu"]

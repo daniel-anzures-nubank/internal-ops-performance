@@ -119,7 +119,13 @@ def _scope_mask(df: DataFrame, row: dict[str, Any]) -> Column:
         squad = agent.split("squad", maxsplit=1)[1].rstrip(")").strip().lower()
         return mask & F.lower(F.col("squad")).contains(squad)
     if "agent" in df.columns:
-        return mask & (F.lower(F.col("agent")) == agent_l)
+        # A named agent identifies the scope by itself — do NOT also require
+        # the roster team to equal the sheet's `equipo`, which is the label of
+        # the team that FILED the row, not a roster filter. E.g. the 2026-03
+        # "Auditorías CNVB" rows carry equipo='Core' for agents rostered
+        # team='fraud' (janet.castro et al.); legacy dropped them by name, and
+        # the AND made those approved exclusions silently never apply.
+        return F.lower(F.col("agent")) == agent_l
     return mask
 
 
