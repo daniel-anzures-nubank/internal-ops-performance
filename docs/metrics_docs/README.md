@@ -45,6 +45,7 @@ Raw `metrics_data` tables are suffixed `_raw`; metric tables are suffixed
 | [average_xpeer_index](average_xpeer_index.md) | `metrics/average_xpeer_index.py` | `scripts/metrics_scripts/build_average_xpeer_index.py` | `io_xpeer_index_metric` | `usr.danielanzures.io_average_xpeer_index_metric` |
 | [xforce_index](xforce_index.md) | `metrics/xforce_index.py` | `scripts/metrics_scripts/build_xforce_index.py` | `io_shrinkage_metric` + `io_xpeers_in_target_metric` + `io_average_xpeer_index_metric` + `io_improved_benchmarks_metric` | `usr.danielanzures.io_xforce_index_metric` |
 | [average_xforce_index](average_xforce_index.md) | `metrics/average_xforce_index.py` | `scripts/metrics_scripts/build_average_xforce_index.py` | `io_xforce_index_metric` | `usr.danielanzures.io_average_xforce_index_metric` |
+| [performance_metrics](performance_metrics.md) | `metrics/performance_metrics.py` | `scripts/metrics_scripts/build_performance_metrics.py` | all 16 `io_*_metric` tables (consolidated union) | `usr.danielanzures.io_performance_metrics` |
 
 Shared aggregation (bucketing + the tidy long output) lives in
 `metrics/metric_utils.py`.
@@ -94,5 +95,10 @@ Shared aggregation (bucketing + the tidy long output) lives in
 > - `average_xforce_index` is **XPLead-level** (no agent/xforce grain): the simple
 >   mean of `xforce_index` per XPLead, all four teams. (`numerator` = Σ index,
 >   `denominator` = XForce count, vs legacy's NULL/`AVG`.)
+> - `performance_metrics` is the **consolidated reporting table**: the pure
+>   UNION ALL of all 16 `io_*_metric` tables (row-for-row) with `team` replaced
+>   by a display team (`Core` / `Fraud` / `Social Media` / `Content` /
+>   `Quality`; modal backfill from adherence for the roll-up rows). No
+>   `_metric` suffix on its table.
 >
 > See each metric's doc for details.
