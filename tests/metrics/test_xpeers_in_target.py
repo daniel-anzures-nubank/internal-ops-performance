@@ -268,7 +268,10 @@ class TestFix4SMRollups:
         )
         for metric in (SQUAD_METRIC_NAME, DISTRICT_METRIC_NAME):
             r = one(out, metric)
-            assert r["xforce"] is None and r["squad"] is None and r["district"] is None
+            # SM roll-up rows carry the deck group label so they stay
+            # distinguishable from Content's same-named rows.
+            assert r["xforce"] is None
+            assert r["squad"] == "social" and r["district"] == "social"
             assert abs(r["numerator"] - 3.0) < 1e-9
             assert abs(r["denominator"] - 6.0) < 1e-9
             assert abs(r["metric_value"] - 50.0) < 1e-9
@@ -444,7 +447,8 @@ class TestContent:
         )
         for metric in (SQUAD_METRIC_NAME, DISTRICT_METRIC_NAME):
             r = one(out, metric)
-            assert r["xforce"] is None and r["squad"] is None and r["district"] is None
+            assert r["xforce"] is None
+            assert r["squad"] == "enablement" and r["district"] == "content"
             assert abs(r["numerator"] - 100.0) < 1e-9
             assert abs(r["denominator"] - 0.0) < 1e-9
             assert abs(r["metric_value"] - 50.0) < 1e-9

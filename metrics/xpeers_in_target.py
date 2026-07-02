@@ -127,7 +127,10 @@ numerator, COUNT(DISTINCT agent) AS denominator, AVG(metric_value)`` — and sin
 0 while ``metric_value`` is still the non-NULL average; Content Temp Fix
 L5641-5730 / L7029-7098).
 
-For every row ``agent`` / ``squad`` / ``district`` / ``shift`` are NULL (the
+For every row ``agent`` / ``shift`` are NULL, and ``squad`` / ``district`` are
+NULL except on the squad/district roll-up variants, which carry the deck's
+group label (SM: ``social``; Content: ``enablement``/``content``) so the two
+decks' same-named rows stay distinguishable in the single metric table (the
 degenerate roll-up key is also NULL), ``numerator`` = targets achieved,
 ``denominator`` = total targets, ``metric_value`` = ``numerator / denominator *
 100`` (except the Content roll-ups above).
@@ -453,15 +456,31 @@ def _compute_grain(
     return grain_rows.unionByName(rollups).unionByName(content_rollups)
 
 
-def _rollup_rows(agg: DataFrame, *, squad_metric: str, district_metric: str) -> DataFrame:
-    """Emit one squad + one district row (all-NULL dims) per aggregated bucket."""
+def _rollup_rows(
+    agg: DataFrame,
+    *,
+    squad_metric: str,
+    district_metric: str,
+    group_squad: str,
+    group_district: str,
+) -> DataFrame:
+    """Emit one squad + one district row per aggregated bucket.
+
+    The ``squad`` / ``district`` columns carry the deck's group label
+    (SM: ``social``/``social``; Content: ``enablement``/``content`` — the same
+    convention nuvinhos_performance uses). Legacy leaves these NULL, but its
+    decks live in separate tables; in our single metric table both decks emit
+    the SAME metric names, so without the label the SM and Content rows for a
+    (metric, grain, date) are indistinguishable (a real collision found on the
+    2026-07-02 verification).
+    """
     base = agg.select(
         F.lit(None).cast("string").alias("agent"),
         F.lit(None).cast("string").alias("xforce"),
         F.lit(None).cast("string").alias("xplead"),
         F.lit(None).cast("string").alias("team"),
-        F.lit(None).cast("string").alias("squad"),
-        F.lit(None).cast("string").alias("district"),
+        F.lit(group_squad).alias("squad"),
+        F.lit(group_district).alias("district"),
         F.lit(None).cast("string").alias("shift"),
         F.col("date_reference"),
         F.col("date_granularity"),
@@ -496,7 +515,13 @@ def _sm_rollups(scored: DataFrame, *, squad_metric: str, district_metric: str) -
             F.col("numerator") / F.col("denominator") * F.lit(100.0),
         ).otherwise(F.lit(None).cast("double")),
     )
-    return _rollup_rows(agg, squad_metric=squad_metric, district_metric=district_metric)
+    return _rollup_rows(
+        agg,
+        squad_metric=squad_metric,
+        district_metric=district_metric,
+        group_squad="social",
+        group_district="social",
+    )
 
 
 def _content_rollups(
@@ -516,7 +541,13 @@ def _content_rollups(
         F.avg("metric_value").cast("double").alias("metric_value"),
     )
     agg = agg.withColumn("denominator", F.lit(0.0))
-    return _rollup_rows(agg, squad_metric=squad_metric, district_metric=district_metric)
+    return _rollup_rows(
+        agg,
+        squad_metric=squad_metric,
+        district_metric=district_metric,
+        group_squad="enablement",
+        group_district="content",
+    )
 
 
 def compute_xpeers_in_target(
