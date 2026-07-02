@@ -47,8 +47,10 @@ agents and 8 target squads.
 ## Filters applied here (minimal — raw table)
 
 - Extractor: keep rows with a non-empty `timestamp`; derive
-  `date_reference = survey_timestamp - 1 month` (the month rated) and filter it to
-  the period.
+  `date_reference` from the sheet's `mes` label (`'Abril 2026'` → 2026-04-01, the
+  month rated — matching the OG legacy notebook; a malformed `mes` falls back to
+  the old `survey_timestamp - 1 month` proxy, which broke for responses filled
+  more than a month late) and filter it to the period.
 - Module: `target_squad` normalization (`E.M.I.` / the long `GENERAL (...)` label
   → `emi_general`; else lowercase) so it matches the roster key.
 - **Roster**: `status = 'active'` and non-null `target_squad` (inner join on
