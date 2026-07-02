@@ -45,6 +45,30 @@ that metric in the bucket; toward the **numerator** only when `metric_value`
 clears the threshold (NULL `metric_value` fails the target but still counts in
 the denominator).
 
+### 2026-06-30 legacy re-export — on-target rule UNCHANGED here
+
+The production re-export of 2026-06-30 introduced a **"90-100 rescale with a
+70-cliff"**, but it does **not** touch this metric's on-target flagging. Verified
+against the refreshed legacy notebooks (`git diff` of the re-export commit — the
+`xpeers_in_target_*` views are byte-identical before/after):
+
+- The per-component in-target thresholds above are the CURRENT legacy rule,
+  unchanged: main deck `legacy/[IO] Performance 2026.sql` — adherence `>= 95`
+  (L279), ntpj `<= 100` (L570), nocc `>= 100` (L867), qa `>= 95` (L1160);
+  SM deck `legacy/[IO] Performance 2026 - Social Media Temp Fix.sql` —
+  adherence `>= 95` (L690), nocc `>= 100` (L1776), tnps `>= 88` (L2397),
+  wows `>= 5` (L2785), qa `>= 95` (L3271).
+- The rescale lives **only** in the legacy `index_xforces_final` views — i.e. in
+  how **`xforce_index` consumes** the `xpeers_in_target_xforce` value
+  (`>= 70 → 90 + (x - 70) * 10/30`, `< 70 → raw`; main deck L2213-2221, SM deck
+  L5559-5568, Content deck likewise). It is ported in
+  `metrics/xforce_index.py::_xpeers_in_target_component`.
+- Legacy **publishes `xpeers_in_target_xforce` / `xpeers_in_target_xplead`
+  unrescaled** (the final export unions `xpeers_in_target_xforces_join` /
+  `xpeers_in_target_xpleads_join`, main deck L2531/L2535), so rescaling the
+  metric here would diverge from the published table *and* double-apply the
+  rescale downstream in `xforce_index`.
+
 ## Era windows (anchored on the bucket's month)
 
 - **Core / Fraud**: adherence + ntpj always; `+ quality` from **Feb 2026**;
