@@ -70,24 +70,26 @@ from pyspark.sql import functions as F
 
 # The 5 CSAT questions legacy scores (each 1-5; promoter if >= 4). The survey
 # sheet carries 8 question columns, but legacy `[IO] Performance 2026 - Content`
-# (qa_base) scores only these first 5 — the trailing 3 (`manejo_de_cambios`,
-# `expectativas`, `aportacion_estrategica`) are excluded. Verified against the
-# legacy `qa_score_agent` output: first-5 reproduces legacy num/den exactly
-# (denominator is 5/response, not 8). Owner decision: keep legacy's 5-question
-# CSAT for all dates (no cutover correction to 8).
+# (qa_base, promoters sum at ~L3859) scores exactly these 5: questions 2-5 plus
+# `expectativas` — NOT `facilidad` (question 1) and not `manejo_de_cambios` /
+# `aportacion_estrategica`. An earlier "first 5" reading (with `facilidad`,
+# without `expectativas`) coincidentally matched legacy num/den on the data of
+# the day and was the source of the documented ±1-2 residual: per response the
+# delta is `facilidad_promoter − expectativas_promoter` ∈ {-1, 0, 1}. Owner
+# decision: keep legacy's 5-question CSAT for all dates (no cutover to 8).
 _QUESTION_COLS: tuple[str, ...] = (
-    "facilidad",
     "comprension",
     "comunicacion",
     "calidad",
     "tiempo",
+    "expectativas",
 )
 
 NUMBER_OF_QUESTIONS: int = len(_QUESTION_COLS)  # 5
 PROMOTER_THRESHOLD: int = 4
 
 # [Manual Fix] Content Temp Fix (2026-06-30 legacy re-export): exclude the
-# 'tiempo de entrega' question (`tiempo`, the 5th scored question) for these
+# 'tiempo de entrega' question (`tiempo`) for these
 # agents in May 2026 — promoters drop that question's flag and
 # number_of_questions goes 5 -> 4. Applied after the roster join because legacy
 # keys it on the joined agent. Tracked in the adjustments sheet under

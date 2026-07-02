@@ -166,9 +166,10 @@ class TestComputeContentCsat:
             ),
         )
         row = _collect(out)[0]
-        # Only the first 5 are scored: facilidad=4(✓), comprension=3(✗),
-        # comunicacion=5(✓), calidad=1(✗), tiempo=4(✓) -> 3 promoters. The
-        # trailing 3 columns (manejo/expectativas/aportacion) are ignored.
+        # Scored set = questions 2-5 + expectativas (legacy qa_base ~L3859):
+        # comprension=3(✗), comunicacion=5(✓), calidad=1(✗), tiempo=4(✓),
+        # expectativas=4(✓) -> 3 promoters. facilidad, manejo_de_cambios and
+        # aportacion_estrategica are ignored.
         assert row["promoters"] == 3
         assert abs(row["csat_score"] - 3 / 5) < 1e-9
 
@@ -210,10 +211,21 @@ class TestComputeContentCsat:
     def test_null_score_not_promoter(self, spark):
         out = compute_content_csat(
             make_roster(spark, [{}]),
-            make_csat(spark, [{"facilidad": None}]),
+            make_csat(spark, [{"expectativas": None}]),
         )
-        # facilidad null (not a promoter); the other 4 scored questions = 5 -> 4.
+        # expectativas null (not a promoter); the other 4 scored questions = 5 -> 4.
         assert _collect(out)[0]["promoters"] == 4
+
+    def test_facilidad_not_scored(self, spark):
+        # facilidad is question 1 of the survey but NOT in legacy's scored set —
+        # zeroing it must not move the score (the old "first 5" reading did).
+        out = compute_content_csat(
+            make_roster(spark, [{}]),
+            make_csat(spark, [{"facilidad": 1}]),
+        )
+        row = _collect(out)[0]
+        assert row["promoters"] == 5
+        assert row["number_of_questions"] == 5
 
     def test_all_null_scores_zero_promoters(self, spark):
         out = compute_content_csat(
