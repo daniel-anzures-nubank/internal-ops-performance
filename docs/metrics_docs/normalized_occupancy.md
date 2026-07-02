@@ -56,8 +56,10 @@ The legacy `dimensioned_activity` meeting/leave carve-out and the DIME-squad
 exclusion (`wfm` / `credit_evolution` / `dote`) are applied in the
 **raw layer** (`metrics_data/occupancy_time.py` → `filter_dime`), at the slot
 stage, so they already constrain both the agent occupancy and the peer benchmark
-here. `social` DIME slots are kept on **all dates** (Sprinklr-sourced SM
-occupancy), and the legacy SM deck's **empty-slot 1800 rule** — a pre-cutover
+here. `social` DIME slots are kept on **all dates** in the raw table
+(Sprinklr-sourced SM occupancy) — but the metric output floors at
+**2026-03-01** for every deck (`NOCC_START_DATE`): legacy publishes no Jan/Feb
+NOcc, matched per the 2026-07-02 owner directive. And the legacy SM deck's **empty-slot 1800 rule** — a pre-cutover
 (`< 2026-07-01`) SM slot with no matching-activity Sprinklr overlap counts as
 fully occupied — is also folded into the raw table's `occupancy_minutes`; see
 `docs/metrics_data_docs/occupancy_time.md` → "Social-Media occupancy … and the

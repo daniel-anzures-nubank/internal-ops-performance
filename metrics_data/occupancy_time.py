@@ -167,7 +167,11 @@ from datetime import date
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
-from dime_filters import DIME_SQUAD_EXCLUSIONS, MEETING_LEAVE_DIMENSIONED_ACTIVITIES
+from dime_filters import (
+    DIME_SQUAD_EXCLUSIONS,
+    MEETING_LEAVE_DIMENSIONED_ACTIVITIES,
+    SM_DIME_SQUADS,
+)
 from shift_attribution import night_agent_months, shift_start_date
 
 # ---------------------------------------------------------------------------
@@ -207,7 +211,8 @@ SLOT_DURATION_SECONDS: int = 30 * 60
 # The legacy SM deck scores only these DIME squads
 # (`[IO] Performance 2026 - Social Media Temp Fix.sql` line 1065:
 # `agent_dime_squad IN ('social', 'social_social')`).
-SM_DIME_SQUADS: tuple[str, ...] = ("social", "social_social")
+# SM_DIME_SQUADS now lives in dime_filters (shared with adherent_time's
+# SM leave-exclusion deck split); re-exported here for its existing consumers.
 
 # SM slots dated BEFORE this reproduce the legacy SM quirks (module docstring):
 # empty slot = 1800 (the `ELSE 1800` fall-through at legacy lines 1189/1223),

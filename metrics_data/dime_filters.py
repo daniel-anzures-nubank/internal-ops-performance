@@ -30,6 +30,21 @@ MEETING_LEAVE_DIMENSIONED_ACTIVITIES: tuple[str, ...] = (
     "Vacacion",
 )
 
+# The leave subset of the list above. The legacy SM deck's ADHERENCE filter
+# ([IO] Performance 2026 - Social Media Temp Fix.sql:231) excludes only the
+# five meeting items -- it KEEPS `Licencia`/`Vacacion` slots in the SM
+# adherence universe (where the deck's LEAST/GREATEST NULL-skip quirk then
+# scores them ~100% adherent). adherent_time.filter_dime reproduces that deck
+# split for SM DIME squads pre-cutover; every other consumer keeps the unified
+# 7-item exclusion.
+LEAVE_DIMENSIONED_ACTIVITIES: tuple[str, ...] = ("Licencia", "Vacacion")
+
+# The SM DIME squads (legacy SM deck scope: `agent_dime_squad IN
+# ('social', 'social_social')`). Shared by the SM-specific legacy-parity
+# carve-outs in adherent_time (leave exclusion) and occupancy_time (legacy SM
+# scoring quirks).
+SM_DIME_SQUADS: tuple[str, ...] = ("social", "social_social")
+
 # DIME squads excluded from adherence / occupancy / NTPJ — a fixed legacy
 # filter on the DIME `agent_dime_squad` (operational / workforce-management
 # squads, not part of the productive universe). Legacy applies

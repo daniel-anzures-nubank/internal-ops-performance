@@ -1,4 +1,7 @@
-"""xpeers_in_target — the XForce-level Xpeers In Target metric (Core/Fraud + SM), PySpark.
+"""xpeers_in_target — the XForce-level Xpeers In Target metric, PySpark.
+
+Covers Core/Fraud (the "main" deck), Social Media, and — since the 2026-06-30
+legacy re-export added it to the Content Temp Fix notebook — Content.
 
 Measures, per XForce (and per XPLead), the share of its Xpeers' **metric
 targets** that were met:
@@ -17,13 +20,21 @@ Component targets (legacy ``*_xforce`` in-target counts)
 ======================  ==========  =============================
 component               threshold   teams
 ======================  ==========  =============================
-adherence               ``>= 95``   Core / Fraud / Social Media
+adherence               ``>= 95``   all teams
 ntpj                    ``<= 100``  Core / Fraud
-normalized_occupancy    ``>= 100``  Core / Fraud / Social Media
+ntpj (SLA)              ``>= 95``   Content (higher-is-better)
+normalized_occupancy    ``>= 100``  Core / Fraud / SM / Content
 quality                 ``>= 95``   Core / Fraud / Social Media
+content_csat            ``>= 95``   Content (its Quality)
 tnps                    ``>= 88``   Social Media
 wows                    ``>= 5``    Social Media
 ======================  ==========  =============================
+
+Content NTPJ is the SLA-weighted compliance metric (bounded ≤ 100,
+higher-is-better), so its in-target rule is ``>= 95`` — with one legacy quirk:
+the Content **XPLead** roll-up flags ``>= 100`` instead (Content Temp Fix
+``ntpj_sla_old_xpleads_monthly``, L2341 — almost certainly a copy-paste of the
+NOcc threshold). Reproduced pre-cutover; fixed to ``>= 95`` from 2026-07-01.
 
 An agent counts toward a component's **denominator** when they have a row for
 that metric in the bucket (``COUNT(DISTINCT agent)``), and toward the
@@ -35,11 +46,11 @@ Legacy runs a **separate notebook per deck**, and the main deck
 (``internal_ops_performance_2026``) merges Core + Fraud with **no team column**,
 grouping the XForce roll-up by ``(xforce, xplead)`` across both teams. So we group
 by a synthetic **deck** — ``core`` / ``fraud`` / NULL-team → ``main``;
-``social media`` → ``sm`` — NOT by ``team``. This merges a cross-team XForce
-(agents in both Core and Fraud) into one ``main`` row (legacy emits one), while a
-cross-*deck* XForce (Core + Social-Media agents) stays split into a ``main`` and
-an ``sm`` row. ``team`` is left NULL on output (legacy carries none; downstream
-``xforce_index`` joins on ``xforce`` alone).
+``social media`` → ``sm``; ``content`` → ``content`` — NOT by ``team``. This
+merges a cross-team XForce (agents in both Core and Fraud) into one ``main`` row
+(legacy emits one), while a cross-*deck* XForce (Core + Social-Media agents)
+stays split into a ``main`` and an ``sm`` row. ``team`` is left NULL on output
+(legacy carries none; downstream ``xforce_index`` joins on ``xforce`` alone).
 
 Era windows (parity with legacy — Fix #2)
 -----------------------------------------
@@ -53,9 +64,17 @@ for some paths:
 * **main deck, XPLead grain** and **Social Media (both grains)**:
   ``+ Quality`` from ``date_reference > 2026-01-01`` (so **every** January weekly
   bucket includes it); ``+ NO`` from ``date_reference > 2026-02-01``.
+* **Content (both grains)**: rows exist only from ``date_reference >=
+  2026-02-01`` (the legacy Content deck's save filter permanently drops
+  January 2026); ``+ NTPJ`` and ``+ NO`` from ``>= 2026-03-01`` (in legacy this
+  is data-driven — the Content SLA-NTPJ and NOcc agent rows start in March — we
+  gate it explicitly because our base tables carry earlier rows, e.g. Feb NOcc).
+  CSAT joins wherever ``io_content_csat_metric`` has a row (surveys arrive in
+  monthly batches, so weekly CSAT buckets exist only on a handful of Mondays —
+  matching legacy's sparse ``qa_xforce`` weekly rows).
 
-Adherence + NTPJ (main) and Adherence + tNPS + WoWs (Social Media) are always in
-scope.
+Adherence + NTPJ (main), Adherence + tNPS + WoWs (Social Media), and Adherence +
+CSAT (Content) are always in scope.
 
 Coalescing (parity with legacy — Fix #3)
 ----------------------------------------
@@ -63,8 +82,8 @@ Coalescing (parity with legacy — Fix #3)
   missing NTPJ match yields NULL, so the whole XForce/XPLead row carries NULL
   numerator/denominator/metric_value (the row is still emitted; legacy keeps it).
   Quality / NO are ``COALESCE(..., 0)``.
-* **Social Media**: every component is ``COALESCE(..., 0)`` — a missing component
-  contributes 0, never NULL.
+* **Social Media / Content**: every component is ``COALESCE(..., 0)`` — a
+  missing component contributes 0, never NULL.
 
 Granularity & floor (Fix #1)
 ----------------------------
@@ -74,29 +93,44 @@ only those two grains. Buckets whose month is before 2026 are dropped (the first
 weekly bucket is the Monday ``2026-01-05``; the ``2025-12-29`` partial week is
 excluded, matching legacy ``MIN(date_reference) = 2026-01``).
 
-**Content has no Xpeers In Target** (the legacy Content notebook doesn't build
-it), so Content XForces are excluded.
+**Content XPLead is month-only pre-cutover**: the legacy XPLead base excludes
+``week`` from its granularity list (Content Temp Fix L6906), so its weekly view
+is empty — we mirror that with a month-only filter on the Content XPLead grain.
 
-Output grain (Fix #4 — SM squad/district roll-ups)
---------------------------------------------------
+The legacy Content table also carries six stray ``2025-12-01`` rows (one
+adherence-driver agent bucketed into Dec-2025 by an upstream bad date, kept by
+the save filter's ``date_reference < '2026-01-01'`` branch). That is an upstream
+data artifact — our adherence table has no Dec-2025 Content rows, and the
+``ERA_FLOOR`` would drop them anyway — deliberately NOT reproduced.
+
+Output grain (Fix #4 — SM/Content squad/district roll-ups)
+----------------------------------------------------------
 Six metric names land in the same table:
 
 * ``xpeers_in_target``                 — XForce grain (legacy ``*_xforce``).
 * ``xpeers_in_target_xplead``          — XPLead roll-up (``xforce`` NULL).
-* ``xpeers_in_target_squad``           — **SM only**, the XForce rows summed by
-  ``squad`` (legacy ``*_xforce_squad``). SM carries a NULL squad, so this
-  collapses to one total-SM row per (date, granularity).
-* ``xpeers_in_target_district``        — **SM only**, the XForce rows summed by
-  ``district`` (legacy ``*_xforce_district``); also degenerate (NULL key).
-* ``xpeers_in_target_xplead_squad``    — **SM only**, the XPLead rows summed by
-  ``squad`` (legacy ``*_xplead_squad``).
-* ``xpeers_in_target_xplead_district`` — **SM only**, the XPLead rows summed by
-  ``district`` (legacy ``*_xplead_district``).
+* ``xpeers_in_target_squad``           — **SM + Content**, the XForce rows rolled
+  up by ``squad`` (legacy ``*_xforce_squad``). Both carry a NULL squad, so this
+  collapses to one total-deck row per (date, granularity).
+* ``xpeers_in_target_district``        — **SM + Content**, by ``district``
+  (legacy ``*_xforce_district``); also degenerate (NULL key).
+* ``xpeers_in_target_xplead_squad``    — **SM + Content**, the XPLead rows rolled
+  up by ``squad`` (legacy ``*_xplead_squad``).
+* ``xpeers_in_target_xplead_district`` — **SM + Content**, by ``district``
+  (legacy ``*_xplead_district``).
 
-For every row ``agent`` / ``squad`` / ``district`` / ``shift`` are NULL (except
-the degenerate key, which is also NULL for SM), ``numerator`` = targets achieved,
+The two decks roll up **differently** (each matching its own legacy notebook):
+SM sums the in-target/total counts (``numerator``/``denominator``) and divides;
+Content averages the grain rows' ``metric_value`` (legacy ``SUM(metric_value) AS
+numerator, COUNT(DISTINCT agent) AS denominator, AVG(metric_value)`` — and since
+``agent`` is NULL on every grain row, the Content denominator is the constant
+0 while ``metric_value`` is still the non-NULL average; Content Temp Fix
+L5641-5730 / L7029-7098).
+
+For every row ``agent`` / ``squad`` / ``district`` / ``shift`` are NULL (the
+degenerate roll-up key is also NULL), ``numerator`` = targets achieved,
 ``denominator`` = total targets, ``metric_value`` = ``numerator / denominator *
-100``.
+100`` (except the Content roll-ups above).
 
 Known parity bounds (pre-cutover)
 ---------------------------------
@@ -109,7 +143,9 @@ parity to the early months (both peak in January):
    XForce that spans multiple XPLeads gets a cross-product (its adherence is
    multiplied and its components summed across XPLeads). We aggregate once per
    ``(xforce, xplead)`` instead. Affects only multi-XPLead XForces (~36 in Jan,
-   2–5/month after — XPLead reassignments concentrate at onboarding).
+   2–5/month after — XPLead reassignments concentrate at onboarding). The
+   Content deck has the same on-xforce join but a single XPLead in practice,
+   so no fan-out there.
 2. **NTPJ base-metric early-month gap** — the in-target counts inherit the NTPJ
    metric, which is not yet at parity in the early months (the deferred NTPJ
    early-month benchmark / improved_benchmarks work). This bounds every month
@@ -129,8 +165,8 @@ from metric_utils import METRIC_COLUMNS, empty_metric_frame
 
 METRIC_NAME = "xpeers_in_target"  # XForce grain (legacy xpeers_in_target_xforce)
 XPLEAD_METRIC_NAME = "xpeers_in_target_xplead"  # XPLead roll-up grain
-# SM-only degenerate roll-ups (legacy xpeers_in_target_xforce_{squad,district} /
-# xpeers_in_target_xplead_{squad,district}).
+# SM + Content degenerate roll-ups (legacy xpeers_in_target_xforce_{squad,district}
+# / xpeers_in_target_xplead_{squad,district}).
 SQUAD_METRIC_NAME = "xpeers_in_target_squad"
 DISTRICT_METRIC_NAME = "xpeers_in_target_district"
 XPLEAD_SQUAD_METRIC_NAME = "xpeers_in_target_xplead_squad"
@@ -150,58 +186,99 @@ MAR_1: date = date(2026, 3, 1)
 
 CORE_FRAUD = ("core", "fraud")
 SOCIAL_MEDIA = "social media"
+CONTENT = "content"
 
 # Synthetic decks (legacy runs a notebook per deck; the main deck merges
 # Core + Fraud + NULL-team support squads). We group by deck, not team.
 DECK_MAIN = "main"
 DECK_SM = "sm"
+DECK_CONTENT = "content"
+
+# Content rows exist only from Feb 2026 — the legacy Content deck's save filter
+# (`date_reference < '2026-01-01' OR date_reference >= '2026-02-01'`) drops
+# January 2026 permanently (Content Temp Fix, "[Temp Fix] Joins and Save").
+CONTENT_FLOOR: date = date(2026, 2, 1)
 
 # component column (in the metric tables) -> ("ge"|"le", threshold)
 _TARGETS: dict[str, tuple[str, float]] = {
     "adherence": ("ge", 95.0),
-    "ntpj": ("le", 100.0),
+    "ntpj": ("le", 100.0),  # Core/Fraud duration NTPJ; Content overrides in _passed
     "normalized_occupancy": ("ge", 100.0),
     "quality": ("ge", 95.0),
+    "content_csat": ("ge", 95.0),
     "tnps": ("ge", 88.0),
     "wows": ("ge", 5.0),
 }
+
+# Content SLA-NTPJ is higher-is-better: in-target is >= 95 (Content Temp Fix
+# ntpj_sla_old_xforces, L2301). Legacy quirk: the Content XPLead roll-up flags
+# >= 100 instead (ntpj_sla_old_xpleads_monthly, L2341) — reproduced pre-cutover,
+# fixed to >= 95 from the 2026-07-01 cutover.
+CONTENT_NTPJ_THRESHOLD = 95.0
+CONTENT_NTPJ_XPLEAD_LEGACY_THRESHOLD = 100.0
 
 # Source tables, in the order the public functions accept them.
 _SOURCE_ORDER: tuple[str, ...] = (
     "ntpj",
     "normalized_occupancy",
     "quality",
+    "content_csat",
     "tnps",
     "wows",
 )
 
 
 def _deck_col() -> Column:
-    """Map ``team`` to its deck (``main`` = core/fraud/NULL; ``sm`` = social media)."""
+    """Map ``team`` to its deck (``main`` = core/fraud/NULL; ``sm``; ``content``)."""
     team = F.lower(F.col("team"))
     return (
         F.when(team.isin(list(CORE_FRAUD)) | team.isNull(), F.lit(DECK_MAIN))
         .when(team == F.lit(SOCIAL_MEDIA), F.lit(DECK_SM))
+        .when(team == F.lit(CONTENT), F.lit(DECK_CONTENT))
         .otherwise(F.lit("other"))
     )
 
 
-def _component_counts(df: DataFrame, name: str, *, keys: list[str]) -> DataFrame:
-    """Per-group in-target / total agent counts for one component metric table.
+def _passed(name: str, grain: str) -> Column:
+    """The per-row in-target predicate for one component (deck-aware for NTPJ).
 
-    Adds the synthetic ``_deck`` and keeps only the main / SM decks. ``{name}_in``
-    = agents whose ``metric_value`` clears the threshold (NULL fails);
-    ``{name}_tot`` = distinct agents present for the metric in the bucket.
+    Content NTPJ is the SLA-weighted compliance metric — higher-is-better, so its
+    rule is ``>= 95`` rather than the main deck's ``<= 100``. On the XPLead grain
+    legacy flags ``>= 100`` (the quirk documented on the module constants);
+    reproduced for ``date_reference < 2026-07-01``.
     """
     comparator, threshold = _TARGETS[name]
     mv = F.col("metric_value").cast("double")
-    passed = mv >= F.lit(threshold) if comparator == "ge" else mv <= F.lit(threshold)
+    default = mv >= F.lit(threshold) if comparator == "ge" else mv <= F.lit(threshold)
+    if name != "ntpj":
+        return default
+    if grain == "xforce":
+        content = mv >= F.lit(CONTENT_NTPJ_THRESHOLD)
+    else:  # xplead — legacy >= 100 quirk pre-cutover
+        content = F.when(
+            F.col("date_reference") < F.lit(LEGACY_CUTOVER),
+            mv >= F.lit(CONTENT_NTPJ_XPLEAD_LEGACY_THRESHOLD),
+        ).otherwise(mv >= F.lit(CONTENT_NTPJ_THRESHOLD))
+    return F.when(F.col("_deck") == F.lit(DECK_CONTENT), content).otherwise(default)
+
+
+def _component_counts(
+    df: DataFrame, name: str, *, keys: list[str], grain: str
+) -> DataFrame:
+    """Per-group in-target / total agent counts for one component metric table.
+
+    Adds the synthetic ``_deck`` and keeps only the main / SM / Content decks.
+    ``{name}_in`` = agents whose ``metric_value`` clears the threshold (NULL
+    fails); ``{name}_tot`` = distinct agents present for the metric in the bucket.
+    """
     work = (
         df.withColumn("_deck", _deck_col())
-        .filter(F.col("_deck").isin(DECK_MAIN, DECK_SM))
+        .filter(F.col("_deck").isin(DECK_MAIN, DECK_SM, DECK_CONTENT))
         .withColumn(
             "_pass",
-            F.when(F.coalesce(passed, F.lit(False)), F.lit(1)).otherwise(F.lit(0)),
+            F.when(
+                F.coalesce(_passed(name, grain), F.lit(False)), F.lit(1)
+            ).otherwise(F.lit(0)),
         )
     )
     return work.groupBy(*keys).agg(
@@ -222,7 +299,7 @@ def _compute_grain(
 
     Groups by the synthetic **deck** (not team) so a cross-team XForce merges into
     one ``main`` row. Returns the XForce/XPLead rows (``team`` NULL) plus the
-    SM-only squad/district roll-ups (Fix #4).
+    SM + Content squad/district roll-ups (Fix #4).
     """
     spark = adherence.sparkSession
     if len(adherence.take(1)) == 0:
@@ -240,12 +317,14 @@ def _compute_grain(
     else:  # pragma: no cover - guarded by callers
         raise ValueError(f"unknown grain: {grain!r}")
 
-    base = _component_counts(adherence, "adherence", keys=base_keys)
+    base = _component_counts(adherence, "adherence", keys=base_keys, grain=grain)
     for name in _SOURCE_ORDER:
         df = sources.get(name)
         if df is not None and len(df.take(1)) != 0:
-            base = base.join(_component_counts(df, name, keys=join_keys),
-                             on=join_keys, how="left")
+            base = base.join(
+                _component_counts(df, name, keys=join_keys, grain=grain),
+                on=join_keys, how="left",
+            )
         else:
             base = base.withColumn(f"{name}_in", F.lit(None).cast("double")).withColumn(
                 f"{name}_tot", F.lit(None).cast("double")
@@ -253,16 +332,24 @@ def _compute_grain(
 
     is_main = F.col("_deck") == F.lit(DECK_MAIN)
     is_sm = F.col("_deck") == F.lit(DECK_SM)
+    is_content = F.col("_deck") == F.lit(DECK_CONTENT)
     date_ref = F.col("date_reference")
     gran = F.col("date_granularity")
 
     # Fix #1: week + month only pre-cutover; month-of-bucket >= 2026-01 (raw
     # date_reference floor — exact for week+month). (Deck filter already applied
-    # in _component_counts.)
+    # in _component_counts.) Content adds its own floor (no Jan-2026 rows — the
+    # legacy save filter) and, on the XPLead grain, month-only pre-cutover (the
+    # legacy XPLead base excludes 'week', so its weekly view is empty).
     pre_cutover = date_ref < F.lit(LEGACY_CUTOVER)
     base = base.filter(
         ((~pre_cutover) | gran.isin("week", "month")) & (date_ref >= F.lit(ERA_FLOOR))
     )
+    base = base.filter((~is_content) | (date_ref >= F.lit(CONTENT_FLOOR)))
+    if grain == "xplead":
+        base = base.filter(
+            (~is_content) | (~pre_cutover) | (gran == F.lit("month"))
+        )
     if len(base.take(1)) == 0:
         return empty_metric_frame(spark)
 
@@ -273,6 +360,10 @@ def _compute_grain(
     else:  # xplead — main and SM share the > Jan-1 / > Feb-1 boundary
         qa_ok = date_ref > F.lit(JAN_1)
         no_ok = date_ref > F.lit(FEB_1)
+    # Content: SLA-NTPJ + NOcc join from March (data-driven in legacy — its base
+    # rows start then; explicit here because our tables carry earlier rows).
+    content_ntpj_ok = date_ref >= F.lit(MAR_1)
+    content_no_ok = date_ref >= F.lit(MAR_1)
 
     def opt(prefix: str, suffix: str, ok: Column) -> Column:
         """A COALESCE(.., 0) component that is only added inside its era."""
@@ -281,7 +372,8 @@ def _compute_grain(
         )
 
     # Fix #3: the main deck does NOT coalesce adherence/ntpj (NULL propagates and
-    # the row carries NULL value); Social Media coalesces everything to 0.
+    # the row carries NULL value); Social Media and Content coalesce everything
+    # to 0 (the Content base is a plain LEFT JOIN + COALESCE, L5523-5529).
     main_num = F.col("adherence_in") + F.col("ntpj_in") + opt(
         "quality", "in", qa_ok
     ) + opt("normalized_occupancy", "in", no_ok)
@@ -299,8 +391,27 @@ def _compute_grain(
         "quality", "tot", qa_ok
     ) + opt("normalized_occupancy", "tot", no_ok)
 
-    num = F.when(is_main, main_num).when(is_sm, sm_num).otherwise(F.lit(None).cast("double"))
-    den = F.when(is_main, main_den).when(is_sm, sm_den).otherwise(F.lit(None).cast("double"))
+    # Content: adherence + CSAT always (CSAT presence-driven), NTPJ + NOcc from
+    # March. CSAT plays the qa role (legacy Content 'quality' IS the CSAT).
+    content_num = c("adherence_in") + opt("ntpj", "in", content_ntpj_ok) + opt(
+        "normalized_occupancy", "in", content_no_ok
+    ) + c("content_csat_in")
+    content_den = c("adherence_tot") + opt("ntpj", "tot", content_ntpj_ok) + opt(
+        "normalized_occupancy", "tot", content_no_ok
+    ) + c("content_csat_tot")
+
+    num = (
+        F.when(is_main, main_num)
+        .when(is_sm, sm_num)
+        .when(is_content, content_num)
+        .otherwise(F.lit(None).cast("double"))
+    )
+    den = (
+        F.when(is_main, main_den)
+        .when(is_sm, sm_den)
+        .when(is_content, content_den)
+        .otherwise(F.lit(None).cast("double"))
+    )
     mv = F.when(den > F.lit(0), num / den * F.lit(100.0)).otherwise(
         F.lit(None).cast("double")
     )
@@ -336,11 +447,35 @@ def _compute_grain(
     ).select(*METRIC_COLUMNS)
 
     rollups = _sm_rollups(scored, squad_metric=squad_metric, district_metric=district_metric)
-    return grain_rows.unionByName(rollups)
+    content_rollups = _content_rollups(
+        scored, squad_metric=squad_metric, district_metric=district_metric
+    )
+    return grain_rows.unionByName(rollups).unionByName(content_rollups)
+
+
+def _rollup_rows(agg: DataFrame, *, squad_metric: str, district_metric: str) -> DataFrame:
+    """Emit one squad + one district row (all-NULL dims) per aggregated bucket."""
+    base = agg.select(
+        F.lit(None).cast("string").alias("agent"),
+        F.lit(None).cast("string").alias("xforce"),
+        F.lit(None).cast("string").alias("xplead"),
+        F.lit(None).cast("string").alias("team"),
+        F.lit(None).cast("string").alias("squad"),
+        F.lit(None).cast("string").alias("district"),
+        F.lit(None).cast("string").alias("shift"),
+        F.col("date_reference"),
+        F.col("date_granularity"),
+        F.col("numerator"),
+        F.col("denominator"),
+        F.col("metric_value"),
+    )
+    squad = base.withColumn("metric", F.lit(squad_metric)).select(*METRIC_COLUMNS)
+    district = base.withColumn("metric", F.lit(district_metric)).select(*METRIC_COLUMNS)
+    return squad.unionByName(district)
 
 
 def _sm_rollups(scored: DataFrame, *, squad_metric: str, district_metric: str) -> DataFrame:
-    """Fix #4: SM-only degenerate squad + district roll-ups of a grain's rows.
+    """Fix #4: SM degenerate squad + district roll-ups of a grain's rows.
 
     Sums numerator/denominator across the Social-Media (``_deck == sm``) rows of
     the scored grain per (date_reference, date_granularity). SM carries a NULL
@@ -354,28 +489,34 @@ def _sm_rollups(scored: DataFrame, *, squad_metric: str, district_metric: str) -
         F.sum("numerator").cast("double").alias("numerator"),
         F.sum("denominator").cast("double").alias("denominator"),
     )
-    base = agg.select(
-        F.lit(None).cast("string").alias("agent"),
-        F.lit(None).cast("string").alias("xforce"),
-        F.lit(None).cast("string").alias("xplead"),
-        F.lit(None).cast("string").alias("team"),
-        F.lit(None).cast("string").alias("squad"),
-        F.lit(None).cast("string").alias("district"),
-        F.lit(None).cast("string").alias("shift"),
-        F.col("date_reference"),
-        F.col("date_granularity"),
-        F.col("numerator"),
-        F.col("denominator"),
+    agg = agg.withColumn(
+        "metric_value",
         F.when(
             F.col("denominator") > F.lit(0),
             F.col("numerator") / F.col("denominator") * F.lit(100.0),
-        )
-        .otherwise(F.lit(None).cast("double"))
-        .alias("metric_value"),
+        ).otherwise(F.lit(None).cast("double")),
     )
-    squad = base.withColumn("metric", F.lit(squad_metric)).select(*METRIC_COLUMNS)
-    district = base.withColumn("metric", F.lit(district_metric)).select(*METRIC_COLUMNS)
-    return squad.unionByName(district)
+    return _rollup_rows(agg, squad_metric=squad_metric, district_metric=district_metric)
+
+
+def _content_rollups(
+    scored: DataFrame, *, squad_metric: str, district_metric: str
+) -> DataFrame:
+    """Fix #4 (Content flavor): degenerate roll-ups that AVERAGE the grain rows.
+
+    The Content deck rolls up differently from SM: ``numerator =
+    SUM(metric_value)``, ``denominator = COUNT(DISTINCT agent)`` — the constant 0,
+    since ``agent`` is NULL on every XForce/XPLead row — and ``metric_value =
+    AVG(metric_value)`` (Content Temp Fix L5641-5730 / L7029-7098). Note the
+    denominator-0 rows still carry a non-NULL average — a reproduced legacy quirk.
+    """
+    ct = scored.filter(F.col("_deck") == F.lit(DECK_CONTENT))
+    agg = ct.groupBy("date_reference", "date_granularity").agg(
+        F.sum("metric_value").cast("double").alias("numerator"),
+        F.avg("metric_value").cast("double").alias("metric_value"),
+    )
+    agg = agg.withColumn("denominator", F.lit(0.0))
+    return _rollup_rows(agg, squad_metric=squad_metric, district_metric=district_metric)
 
 
 def compute_xpeers_in_target(
@@ -385,23 +526,26 @@ def compute_xpeers_in_target(
     quality: DataFrame | None = None,
     tnps: DataFrame | None = None,
     wows: DataFrame | None = None,
+    content_csat: DataFrame | None = None,
 ) -> DataFrame:
-    """Compute XForce Xpeers In Target (``xpeers_in_target`` + SM squad/district).
+    """Compute XForce Xpeers In Target (``xpeers_in_target`` + squad/district).
 
     Args:
         adherence: ``io_adherence_metric`` — the driver (defines the XForce
             universe; ``xplead`` rides along).
-        ntpj / normalized_occupancy / quality / tnps / wows: the corresponding
-            ``io_*_metric`` tables. Any may be ``None``/empty.
+        ntpj / normalized_occupancy / quality / tnps / wows / content_csat: the
+            corresponding ``io_*_metric`` tables. Any may be ``None``/empty.
+            ``content_csat`` plays the Quality role for the Content deck.
 
     Returns:
         Tidy long-format metric rows (XForce grain, ``team`` NULL) plus the
-        SM-only ``xpeers_in_target_squad`` / ``xpeers_in_target_district``.
+        SM + Content ``xpeers_in_target_squad`` / ``xpeers_in_target_district``.
     """
     sources = {
         "ntpj": ntpj,
         "normalized_occupancy": normalized_occupancy,
         "quality": quality,
+        "content_csat": content_csat,
         "tnps": tnps,
         "wows": wows,
     }
@@ -418,18 +562,21 @@ def compute_xpeers_in_target_xplead(
     quality: DataFrame | None = None,
     tnps: DataFrame | None = None,
     wows: DataFrame | None = None,
+    content_csat: DataFrame | None = None,
 ) -> DataFrame:
-    """Compute XPLead Xpeers In Target (``xpeers_in_target_xplead`` + SM roll-ups).
+    """Compute XPLead Xpeers In Target (``xpeers_in_target_xplead`` + roll-ups).
 
     Identical target/era logic to the XForce version, but the in-target and total
     agent counts are aggregated per ``(deck, xplead)`` instead of per XForce
-    (``xforce`` NULL). Appends the SM-only ``xpeers_in_target_xplead_squad`` /
-    ``xpeers_in_target_xplead_district`` roll-ups.
+    (``xforce`` NULL). Appends the SM + Content ``xpeers_in_target_xplead_squad``
+    / ``xpeers_in_target_xplead_district`` roll-ups. Content is month-only
+    pre-cutover and flags NTPJ ``>= 100`` (the legacy quirk).
     """
     sources = {
         "ntpj": ntpj,
         "normalized_occupancy": normalized_occupancy,
         "quality": quality,
+        "content_csat": content_csat,
         "tnps": tnps,
         "wows": wows,
     }

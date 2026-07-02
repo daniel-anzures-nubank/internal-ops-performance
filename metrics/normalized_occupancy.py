@@ -67,9 +67,11 @@ Legacy's ``dimensioned_activity`` meeting/leave carve-out and the DIME-squad
 exclusion (wfm / credit_evolution / dote) are applied **upstream** as fixed DIME
 filters in the raw layer (``metrics_data/occupancy_time.py`` → ``filter_dime``),
 so — unlike before — they DO already constrain both the agent occupancy and the
-peer benchmark here. ``social`` DIME slots are KEPT on all dates: Social-Media
-occupancy is Sprinklr-sourced (``sm_jobs``) and intentionally ON for the whole
-history, a documented divergence from legacy (see the raw layer's docstring).
+peer benchmark here. ``social`` DIME slots are KEPT on all dates in the RAW
+table (Sprinklr-sourced), but the METRIC floors its output at
+:data:`NOCC_START_DATE` (2026-03-01) for every deck — legacy publishes no
+Jan/Feb NOcc, and per the 2026-07-02 owner directive we match it (this
+reversed an earlier deliberate SM-on-all-dates extension).
 
 Output — tidy long format, one row per (agent, date_reference, granularity)
 ---------------------------------------------------------------------------
@@ -95,6 +97,14 @@ from metric_utils import (
 from adjustments.manual import drop_slot_windows, reclassify_dime_slots
 
 METRIC_NAME = "normalized_occupancy"
+
+# Legacy publishes Normalized Occupancy only from this date (its final view
+# filters `date >= '2026-03-01'` on every deck) — there is no Jan/Feb NOcc.
+# Owner directive 2026-07-02: match legacy for ALL squads (this reversed an
+# earlier deliberate SM-on-all-dates extension). Slots before the floor are
+# dropped up front, so a week bucket straddling the floor (Monday 2026-02-23)
+# emits a partial row built only from its March days — exactly like legacy.
+NOCC_START_DATE: date = date(2026, 3, 1)
 
 NITZA_NO_SUPPRESSION_AGENT = "nitza.zarza"
 NITZA_NO_SUPPRESSION_START: date = date(2026, 4, 1)
@@ -217,7 +227,10 @@ def compute_normalized_occupancy(
     """
     spark = occupancy_time.sparkSession
 
-    work = reclassify_dime_slots(occupancy_time, dime_inconsistencies)
+    work = occupancy_time.filter(
+        F.to_date(F.col("date")) >= F.lit(NOCC_START_DATE)
+    )
+    work = reclassify_dime_slots(work, dime_inconsistencies)
     work = drop_slot_windows(work, general_exclusions)
 
     productive = work.filter(

@@ -504,3 +504,35 @@ class TestComputeAdherentTimeEndToEnd:
         out = compute_adherent_time(roster, make_dime(spark, [{}]), make_prod(spark, [{}])).collect()
         assert len(out) == 1
         assert out[0]["squad"] == "correct-may"
+
+
+class TestSmLeaveDeckSplit:
+    """Legacy SM adherence keeps Licencia/Vacacion (5-item exclusion) pre-cutover."""
+
+    def test_sm_licencia_kept_pre_cutover(self, spark):
+        out = filter_dime(make_dime(spark, [
+            {"squad": "social_social", "dimensioned_activity": "Licencia"},
+            {"squad": "social", "dimensioned_activity": "Vacacion"},
+        ]))
+        assert out.count() == 2
+
+    def test_sm_meeting_items_still_dropped_pre_cutover(self, spark):
+        out = filter_dime(make_dime(spark, [
+            {"squad": "social_social", "dimensioned_activity": "Huddle"},
+            {"squad": "social", "dimensioned_activity": "Weekly"},
+        ]))
+        assert out.count() == 0
+
+    def test_non_sm_licencia_dropped(self, spark):
+        out = filter_dime(make_dime(spark, [
+            {"squad": "core", "dimensioned_activity": "Licencia"},
+            {"squad": "content_content", "dimensioned_activity": "Vacacion"},
+        ]))
+        assert out.count() == 0
+
+    def test_sm_licencia_dropped_post_cutover(self, spark):
+        out = filter_dime(make_dime(spark, [
+            {"squad": "social_social", "dimensioned_activity": "Licencia",
+             "date": dt.date(2026, 7, 6)},
+        ]))
+        assert out.count() == 0
