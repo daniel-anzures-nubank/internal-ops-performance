@@ -61,30 +61,43 @@ into this one table via the same per-slot overlap logic:
   - `dimensioned_activity` not in (`Mouring`, `Weekly`, `Permiso Medico`,
     `Permiso medico`, `Huddle`, `Licencia`, `Vacacion`); a NULL is kept.
     **Fixed — all dates.**
-  - `agent_dime_squad` non-NULL and not in (`wfm`, `credit_evolution`, `dote`,
-    `social`). NOTE this list **includes `social`** (unlike adherence). The
-    wfm/credit_evolution/dote drop is **fixed — all dates**; the `social` drop is
-    **cutover-gated** (see Social-Media occupancy below).
+  - `agent_dime_squad` non-NULL and not in (`wfm`, `credit_evolution`, `dote`).
+    **Fixed — all dates.** Unlike legacy's NOcc dataset (line 236), `social` is
+    NOT excluded: Social-Media occupancy is Sprinklr-sourced and intentionally
+    ON for the whole history (see Social-Media occupancy below).
 - **Jobs**: shuffle `status IN ('finished', 'transferred', 'skipped')`
   (occupancy counts *attempted* work, wider than NTPJ's `finished` only); OOS
   and SM rows get a synthetic `activity_type = 'oos'`. `sm_jobs` drops case rows
   with a NULL assignment/unassignment time (no measurable interval).
 - **Roster**: `status = 'active'` (inner join on `(agent, snapshot_month)`).
 
-## Social-Media occupancy (cutover-gated at 2026-07-01)
+## Social-Media occupancy (ON for all dates) and the empty-slot 1800 rule
 
-Legacy excluded `agent_dime_squad = 'social'` DIME slots **and** had no Sprinklr
-source (its `jobs_join` was shuffle ∪ oos only), so legacy produced no
-Social-Media occupancy. The new code both keeps `social` DIME slots and unions
-`sm_jobs`. To stay byte-for-byte with legacy **before** the cutover, this is
-gated per-slot at `SOCIAL_MEDIA_OCCUPANCY_CUTOVER` (`2026-07-01`):
+Legacy's main NOcc dataset excluded `agent_dime_squad = 'social'` DIME slots
+and had no Sprinklr source, but the **Social-Media deck**
+(`legacy/[IO] Performance 2026 - Social Media Temp Fix.sql`) computes SM
+occupancy from Sprinklr case assignments. The new code keeps `social` DIME
+slots and unions `sm_jobs` on **all dates**, so Social-Media occupancy is
+populated for the whole history.
 
-- `date < 2026-07-01`: `agent_dime_squad = 'social'` slots are dropped and SM
-  jobs can never match a slot — reproducing legacy (no Social-Media occupancy).
-- `date >= 2026-07-01`: `social` slots are kept and `sm_jobs` populates their
-  occupancy — Social-Media occupancy turns on.
-
-This mirrors the night-shift / phantom-adherence `2026-07-01` cutover handling.
+**Empty-slot full credit (pre-cutover parity quirk).** The legacy SM deck
+counts a dimensioned SM slot with **no** overlapping matching-activity Sprinklr
+case as **fully occupied**: `occupancy_agg` (lines 1123–1135) computes
+`SUM(CASE WHEN activity_occuped = 1 THEN duration END)` — NULL when no
+overlapping case matches the slot's activity type — and the downstream
+`CASE WHEN SUM(occupancy_time) <= 1800 THEN SUM(occupancy_time) ELSE 1800 END`
+(lines 1189 / 1223) evaluates `NULL <= 1800` to NULL, falling through to
+`ELSE 1800` (seconds = the full 30-minute slot). Partially covered slots keep
+their actual overlap seconds; only slots with zero matching cases get the 1800
+default. The rule is reproduced here for SM DIME slots
+(`agent_dime_squad IN ('social', 'social_social')` — the squads the legacy deck
+scores, line 1065) dated **before** `SM_EMPTY_SLOT_FULL_CREDIT_CUTOVER`
+(`2026-07-01`), restricted to legacy's slot universe: its DIME filter (lines
+1064 / 1079) drops `lunch_break` / `dime_invalid_notation` / `time_off` /
+`shrinkage`, and eligibility is decided on the **pre-reclass**
+`activity_type_required` (this module relabels `dime_invalid_notation` to
+`'oos'`, but legacy never scored those slots). On/after the cutover the
+corrected behavior applies: an empty slot is 0.
 
 ## luis.contreras OOS timestamp correction
 
