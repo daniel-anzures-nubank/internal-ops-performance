@@ -7,12 +7,13 @@ Metrics-layer script. Thin orchestrator — the math lives in
   1. Get the ambient SparkSession (shared ``db.open_connection``).
   2. Read the agent-level component metric tables for the period (via
      ``db.read_table``, scoped on ``date_reference``).
-  3. Call ``compute_xpeers_in_target`` (XForce grain + SM squad/district) and
-     ``compute_xpeers_in_target_xplead`` (XPLead roll-ups) and union both.
+  3. Call ``compute_xpeers_in_target`` (XForce grain + SM/Content squad/district)
+     and ``compute_xpeers_in_target_xplead`` (XPLead roll-ups) and union both.
   4. Either print a summary (``--dry-run``) or replace the target Delta table.
 
 The in-target composition is gated on the raw ``date_reference`` (Quality / NO
-join over the 2026 rollout); week + month only before the 2026-07-01 cutover.
+join over the 2026 rollout; Content NTPJ/NOcc from March, no Jan-2026 rows);
+week + month only before the 2026-07-01 cutover.
 
 Tables
 ------
@@ -23,6 +24,7 @@ Tables
     - ``usr.danielanzures.io_quality_metric``
     - ``usr.danielanzures.io_tnps_metric``
     - ``usr.danielanzures.io_wows_metric``
+    - ``usr.danielanzures.io_content_csat_metric``           (Content's Quality)
 * Output: ``usr.danielanzures.io_xpeers_in_target_metric`` (override ``--target``).
 
 Usage
@@ -100,6 +102,7 @@ INPUTS: tuple[tuple[str, str, str], ...] = (
     ("quality", "usr.danielanzures.io_quality_metric", "quality"),
     ("tnps", "usr.danielanzures.io_tnps_metric", "tnps"),
     ("wows", "usr.danielanzures.io_wows_metric", "wows"),
+    ("content-csat", "usr.danielanzures.io_content_csat_metric", "content_csat"),
 )
 
 DEFAULT_TARGET = "usr.danielanzures.io_xpeers_in_target_metric"

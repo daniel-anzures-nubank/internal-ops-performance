@@ -77,10 +77,13 @@ Shared aggregation (bucketing + the tidy long output) lives in
 >   cohort-count-biased two-level average).
 > - `xpeers_in_target` (no agent grain): it reads the agent-level `io_*_metric`
 >   tables, flags each agent in/out of target per component (adherence ≥95, ntpj
->   ≤100, NO ≥100, quality ≥95, tnps ≥88, wows ≥5), and reports targets-achieved
+>   ≤100 — Content ≥95, its SLA NTPJ is higher-better — NO ≥100, quality ≥95,
+>   content_csat ≥95, tnps ≥88, wows ≥5), and reports targets-achieved
 >   / total-targets at two grains in one table — `xpeers_in_target` (**XForce**)
->   and `xpeers_in_target_xplead` (**XPLead**, `xforce` NULL). Core/Fraud +
->   Social Media only; era-gated like the Index.
+>   and `xpeers_in_target_xplead` (**XPLead**, `xforce` NULL) — plus SM/Content
+>   degenerate `_squad`/`_district` variants. Core/Fraud + Social Media +
+>   Content (Content per the 2026-06-30 legacy re-export, rows from Feb 2026);
+>   era-gated like the Index.
 > - `shrinkage` is **agent-level**, but its build also writes two slot-weighted
 >   roll-ups into the same table: `shrinkage_xforce` (per XForce) and
 >   `shrinkage_xplead` (per XPLead, `xforce` NULL).
